@@ -22,7 +22,7 @@ impl Color {
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Player {
+pub enum Player {
     Black = 1,
     White = 2,
 }
@@ -47,11 +47,11 @@ impl From<Player> for Color {
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Loc(u16);
+pub struct Loc(u16);
 
 impl Loc {
     const NULL: Self = Self(0);
-    const PASS: Self = Self(1);
+    pub const PASS: Self = Self(1);
     fn new(x: usize, y: usize) -> Option<Loc> {
         if x < BOARD_SIZE && y < BOARD_SIZE {
             Some(Self(((x + 1) + (y + 1) * STRIDE) as u16))
@@ -88,7 +88,7 @@ struct ChainData {
 }
 
 #[derive(Clone)]
-struct Board {
+pub struct Board {
     colors: [Color; ARRAY_LEN], // flat board array
     chain_data: [ChainData; ARRAY_LEN],
     chain_head: [Loc; ARRAY_LEN],
@@ -237,6 +237,10 @@ impl Board {
 
     fn play_move_assume_legal(&mut self, loc: Loc, player: Player) {
         //create new chain, merge with nearby chains, decrement opponent liberties, kill and increment liberties and mark ko
+        self.simple_ko = None;
+        if loc == Loc::PASS {
+            return;
+        }
         let i = loc.index();
         let player_color = Color::from(player);
         let opponent_player = player.opponent();
@@ -252,7 +256,7 @@ impl Board {
         };
         self.chain_head[i] = loc;
         self.next_in_chain[i] = loc;
-        
+
         self.change_surrounding_liberties(loc, opponent_player, -1);
         for adj in Loc::adjacent_indices(i) {
             let adj_loc = Loc::from_index(adj);
@@ -262,8 +266,7 @@ impl Board {
                 self.merge_chains(adj_loc, loc)
             }
             //kill enemies
-            else if (self.colors[adj] == opponent_color)
-                && (self.get_num_liberties(adj_loc) == 0)
+            else if (self.colors[adj] == opponent_color) && (self.get_num_liberties(adj_loc) == 0)
             {
                 num_killed += self.remove_chain(adj_loc);
                 potential_ko_loc = Some(adj_loc); //ko only happens when exactly one stone is killed
@@ -272,7 +275,6 @@ impl Board {
 
         // ko
         let new_chain_data = self.chain_data[self.chain_head[i].index()];
-        self.simple_ko = None;
         if num_killed == 1 && new_chain_data.num_locs == 1 && new_chain_data.num_liberties == 1 {
             self.simple_ko = potential_ko_loc;
         }
@@ -282,78 +284,85 @@ impl Board {
             self.remove_chain(loc);
         }
     }
-    fn is_ko_banned(&self, loc: Loc) -> bool{
-        Some(loc)==self.simple_ko
+    fn is_ko_banned(&self, loc: Loc) -> bool {
+        Some(loc) == self.simple_ko
     }
-    fn is_suicide(&self, loc: Loc, player: Player) -> bool{
+    fn is_suicide(&self, loc: Loc, player: Player) -> bool {
         let i = loc.index();
         let player_color = Color::from(player);
         let opponent_color = Color::from(player.opponent());
-        for adj in Loc::adjacent_indices(i){
+        for adj in Loc::adjacent_indices(i) {
             let adj_color = self.colors[adj];
-            if adj_color.is_empty(){
+            if adj_color.is_empty() {
                 return false;
             }
-            if adj_color == player_color{
-                if self.get_num_liberties(Loc::from_index(adj))>1{
+            if adj_color == player_color {
+                if self.get_num_liberties(Loc::from_index(adj)) > 1 {
                     return false;
                 }
-            } 
-            else if adj_color == opponent_color {
-                if self.get_num_liberties(Loc::from_index(adj))==1{
+            } else if adj_color == opponent_color {
+                if self.get_num_liberties(Loc::from_index(adj)) == 1 {
                     return false;
                 }
             }
         }
         true
     }
-    fn is_illegal_suicide(&self, loc: Loc, player: Player, multi_stone_suicide_legal:bool) -> bool{
+    fn is_illegal_suicide(
+        &self,
+        loc: Loc,
+        player: Player,
+        multi_stone_suicide_legal: bool,
+    ) -> bool {
         let i = loc.index();
         let player_color = Color::from(player);
         let opponent_color = Color::from(player.opponent());
-        for adj in Loc::adjacent_indices(i){
+        for adj in Loc::adjacent_indices(i) {
             let adj_color = self.colors[adj];
-            if adj_color.is_empty(){
+            if adj_color.is_empty() {
                 return false;
             }
-            if adj_color == player_color{
-                if multi_stone_suicide_legal{
+            if adj_color == player_color {
+                if multi_stone_suicide_legal {
                     return false;
                 }
-                if self.get_num_liberties(Loc::from_index(adj))>1{
+                if self.get_num_liberties(Loc::from_index(adj)) > 1 {
                     return false;
                 }
-            } 
-            else if adj_color == opponent_color {
-                if self.get_num_liberties(Loc::from_index(adj))==1{
+            } else if adj_color == opponent_color {
+                if self.get_num_liberties(Loc::from_index(adj)) == 1 {
                     return false;
                 }
             }
         }
-        true 
+        true
     }
-    fn is_legal(&self, loc: Loc, player: Player, multi_stone_suicide_legal: bool) -> bool{
-        if loc == Loc::PASS{
+    fn is_legal(&self, loc: Loc, player: Player, multi_stone_suicide_legal: bool) -> bool {
+        if loc == Loc::PASS {
             return true;
         }
-        if !self.colors[loc.index()].is_empty(){
+        if !self.colors[loc.index()].is_empty() {
             return false;
         }
-        if self.is_ko_banned(loc){
+        if self.is_ko_banned(loc) {
             return false;
         }
         !self.is_illegal_suicide(loc, player, multi_stone_suicide_legal)
     }
-    fn is_legal_ignoring_ko(&self, loc: Loc, player: Player, multi_stone_suicide_legal: bool) -> bool{
-        if loc == Loc::PASS{
+    fn is_legal_ignoring_ko(
+        &self,
+        loc: Loc,
+        player: Player,
+        multi_stone_suicide_legal: bool,
+    ) -> bool {
+        if loc == Loc::PASS {
             return true;
         }
-        if !self.colors[loc.index()].is_empty(){
+        if !self.colors[loc.index()].is_empty() {
             return false;
         }
         !self.is_illegal_suicide(loc, player, multi_stone_suicide_legal)
     }
-     
 }
 
 #[cfg(test)]
@@ -430,11 +439,18 @@ mod tests {
         let mut board = Board::new();
         let captured = loc(4, 4);
         let top = loc(4, 3);
+        let capture = loc(4, 5);
 
         play(&mut board, 4, 4, Player::White);
         play(&mut board, 4, 3, Player::Black);
         play(&mut board, 3, 4, Player::Black);
         play(&mut board, 5, 4, Player::Black);
+
+        // The final Black move has no directly empty neighbor, but captures
+        // White's one-liberty chain and is therefore not suicide.
+        assert!(!board.is_suicide(capture, Player::Black));
+        assert!(board.is_legal(capture, Player::Black, false));
+
         play(&mut board, 4, 5, Player::Black);
 
         assert_eq!(board.colors[captured.index()], Color::Empty);
@@ -465,6 +481,9 @@ mod tests {
         assert_eq!(board.get_chain_size(capture), 1);
         assert_eq!(board.get_num_liberties(capture), 1);
         assert_eq!(board.simple_ko, Some(captured));
+        assert!(board.is_ko_banned(captured));
+        assert!(!board.is_legal(captured, Player::White, true));
+        assert!(board.is_legal_ignoring_ko(captured, Player::White, true));
     }
 
     #[test]
@@ -480,5 +499,52 @@ mod tests {
         play(&mut board, 4, 4, Player::Black);
 
         assert_eq!(board.colors[suicide_point.index()], Color::Empty);
+    }
+
+    #[test]
+    fn legality_rejects_occupied_and_wall_locations() {
+        let mut board = Board::new();
+        let occupied = loc(4, 4);
+
+        play(&mut board, 4, 4, Player::Black);
+
+        assert!(!board.is_legal(occupied, Player::White, true));
+        assert!(!board.is_legal_ignoring_ko(occupied, Player::White, true));
+        assert!(!board.is_legal(Loc::NULL, Player::Black, true));
+        assert!(!board.is_legal_ignoring_ko(Loc::NULL, Player::Black, true));
+    }
+
+    #[test]
+    fn pass_is_legal_and_clears_simple_ko_without_changing_stones() {
+        let mut board = Board::new();
+        let stone = loc(4, 4);
+
+        play(&mut board, 4, 4, Player::Black);
+        board.simple_ko = Some(loc(3, 3));
+
+        assert!(board.is_legal(Loc::PASS, Player::White, true));
+        assert!(board.is_legal_ignoring_ko(Loc::PASS, Player::White, true));
+
+        board.play_move_assume_legal(Loc::PASS, Player::White);
+
+        assert_eq!(board.simple_ko, None);
+        assert_eq!(board.colors[stone.index()], Color::Black);
+    }
+
+    #[test]
+    fn single_stone_suicide_is_illegal_under_both_suicide_settings() {
+        let mut board = Board::new();
+        let suicide_point = loc(4, 4);
+
+        play(&mut board, 4, 3, Player::White);
+        play(&mut board, 5, 4, Player::White);
+        play(&mut board, 4, 5, Player::White);
+        play(&mut board, 3, 4, Player::White);
+
+        assert!(board.is_suicide(suicide_point, Player::Black));
+        assert!(board.is_illegal_suicide(suicide_point, Player::Black, false));
+        assert!(board.is_illegal_suicide(suicide_point, Player::Black, true));
+        assert!(!board.is_legal(suicide_point, Player::Black, false));
+        assert!(!board.is_legal(suicide_point, Player::Black, true));
     }
 }
