@@ -1,10 +1,13 @@
+use super::hash::{PositionHash, stone_hash};
+
+// can make these runtime-configurable in the future
 const BOARD_SIZE: usize = 9;
 const STRIDE: usize = BOARD_SIZE + 1; // first element of each row is the wall
-const ARRAY_LEN: usize = STRIDE * STRIDE + STRIDE + 1; //need bottom row of walls and bottom corner
+pub const ARRAY_LEN: usize = STRIDE * STRIDE + STRIDE + 1; //need bottom row of walls and bottom corner
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Color {
+pub enum Color {
     Empty = 0,
     Black = 1,
     White = 2,
@@ -28,7 +31,7 @@ pub enum Player {
 }
 
 impl Player {
-    fn opponent(self) -> Self {
+    pub fn opponent(self) -> Self {
         match self {
             Self::Black => Self::White,
             Self::White => Self::Black,
@@ -52,14 +55,14 @@ pub struct Loc(u16);
 impl Loc {
     const NULL: Self = Self(0);
     pub const PASS: Self = Self(1);
-    fn new(x: usize, y: usize) -> Option<Loc> {
+    pub fn new(x: usize, y: usize) -> Option<Loc> {
         if x < BOARD_SIZE && y < BOARD_SIZE {
             Some(Self(((x + 1) + (y + 1) * STRIDE) as u16))
         } else {
             None
         }
     }
-    fn index(self) -> usize {
+    pub fn index(self) -> usize {
         self.0 as usize // cant have u16
     }
     fn from_index(index: usize) -> Self {
@@ -94,10 +97,11 @@ pub struct Board {
     chain_head: [Loc; ARRAY_LEN],
     next_in_chain: [Loc; ARRAY_LEN],
     simple_ko: Option<Loc>,
+    position_hash: PositionHash,
 }
 
 impl Board {
-    fn new() -> Self {
+    pub fn new() -> Self {
         let mut colors = [Color::Empty; ARRAY_LEN];
         for i in 0..STRIDE {
             colors[i] = Color::Wall;
@@ -116,6 +120,7 @@ impl Board {
             chain_head: [Loc(0); ARRAY_LEN],
             next_in_chain: [Loc(0); ARRAY_LEN],
             simple_ko: None,
+            position_hash: 0,
         }
     }
     fn is_empty(&self) -> bool {
@@ -213,7 +218,8 @@ impl Board {
     fn remove_chain(&mut self, loc: Loc) -> u16 {
         let mut cur = loc;
         let mut counter = 0_u16;
-        let other_player = match self.colors[loc.index()] {
+        let current_color = self.colors[loc.index()];
+        let other_player = match current_color {
             Color::Black => Player::White,
             Color::White => Player::Black,
             _ => unreachable!("can only remove stones"),
@@ -223,6 +229,9 @@ impl Board {
 
             counter += 1;
             self.colors[i] = Color::Empty; //clear
+
+            //update position hash
+            self.position_hash ^= stone_hash(cur, current_color);
 
             self.change_surrounding_liberties(cur, other_player, 1); //increment liberties
 
@@ -235,7 +244,7 @@ impl Board {
         counter
     }
 
-    fn play_move_assume_legal(&mut self, loc: Loc, player: Player) {
+    pub fn play_move_assume_legal(&mut self, loc: Loc, player: Player) {
         //create new chain, merge with nearby chains, decrement opponent liberties, kill and increment liberties and mark ko
         self.simple_ko = None;
         if loc == Loc::PASS {
@@ -256,6 +265,9 @@ impl Board {
         };
         self.chain_head[i] = loc;
         self.next_in_chain[i] = loc;
+
+        //update hash
+        self.position_hash ^= stone_hash(loc, player_color);
 
         self.change_surrounding_liberties(loc, opponent_player, -1);
         for adj in Loc::adjacent_indices(i) {
@@ -349,7 +361,7 @@ impl Board {
         }
         !self.is_illegal_suicide(loc, player, multi_stone_suicide_legal)
     }
-    fn is_legal_ignoring_ko(
+    pub fn is_legal_ignoring_ko(
         &self,
         loc: Loc,
         player: Player,
@@ -363,6 +375,9 @@ impl Board {
         }
         !self.is_illegal_suicide(loc, player, multi_stone_suicide_legal)
     }
+    pub fn position_hash(&self) -> PositionHash {
+        self.position_hash
+    }
 }
 
 #[cfg(test)]
@@ -375,6 +390,19 @@ mod tests {
 
     fn play(board: &mut Board, x: usize, y: usize, player: Player) {
         board.play_move_assume_legal(loc(x, y), player);
+    }
+
+    fn assert_position_hash_matches_recomputation(board: &Board) {
+        let mut recomputed = 0;
+
+        for i in 0..ARRAY_LEN {
+            let color = board.colors[i];
+            if color == Color::Black || color == Color::White {
+                recomputed ^= super::stone_hash(Loc::from_index(i), color);
+            }
+        }
+
+        assert_eq!(board.position_hash(), recomputed);
     }
 
     #[test]
@@ -546,5 +574,50 @@ mod tests {
         assert!(board.is_illegal_suicide(suicide_point, Player::Black, true));
         assert!(!board.is_legal(suicide_point, Player::Black, false));
         assert!(!board.is_legal(suicide_point, Player::Black, true));
+    }
+
+    #[test]
+    fn position_hash_matches_recomputation_after_moves_and_pass() {
+        let mut board = Board::new();
+        let empty_hash = board.position_hash();
+
+        assert_eq!(empty_hash, 0);
+        assert_position_hash_matches_recomputation(&board);
+
+        board.play_move_assume_legal(Loc::PASS, Player::Black);
+        assert_eq!(board.position_hash(), empty_hash);
+        assert_position_hash_matches_recomputation(&board);
+
+        play(&mut board, 4, 4, Player::Black);
+        assert_position_hash_matches_recomputation(&board);
+
+        play(&mut board, 0, 0, Player::White);
+        assert_position_hash_matches_recomputation(&board);
+    }
+
+    #[test]
+    fn position_hash_matches_recomputation_after_multi_stone_capture_and_suicide() {
+        let mut capture_board = Board::new();
+
+        play(&mut capture_board, 4, 4, Player::Black);
+        play(&mut capture_board, 4, 5, Player::Black);
+        for (x, y) in [(3, 4), (3, 5), (5, 4), (5, 5), (4, 3), (4, 6)] {
+            play(&mut capture_board, x, y, Player::White);
+            assert_position_hash_matches_recomputation(&capture_board);
+        }
+        assert_eq!(capture_board.colors[loc(4, 4).index()], Color::Empty);
+        assert_eq!(capture_board.colors[loc(4, 5).index()], Color::Empty);
+
+        let mut suicide_board = Board::new();
+        for (x, y) in [(4, 3), (5, 4), (4, 5), (3, 4)] {
+            play(&mut suicide_board, x, y, Player::White);
+        }
+        let before_suicide = suicide_board.position_hash();
+
+        play(&mut suicide_board, 4, 4, Player::Black);
+
+        assert_eq!(suicide_board.colors[loc(4, 4).index()], Color::Empty);
+        assert_eq!(suicide_board.position_hash(), before_suicide);
+        assert_position_hash_matches_recomputation(&suicide_board);
     }
 }
