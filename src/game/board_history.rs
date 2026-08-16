@@ -1,20 +1,28 @@
 use super::board::{Board, Loc, Player};
+use super::hash::PositionHash;
 use super::rules::Rules;
+
+use std::collections::HashSet;
 
 struct BoardHistory {
     board: Board,
     rules: Rules,
     next_player: Player,
     consecutive_ending_passes: u8,
+    seen_position_hashes: HashSet<PositionHash>,
 }
 
 impl BoardHistory {
     fn new(rules: Rules) -> Self {
+        let board = Board::new();
+        let mut seen_position_hashes = HashSet::new();
+        seen_position_hashes.insert(board.position_hash());
         Self {
-            board: Board::new(),
+            board,
             rules,
             next_player: Player::Black,
             consecutive_ending_passes: 0,
+            seen_position_hashes,
         }
     }
     fn is_legal(&self, loc: Loc) -> bool {
@@ -25,9 +33,14 @@ impl BoardHistory {
         ) {
             return false;
         }
-        //check against history hash
-
-        true
+        if loc == Loc::PASS {
+            return true;
+        }
+        !self.seen_position_hashes.contains(
+            &self
+                .board
+                .get_position_hash_after_move(loc, self.next_player),
+        )
     }
 
     fn is_finished(&self) -> bool {
@@ -42,6 +55,7 @@ impl BoardHistory {
             self.consecutive_ending_passes += 1;
         } else {
             self.consecutive_ending_passes = 0;
+            self.seen_position_hashes.insert(self.board.position_hash());
         }
         self.next_player = self.next_player.opponent();
         true
@@ -104,5 +118,34 @@ mod tests {
         assert!(!history.play(point));
         assert_eq!(history.next_player, Player::White);
         assert_eq!(history.consecutive_ending_passes, 0);
+    }
+
+    #[test]
+    fn positional_superko_rejects_immediate_ko_recapture() {
+        let mut history = BoardHistory::new(rules());
+        let capture = loc(4, 5);
+        let recapture = loc(4, 4);
+
+        for move_loc in [
+            loc(4, 3),
+            loc(4, 4),
+            loc(3, 4),
+            loc(4, 6),
+            loc(5, 4),
+            loc(3, 5),
+            loc(0, 0),
+            loc(5, 5),
+            capture,
+        ] {
+            assert!(history.play(move_loc));
+        }
+
+        assert_eq!(history.next_player, Player::White);
+        assert!(history.board.is_legal_ignoring_ko(
+            recapture,
+            Player::White,
+            history.rules.multi_stone_suicide_legal,
+        ));
+        assert!(!history.is_legal(recapture));
     }
 }

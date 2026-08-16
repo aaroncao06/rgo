@@ -160,17 +160,17 @@ impl Board {
             if self.colors[adj] != owner {
                 continue;
             }
-            let head = self.chain_head[adj];
-            if seen_heads[..seen_len].contains(&head) {
+            let adj_head = self.chain_head[adj];
+            if seen_heads[..seen_len].contains(&adj_head) {
                 continue;
             }
-            let data = &mut self.chain_data[head.index()];
+            let data = &mut self.chain_data[adj_head.index()];
             data.num_liberties = data
                 .num_liberties
                 .checked_add_signed(delta)
                 .expect("liberty count underflow/overflow");
 
-            seen_heads[seen_len] = head;
+            seen_heads[seen_len] = adj_head;
             seen_len += 1;
         }
     }
@@ -377,6 +377,76 @@ impl Board {
     }
     pub fn position_hash(&self) -> PositionHash {
         self.position_hash
+    }
+    fn chain_iter(&self, start: Loc) -> impl Iterator<Item = Loc> + '_ {
+        std::iter::successors(Some(start), move |&current| {
+            let next = self.next_in_chain[current.index()];
+            (next != start).then_some(next) // just an if statement lol
+        })
+    }
+    pub fn get_position_hash_after_move(&self, loc: Loc, player: Player) -> PositionHash {
+        if loc == Loc::PASS {
+            return self.position_hash;
+        }
+        let mut new_position_hash = self.position_hash;
+        let i = loc.index();
+        let current_color = Color::from(player);
+        let opponent_color = Color::from(player.opponent());
+
+        let mut seen_heads = [Loc(0); 4]; // update distinct chains once
+        let mut seen_len = 0;
+
+        let mut suicide_heads = [Loc(0); 4];
+        let mut suicide_len = 0;
+
+        let mut suicide = true;
+        for adj in Loc::adjacent_indices(i) {
+            let adj_color = self.colors[adj];
+            if adj_color == Color::Empty {
+                suicide = false;
+                continue;
+            }
+            if adj_color == Color::Wall {
+                continue;
+            }
+
+            let adj_head = self.chain_head[adj];
+            if seen_heads[..seen_len].contains(&adj_head) {
+                continue;
+            }
+
+            let adj_liberties = self.chain_data[adj_head.index()].num_liberties;
+
+            if adj_color == current_color {
+                if adj_liberties > 1 {
+                    suicide = false;
+                } else {
+                    // liberties = 1
+                    suicide_heads[suicide_len] = adj_head;
+                    suicide_len += 1;
+                }
+            } else if adj_color == opponent_color && adj_liberties == 1 {
+                //kill them
+                suicide = false;
+                for killed_loc in self.chain_iter(adj_head) {
+                    new_position_hash ^= stone_hash(killed_loc, opponent_color);
+                }
+            }
+
+            seen_heads[seen_len] = adj_head;
+            seen_len += 1;
+        }
+        if suicide {
+            // go through each suicide chain and update position hash with each
+            for &suicide_head in &suicide_heads[..suicide_len] {
+                for killed_loc in self.chain_iter(suicide_head) {
+                    new_position_hash ^= stone_hash(killed_loc, current_color);
+                }
+            }
+        } else {
+            new_position_hash ^= stone_hash(loc, current_color);
+        }
+        new_position_hash
     }
 }
 
@@ -619,5 +689,38 @@ mod tests {
         assert_eq!(suicide_board.colors[loc(4, 4).index()], Color::Empty);
         assert_eq!(suicide_board.position_hash(), before_suicide);
         assert_position_hash_matches_recomputation(&suicide_board);
+    }
+
+    #[test]
+    fn position_hash_after_move_matches_played_position() {
+        let mut capture_board = Board::new();
+
+        play(&mut capture_board, 4, 4, Player::Black);
+        play(&mut capture_board, 4, 5, Player::Black);
+        for (x, y) in [(3, 4), (3, 5), (5, 4), (5, 5), (4, 3)] {
+            play(&mut capture_board, x, y, Player::White);
+        }
+
+        let capture = loc(4, 6);
+        let capture_hash = capture_board.get_position_hash_after_move(capture, Player::White);
+        let mut captured = capture_board.clone();
+        captured.play_move_assume_legal(capture, Player::White);
+        assert_eq!(capture_hash, captured.position_hash());
+
+        let mut suicide_board = Board::new();
+        for (x, y) in [(4, 3), (5, 4), (4, 5), (3, 4)] {
+            play(&mut suicide_board, x, y, Player::White);
+        }
+
+        let suicide = loc(4, 4);
+        let suicide_hash = suicide_board.get_position_hash_after_move(suicide, Player::Black);
+        let mut suicided = suicide_board.clone();
+        suicided.play_move_assume_legal(suicide, Player::Black);
+        assert_eq!(suicide_hash, suicided.position_hash());
+
+        assert_eq!(
+            suicide_board.get_position_hash_after_move(Loc::PASS, Player::Black),
+            suicide_board.position_hash(),
+        );
     }
 }
