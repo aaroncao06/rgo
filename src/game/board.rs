@@ -86,7 +86,7 @@ impl Loc {
     fn adjacent_indices(i: usize) -> [usize; 4] {
         [i + 1, i - STRIDE, i - 1, i + STRIDE] // unit circle direction lol
     }
-    fn board_iter() -> impl Iterator<Item = Loc> {
+    pub fn board_iter() -> impl Iterator<Item = Loc> {
         (1..=BOARD_SIZE).flat_map(|y| (1..=BOARD_SIZE).map(move |x| Loc((x + y * STRIDE) as u16)))
     }
 }
@@ -461,10 +461,22 @@ impl Board {
         new_position_hash
     }
 
-    fn calculate_area(&self) -> [Color; ARRAY_LEN] {
+    pub fn calculate_area(&self, multi_stone_suicide_legal: bool) -> [Color; ARRAY_LEN] {
         let mut result = [Color::Empty; ARRAY_LEN];
-        self.calculate_area_for_player(Player::Black, true, true, true, &mut result);
-        self.calculate_area_for_player(Player::White, true, true, true, &mut result);
+        self.calculate_area_for_player(
+            Player::Black,
+            true,
+            true,
+            multi_stone_suicide_legal,
+            &mut result,
+        );
+        self.calculate_area_for_player(
+            Player::White,
+            true,
+            true,
+            multi_stone_suicide_legal,
+            &mut result,
+        );
         for loc in Loc::board_iter() {
             let i = loc.index();
             if result[i].is_empty() {
@@ -1011,7 +1023,7 @@ mod tests {
     #[test]
     fn area_of_an_empty_board_is_neutral() {
         let board = Board::new();
-        let area = board.calculate_area();
+        let area = board.calculate_area(true);
 
         for point in Loc::board_iter() {
             assert_eq!(area[point.index()], Color::Empty);
@@ -1088,7 +1100,7 @@ mod tests {
         }
         play(&mut board, 0, 0, Player::White);
 
-        let area = board.calculate_area();
+        let area = board.calculate_area(true);
 
         assert_eq!(area[loc(4, 4).index()], Color::Black);
         assert_eq!(area[loc(6, 4).index()], Color::Black);

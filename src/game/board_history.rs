@@ -1,4 +1,4 @@
-use super::board::{Board, Loc, Player};
+use super::board::{Board, Color, Loc, Player};
 use super::hash::PositionHash;
 use super::rules::Rules;
 
@@ -60,6 +60,23 @@ impl BoardHistory {
         self.next_player = self.next_player.opponent();
         true
     }
+    fn count_area_score_white_minus_black(&self) -> i16 {
+        let area = self
+            .board
+            .calculate_area(self.rules.multi_stone_suicide_legal);
+        let mut score = 0_i16;
+        for loc in Loc::board_iter() {
+            match area[loc.index()] {
+                Color::White => score += 1,
+                Color::Black => score -= 1,
+                Color::Empty | Color::Wall => {}
+            }
+        }
+        score
+    }
+    fn final_score_white_minus_black(&self) -> f32 {
+        self.count_area_score_white_minus_black() as f32 + self.rules.komi
+    }
 }
 
 #[cfg(test)]
@@ -95,6 +112,42 @@ mod tests {
         assert!(!history.is_finished());
         assert!(history.play(Loc::PASS));
         assert!(history.is_finished());
+        assert_eq!(history.count_area_score_white_minus_black(), 0);
+        assert_eq!(history.final_score_white_minus_black(), 7.5);
+    }
+
+    #[test]
+    fn area_score_counts_a_two_eye_group_and_neutral_exterior() {
+        let mut history = BoardHistory::new(rules());
+
+        // Construct the position directly: a pass-alive Black group with two
+        // eyes, and one distant White stone in the exterior region.
+        for (x, y) in [
+            (3, 3),
+            (4, 3),
+            (5, 3),
+            (6, 3),
+            (7, 3),
+            (3, 4),
+            (5, 4),
+            (7, 4),
+            (3, 5),
+            (4, 5),
+            (5, 5),
+            (6, 5),
+            (7, 5),
+        ] {
+            history
+                .board
+                .play_move_assume_legal(loc(x, y), Player::Black);
+        }
+        history
+            .board
+            .play_move_assume_legal(loc(0, 0), Player::White);
+
+        // Black has 13 stones and two eyes; White has one stone.
+        assert_eq!(history.count_area_score_white_minus_black(), -14);
+        assert_eq!(history.final_score_white_minus_black(), -6.5);
     }
 
     #[test]
