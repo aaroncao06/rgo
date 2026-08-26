@@ -4,7 +4,7 @@ use super::rules::Rules;
 
 use std::collections::HashSet;
 
-struct BoardHistory {
+pub struct GameState {
     board: Board,
     rules: Rules,
     next_player: Player,
@@ -12,8 +12,8 @@ struct BoardHistory {
     seen_position_hashes: HashSet<PositionHash>,
 }
 
-impl BoardHistory {
-    fn new(rules: Rules) -> Self {
+impl GameState {
+    pub fn new(rules: Rules) -> Self {
         let board = Board::new();
         let mut seen_position_hashes = HashSet::new();
         seen_position_hashes.insert(board.position_hash());
@@ -25,7 +25,7 @@ impl BoardHistory {
             seen_position_hashes,
         }
     }
-    fn is_legal(&self, loc: Loc) -> bool {
+    pub fn is_legal(&self, loc: Loc) -> bool {
         if !self.board.is_legal_ignoring_ko(
             loc,
             self.next_player,
@@ -96,7 +96,7 @@ mod tests {
 
     #[test]
     fn black_moves_first_and_a_successful_move_flips_turn() {
-        let mut history = BoardHistory::new(rules());
+        let mut history = GameState::new(rules());
 
         assert_eq!(history.next_player, Player::Black);
         assert!(history.play(loc(4, 4)));
@@ -106,7 +106,7 @@ mod tests {
 
     #[test]
     fn two_passes_finish_the_game() {
-        let mut history = BoardHistory::new(rules());
+        let mut history = GameState::new(rules());
 
         assert!(history.play(Loc::PASS));
         assert!(!history.is_finished());
@@ -118,7 +118,7 @@ mod tests {
 
     #[test]
     fn area_score_counts_a_two_eye_group_and_neutral_exterior() {
-        let mut history = BoardHistory::new(rules());
+        let mut history = GameState::new(rules());
 
         // Construct the position directly: a pass-alive Black group with two
         // eyes, and one distant White stone in the exterior region.
@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn stone_move_resets_consecutive_passes() {
-        let mut history = BoardHistory::new(rules());
+        let mut history = GameState::new(rules());
 
         assert!(history.play(Loc::PASS));
         assert_eq!(history.consecutive_ending_passes, 1);
@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn illegal_move_does_not_change_history_state() {
-        let mut history = BoardHistory::new(rules());
+        let mut history = GameState::new(rules());
         let point = loc(4, 4);
 
         assert!(history.play(point));
@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     fn positional_superko_rejects_immediate_ko_recapture() {
-        let mut history = BoardHistory::new(rules());
+        let mut history = GameState::new(rules());
         let capture = loc(4, 5);
         let recapture = loc(4, 4);
 

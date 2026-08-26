@@ -1,8 +1,8 @@
 use super::hash::{PositionHash, stone_hash};
 
 // can make these runtime-configurable in the future
-const BOARD_SIZE: usize = 9;
-const STRIDE: usize = BOARD_SIZE + 1; // first element of each row is the wall
+pub const BOARD_SIZE: usize = 9;
+pub const STRIDE: usize = BOARD_SIZE + 1; // first element of each row is the wall
 pub const ARRAY_LEN: usize = STRIDE * STRIDE + STRIDE + 1; //need bottom row of walls and bottom corner
 
 const MAX_PLAYER_HEADS: usize = (BOARD_SIZE * BOARD_SIZE + 1) / 2;
@@ -57,7 +57,7 @@ impl From<Player> for Color {
 pub struct Loc(u16);
 
 impl Loc {
-    const NULL: Self = Self(0);
+    pub const NULL: Self = Self(0);
     pub const PASS: Self = Self(1);
     pub fn new(x: usize, y: usize) -> Option<Loc> {
         if x < BOARD_SIZE && y < BOARD_SIZE {
@@ -69,14 +69,14 @@ impl Loc {
     pub fn index(self) -> usize {
         self.0 as usize // cant have u16
     }
-    fn from_index(index: usize) -> Self {
+    pub fn from_index(index: usize) -> Self {
         debug_assert!(index < ARRAY_LEN);
         Self(index as u16)
     }
-    fn x(self) -> usize {
+    pub fn x(self) -> usize {
         (self.0 as usize) % STRIDE - 1
     }
-    fn y(self) -> usize {
+    pub fn y(self) -> usize {
         (self.0 as usize) / STRIDE - 1
     }
     fn is_adjacent(loc1: Self, loc2: Self) -> bool {
@@ -88,6 +88,12 @@ impl Loc {
     }
     pub fn board_iter() -> impl Iterator<Item = Loc> {
         (1..=BOARD_SIZE).flat_map(|y| (1..=BOARD_SIZE).map(move |x| Loc((x + y * STRIDE) as u16)))
+    }
+    pub fn is_on_board(self) -> bool {
+        let i = self.index();
+        let padded_x = i % STRIDE;
+        let padded_y = i / STRIDE;
+        padded_x > 0 && padded_x <= BOARD_SIZE && padded_y > 0 && padded_y <= BOARD_SIZE
     }
 }
 
