@@ -105,11 +105,11 @@ struct ChainData {
 
 #[derive(Clone)]
 pub struct Board {
-    colors: [Color; ARRAY_LEN], // flat board array
+    pub colors: [Color; ARRAY_LEN], // flat board array
     chain_data: [ChainData; ARRAY_LEN],
     chain_head: [Loc; ARRAY_LEN],
     next_in_chain: [Loc; ARRAY_LEN],
-    simple_ko: Option<Loc>,
+    pub simple_ko: Option<Loc>,
     position_hash: PositionHash,
 }
 

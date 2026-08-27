@@ -1,3 +1,5 @@
+use crate::game::board::ARRAY_LEN;
+
 use super::board::{Board, Color, Loc, Player};
 use super::hash::PositionHash;
 use super::rules::Rules;
@@ -5,10 +7,11 @@ use super::rules::Rules;
 use std::collections::HashSet;
 
 pub struct GameState {
-    board: Board,
-    rules: Rules,
-    next_player: Player,
-    consecutive_ending_passes: u8,
+    pub board: Board,
+    pub rules: Rules,
+    pub next_player: Player,
+    pub consecutive_ending_passes: u8,
+    pub superko_banned: [bool; ARRAY_LEN],
     seen_position_hashes: HashSet<PositionHash>,
 }
 
@@ -17,12 +20,28 @@ impl GameState {
         let board = Board::new();
         let mut seen_position_hashes = HashSet::new();
         seen_position_hashes.insert(board.position_hash());
+        let superko_banned = [false; ARRAY_LEN];
         Self {
             board,
             rules,
             next_player: Player::Black,
             consecutive_ending_passes: 0,
+            superko_banned,
             seen_position_hashes,
+        }
+    }
+    fn rebuild_superko_banned(&mut self) {
+        // Maintain separately from the legal mask.
+        for loc in Loc::board_iter() {
+            self.superko_banned[loc.index()] = self.board.is_legal_ignoring_ko(
+                loc,
+                self.next_player,
+                self.rules.multi_stone_suicide_legal,
+            ) && self.seen_position_hashes.contains(
+                &self
+                    .board
+                    .get_position_hash_after_move(loc, self.next_player),
+            );
         }
     }
     pub fn is_legal(&self, loc: Loc) -> bool {
@@ -33,20 +52,12 @@ impl GameState {
         ) {
             return false;
         }
-        if loc == Loc::PASS {
-            return true;
-        }
-        !self.seen_position_hashes.contains(
-            &self
-                .board
-                .get_position_hash_after_move(loc, self.next_player),
-        )
+        loc == Loc::PASS || !self.superko_banned[loc.index()]
     }
-
     fn is_finished(&self) -> bool {
         self.consecutive_ending_passes >= 2
     }
-    fn play(&mut self, loc: Loc) -> bool {
+    pub fn play(&mut self, loc: Loc) -> bool {
         if !self.is_legal(loc) {
             return false;
         }
@@ -58,6 +69,8 @@ impl GameState {
             self.seen_position_hashes.insert(self.board.position_hash());
         }
         self.next_player = self.next_player.opponent();
+        // recompute mask
+        self.rebuild_superko_banned();
         true
     }
     fn count_area_score_white_minus_black(&self) -> i16 {
@@ -200,5 +213,44 @@ mod tests {
             history.rules.multi_stone_suicide_legal,
         ));
         assert!(!history.is_legal(recapture));
+    }
+
+    #[test]
+    fn cached_superko_mask_matches_direct_legality_after_a_ko_capture() {
+        let mut history = GameState::new(rules());
+
+        for move_loc in [
+            loc(4, 3),
+            loc(4, 4),
+            loc(3, 4),
+            loc(4, 6),
+            loc(5, 4),
+            loc(3, 5),
+            loc(0, 0),
+            loc(5, 5),
+            loc(4, 5),
+        ] {
+            assert!(history.play(move_loc));
+        }
+
+        for loc in Loc::board_iter() {
+            let locally_legal = history.board.is_legal_ignoring_ko(
+                loc,
+                history.next_player,
+                history.rules.multi_stone_suicide_legal,
+            );
+            let directly_superko_banned = locally_legal
+                && history.seen_position_hashes.contains(
+                    &history
+                        .board
+                        .get_position_hash_after_move(loc, history.next_player),
+                );
+
+            assert_eq!(history.superko_banned[loc.index()], directly_superko_banned);
+            assert_eq!(
+                history.is_legal(loc),
+                locally_legal && !directly_superko_banned
+            );
+        }
     }
 }
