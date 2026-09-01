@@ -13,23 +13,22 @@ pub struct NNInputs {
 
 impl NNInputs {
     pub fn encode(game_state: &GameState) -> Self {
-        let current_player = game_state.next_player;
+        let current_player = game_state.next_player();
         let current_color = Color::from(current_player);
         let opponent_color = Color::from(current_player.opponent());
 
         let mut global = [0_f32; NUM_GLOBAL_FEATURES];
         match current_color {
-            Color::White => global[0] = game_state.rules.komi,
-            Color::Black => global[0] = -game_state.rules.komi,
+            Color::White => global[0] = game_state.rules().komi,
+            Color::Black => global[0] = -game_state.rules().komi,
             _ => {}
         }
-        global[1] = game_state.consecutive_ending_passes as f32;
+        global[1] = game_state.consecutive_ending_passes() as f32;
 
         // encode spatial maps
         let mut spatial = [0_f32; NUM_SPATIAL_FEATURES * BOARD_POLICY_SIZE];
         for loc in Loc::board_iter() {
-            let i = loc.index();
-            let color = game_state.board.colors[i];
+            let color = game_state.board().color_at(loc);
             let policy_idx = loc_to_policy(loc);
 
             if color == current_color {
@@ -37,7 +36,7 @@ impl NNInputs {
             } else if color == opponent_color {
                 spatial[BOARD_POLICY_SIZE + policy_idx] = 1_f32;
             }
-            if game_state.superko_banned[i] {
+            if game_state.is_superko_banned(loc) {
                 spatial[2 * BOARD_POLICY_SIZE + policy_idx] = 1_f32;
             }
         }
@@ -89,7 +88,7 @@ mod tests {
         assert_eq!(white_turn_inputs.global, [7.5, 0.0]);
 
         assert!(game_state.play(white_stone));
-        assert_eq!(game_state.next_player, Player::Black);
+        assert_eq!(game_state.next_player(), Player::Black);
 
         let inputs = NNInputs::encode(&game_state);
         let white_pos = loc_to_policy(white_stone);
@@ -123,7 +122,7 @@ mod tests {
         let inputs = NNInputs::encode(&game_state);
         let recapture_pos = loc_to_policy(recapture);
 
-        assert!(game_state.superko_banned[recapture.index()]);
+        assert!(game_state.is_superko_banned(recapture));
         assert_eq!(inputs.spatial[2 * BOARD_POLICY_SIZE + recapture_pos], 1.0);
     }
 }

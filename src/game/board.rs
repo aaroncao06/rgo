@@ -105,11 +105,11 @@ struct ChainData {
 
 #[derive(Clone)]
 pub struct Board {
-    pub colors: [Color; ARRAY_LEN], // flat board array
+    colors: [Color; ARRAY_LEN], // flat board array
     chain_data: [ChainData; ARRAY_LEN],
     chain_head: [Loc; ARRAY_LEN],
     next_in_chain: [Loc; ARRAY_LEN],
-    pub simple_ko: Option<Loc>,
+    simple_ko: Option<Loc>,
     position_hash: PositionHash,
 }
 
@@ -135,6 +135,9 @@ impl Board {
             simple_ko: None,
             position_hash: 0,
         }
+    }
+    pub fn color_at(&self, loc: Loc) -> Color {
+        self.colors[loc.index()]
     }
     fn is_empty(&self) -> bool {
         self.colors
@@ -777,6 +780,109 @@ mod tests {
         assert_eq!(board.position_hash(), recomputed);
     }
 
+    fn assert_chain_metadata_matches_recomputation(board: &Board) {
+        let mut visited = [false; ARRAY_LEN];
+
+        for start in Loc::board_iter() {
+            let start_i = start.index();
+            let color = board.colors[start_i];
+            if visited[start_i] || (color != Color::Black && color != Color::White) {
+                continue;
+            }
+
+            let mut component = [false; ARRAY_LEN];
+            let mut liberties = [false; ARRAY_LEN];
+            let mut queue = [Loc::NULL; ARRAY_LEN];
+            let mut queue_head = 0;
+            let mut queue_tail = 1;
+            queue[0] = start;
+            visited[start_i] = true;
+
+            while queue_head < queue_tail {
+                let current = queue[queue_head];
+                queue_head += 1;
+                let current_i = current.index();
+                component[current_i] = true;
+
+                for adj_i in Loc::adjacent_indices(current_i) {
+                    if board.colors[adj_i] == color && !visited[adj_i] {
+                        visited[adj_i] = true;
+                        queue[queue_tail] = Loc::from_index(adj_i);
+                        queue_tail += 1;
+                    } else if board.colors[adj_i] == Color::Empty {
+                        liberties[adj_i] = true;
+                    }
+                }
+            }
+
+            let expected_size = component.iter().filter(|&&present| present).count() as u16;
+            let expected_liberties = liberties.iter().filter(|&&present| present).count() as u16;
+            let head = board.chain_head[start_i];
+
+            assert_eq!(board.get_chain_size(start), expected_size);
+            assert_eq!(board.get_num_liberties(start), expected_liberties);
+            assert_eq!(board.colors[head.index()], color);
+
+            let mut linked_list = [false; ARRAY_LEN];
+            let mut linked_list_size = 0;
+            for chain_loc in board.chain_iter(head).take(ARRAY_LEN) {
+                let chain_i = chain_loc.index();
+                assert!(!linked_list[chain_i], "chain list repeated before closing");
+                assert_eq!(board.colors[chain_i], color);
+                assert_eq!(board.chain_head[chain_i], head);
+                linked_list[chain_i] = true;
+                linked_list_size += 1;
+            }
+            assert_eq!(linked_list_size, expected_size as usize);
+            assert_eq!(linked_list, component);
+        }
+    }
+
+    fn board_from_ascii(rows: [&str; BOARD_SIZE]) -> Board {
+        let mut board = Board::new();
+
+        for (stone, player) in [('x', Player::Black), ('o', Player::White)] {
+            for (y, row) in rows.iter().enumerate() {
+                assert_eq!(row.len(), BOARD_SIZE);
+                for (x, cell) in row.bytes().enumerate() {
+                    if cell == stone as u8 {
+                        board.play_move_assume_legal(loc(x, y), player);
+                    }
+                }
+            }
+        }
+
+        for (y, row) in rows.iter().enumerate() {
+            for (x, cell) in row.bytes().enumerate() {
+                let expected = match cell {
+                    b'x' => Color::Black,
+                    b'o' => Color::White,
+                    b'.' => Color::Empty,
+                    _ => panic!("invalid board character"),
+                };
+                assert_eq!(board.colors[loc(x, y).index()], expected);
+            }
+        }
+        assert_chain_metadata_matches_recomputation(&board);
+        assert_position_hash_matches_recomputation(&board);
+        board
+    }
+
+    fn assert_area_rows(area: &[Color; ARRAY_LEN], expected: [&str; BOARD_SIZE]) {
+        for (y, row) in expected.iter().enumerate() {
+            assert_eq!(row.len(), BOARD_SIZE);
+            for (x, cell) in row.bytes().enumerate() {
+                let expected_color = match cell {
+                    b'X' => Color::Black,
+                    b'O' => Color::White,
+                    b'.' => Color::Empty,
+                    _ => panic!("invalid area character"),
+                };
+                assert_eq!(area[loc(x, y).index()], expected_color, "at ({x}, {y})");
+            }
+        }
+    }
+
     #[test]
     fn loc_round_trips_coordinates_and_knows_adjacency() {
         let point = loc(4, 7);
@@ -832,6 +938,53 @@ mod tests {
         assert_eq!(board.get_chain_size(left), 2);
         assert_eq!(board.get_chain_size(right), 2);
         assert_eq!(board.get_num_liberties(left), 6);
+    }
+
+    #[test]
+    fn one_move_merges_two_preexisting_friendly_chains() {
+        let mut board = Board::new();
+        let left = loc(3, 4);
+        let bridge = loc(4, 4);
+        let right = loc(5, 4);
+
+        play(&mut board, 3, 4, Player::Black);
+        play(&mut board, 5, 4, Player::Black);
+        assert_ne!(
+            board.chain_head[left.index()],
+            board.chain_head[right.index()]
+        );
+
+        play(&mut board, 4, 4, Player::Black);
+
+        assert_eq!(
+            board.chain_head[left.index()],
+            board.chain_head[bridge.index()]
+        );
+        assert_eq!(
+            board.chain_head[right.index()],
+            board.chain_head[bridge.index()]
+        );
+        assert_eq!(board.get_chain_size(bridge), 3);
+        assert_eq!(board.get_num_liberties(bridge), 8);
+        assert_chain_metadata_matches_recomputation(&board);
+    }
+
+    #[test]
+    fn touching_one_chain_from_two_directions_updates_its_liberty_once() {
+        let mut board = Board::new();
+        let played = loc(4, 4);
+        let chain_stone = loc(3, 4);
+
+        for (x, y) in [(3, 4), (3, 3), (4, 3)] {
+            play(&mut board, x, y, Player::White);
+        }
+        assert_eq!(board.get_num_liberties(chain_stone), 7);
+
+        play(&mut board, 4, 4, Player::Black);
+
+        assert_eq!(board.get_num_liberties(chain_stone), 6);
+        assert_chain_metadata_matches_recomputation(&board);
+        assert_eq!(board.colors[played.index()], Color::Black);
     }
 
     #[test]
@@ -946,6 +1099,60 @@ mod tests {
         assert!(board.is_illegal_suicide(suicide_point, Player::Black, true));
         assert!(!board.is_legal(suicide_point, Player::Black, false));
         assert!(!board.is_legal(suicide_point, Player::Black, true));
+    }
+
+    #[test]
+    fn multi_stone_suicide_rule_changes_legality_and_removes_the_chain() {
+        let mut board = Board::new();
+        let existing_stone = loc(4, 4);
+        let suicide_move = loc(4, 5);
+
+        play(&mut board, 4, 4, Player::Black);
+        for (x, y) in [(4, 3), (3, 4), (5, 4), (3, 5), (5, 5), (4, 6)] {
+            play(&mut board, x, y, Player::White);
+        }
+
+        assert_eq!(board.get_num_liberties(existing_stone), 1);
+        assert!(!board.is_legal_ignoring_ko(suicide_move, Player::Black, false));
+        assert!(board.is_legal_ignoring_ko(suicide_move, Player::Black, true));
+
+        board.play_move_assume_legal(suicide_move, Player::Black);
+
+        assert_eq!(board.colors[existing_stone.index()], Color::Empty);
+        assert_eq!(board.colors[suicide_move.index()], Color::Empty);
+        assert_chain_metadata_matches_recomputation(&board);
+        assert_position_hash_matches_recomputation(&board);
+    }
+
+    #[test]
+    fn randomized_play_preserves_incremental_chain_and_hash_invariants() {
+        let mut board = Board::new();
+        let mut player = Player::Black;
+        let mut random_state = 0x7267_6f5f_7465_7374_u64;
+
+        for _ in 0..2_000 {
+            random_state = random_state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let action = (random_state as usize) % (BOARD_SIZE * BOARD_SIZE + 1);
+            let move_loc = if action == BOARD_SIZE * BOARD_SIZE {
+                Loc::PASS
+            } else {
+                loc(action % BOARD_SIZE, action / BOARD_SIZE)
+            };
+
+            if !board.is_legal(move_loc, player, true) {
+                continue;
+            }
+
+            let predicted_hash = board.get_position_hash_after_move(move_loc, player);
+            board.play_move_assume_legal(move_loc, player);
+
+            assert_eq!(board.position_hash(), predicted_hash);
+            assert_position_hash_matches_recomputation(&board);
+            assert_chain_metadata_matches_recomputation(&board);
+            player = player.opponent();
+        }
     }
 
     #[test]
@@ -1113,5 +1320,78 @@ mod tests {
         assert_eq!(area[loc(5, 4).index()], Color::Black);
         assert_eq!(area[loc(0, 0).index()], Color::White);
         assert_eq!(area[loc(0, 1).index()], Color::Empty);
+    }
+
+    #[test]
+    fn surrounded_pass_dead_stone_is_scored_for_the_surrounding_player() {
+        let mut board = Board::new();
+
+        // One connected Black chain surrounds two one-point eyes and a third
+        // chamber containing a White stone with one remaining liberty.
+        for x in 1..=8 {
+            play(&mut board, x, 3, Player::Black);
+            play(&mut board, x, 5, Player::Black);
+        }
+        for x in [1, 3, 5, 8] {
+            play(&mut board, x, 4, Player::Black);
+        }
+        let dead_white = loc(6, 4);
+        play(&mut board, 6, 4, Player::White);
+
+        let area = board.calculate_area(true);
+
+        assert_eq!(board.colors[dead_white.index()], Color::White);
+        assert_eq!(area[dead_white.index()], Color::Black);
+        assert_eq!(area[loc(7, 4).index()], Color::Black);
+    }
+
+    #[test]
+    fn pass_alive_analysis_respects_multi_stone_suicide_legality() {
+        // Ported from KataGo's "Area 2" regression position. Treating
+        // multi-stone suicide as legal changes which chains satisfy Benson's
+        // vital-region condition.
+        let board = board_from_ascii([
+            "x.oooooo.",
+            "oox..xx.o",
+            "o...xox.o",
+            "o...x.x.o",
+            "oxxx.xx.o",
+            "ox..x...o",
+            "o.xox...o",
+            "o.xxx...o",
+            ".ooooooo.",
+        ]);
+
+        let suicide_illegal_area = board.calculate_area(false);
+        assert_area_rows(
+            &suicide_illegal_area,
+            [
+                "OOOOOOOOO",
+                "OOX..XX.O",
+                "O...XXX.O",
+                "O...XXX.O",
+                "OXXXXXX.O",
+                "OXXXX...O",
+                "O.XXX...O",
+                "O.XXX...O",
+                "OOOOOOOOO",
+            ],
+        );
+
+        let suicide_legal_area = board.calculate_area(true);
+        assert_area_rows(
+            &suicide_legal_area,
+            [
+                "X.OOOOOOO",
+                "OOX..XX.O",
+                "O...XOX.O",
+                "O...X.X.O",
+                "OXXXXXX.O",
+                "OX..X...O",
+                "O.XOX...O",
+                "O.XXX...O",
+                "OOOOOOOOO",
+            ],
+        );
     }
 }

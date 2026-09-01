@@ -7,11 +7,11 @@ use super::rules::Rules;
 use std::collections::HashSet;
 
 pub struct GameState {
-    pub board: Board,
-    pub rules: Rules,
-    pub next_player: Player,
-    pub consecutive_ending_passes: u8,
-    pub superko_banned: [bool; ARRAY_LEN],
+    board: Board,
+    rules: Rules,
+    next_player: Player,
+    consecutive_ending_passes: u8,
+    superko_banned: [bool; ARRAY_LEN],
     seen_position_hashes: HashSet<PositionHash>,
 }
 
@@ -29,6 +29,22 @@ impl GameState {
             superko_banned,
             seen_position_hashes,
         }
+    }
+    pub fn board(&self) -> &Board {
+        &self.board
+    }
+    pub fn rules(&self) -> &Rules {
+        &self.rules
+    }
+    pub fn next_player(&self) -> Player {
+        self.next_player
+    }
+    pub fn consecutive_ending_passes(&self) -> u8 {
+        self.consecutive_ending_passes
+    }
+    pub fn is_superko_banned(&self, loc: Loc) -> bool {
+        debug_assert!(loc.is_on_board());
+        self.superko_banned[loc.index()]
     }
     fn rebuild_superko_banned(&mut self) {
         // Maintain separately from the legal mask.
@@ -54,7 +70,7 @@ impl GameState {
         }
         loc == Loc::PASS || !self.superko_banned[loc.index()]
     }
-    fn is_finished(&self) -> bool {
+    pub fn is_finished(&self) -> bool {
         self.consecutive_ending_passes >= 2
     }
     pub fn play(&mut self, loc: Loc) -> bool {
@@ -87,7 +103,7 @@ impl GameState {
         }
         score
     }
-    fn final_score_white_minus_black(&self) -> f32 {
+    pub fn final_score_white_minus_black(&self) -> f32 {
         self.count_area_score_white_minus_black() as f32 + self.rules.komi
     }
 }
@@ -212,6 +228,39 @@ mod tests {
             Player::White,
             history.rules.multi_stone_suicide_legal,
         ));
+        assert!(!history.is_legal(recapture));
+    }
+
+    #[test]
+    fn positional_superko_rejects_recapture_after_intervening_passes() {
+        let mut history = GameState::new(rules());
+        let capture = loc(4, 5);
+        let recapture = loc(4, 4);
+
+        for move_loc in [
+            loc(4, 3),
+            recapture,
+            loc(3, 4),
+            loc(4, 6),
+            loc(5, 4),
+            loc(3, 5),
+            loc(0, 0),
+            loc(5, 5),
+            capture,
+        ] {
+            assert!(history.play(move_loc));
+        }
+
+        assert!(history.play(Loc::PASS));
+        assert!(history.play(Loc::PASS));
+        assert_eq!(history.next_player, Player::White);
+
+        assert!(history.board.is_legal_ignoring_ko(
+            recapture,
+            history.next_player,
+            history.rules.multi_stone_suicide_legal,
+        ));
+        assert!(history.superko_banned[recapture.index()]);
         assert!(!history.is_legal(recapture));
     }
 
