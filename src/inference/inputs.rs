@@ -1,6 +1,6 @@
+use super::policy::{BOARD_POLICY_SIZE, loc_to_policy};
 use crate::game::board::{Color, Loc};
 use crate::game::game_state::GameState;
-use crate::inference::policy::{BOARD_POLICY_SIZE, loc_to_policy};
 
 const NUM_SPATIAL_FEATURES: usize = 3; // player masks, superko banned
 const NUM_GLOBAL_FEATURES: usize = 2; // komi, passes
