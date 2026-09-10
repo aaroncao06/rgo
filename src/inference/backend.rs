@@ -8,12 +8,12 @@ use crate::inference::policy::POLICY_SIZE;
 use super::inputs::NNInput;
 
 #[derive(Debug, Clone)]
-pub enum InferenceError {
+pub(crate) enum InferenceError {
     ExecutionFailed,
     MismatchedBatchOutput,
     RuntimeClosed,
 }
-pub trait InferenceBackend {
+pub(crate) trait InferenceBackend {
     /// appends to outputs one result per input, preserving input order.
     /// on success, outputs.len must equal inputs.len, else returns err
     fn evaluate_batch(
@@ -25,8 +25,8 @@ pub trait InferenceBackend {
 
 #[cfg(test)]
 #[derive(Default)]
-pub(crate) struct DummyInferenceBackend {
-    pub(crate) batch_sizes: Vec<usize>, // for debugging
+struct DummyInferenceBackend {
+    batch_sizes: Vec<usize>, // for debugging
 }
 
 #[cfg(test)]

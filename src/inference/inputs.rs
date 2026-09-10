@@ -6,13 +6,13 @@ const NUM_SPATIAL_FEATURES: usize = 3; // player masks, superko banned
 const NUM_GLOBAL_FEATURES: usize = 2; // komi, passes
 
 // takes in current board,
-pub struct NNInput {
-    pub spatial: [f32; NUM_SPATIAL_FEATURES * BOARD_POLICY_SIZE],
-    pub global: [f32; NUM_GLOBAL_FEATURES],
+pub(crate) struct NNInput {
+    pub(crate) spatial: [f32; NUM_SPATIAL_FEATURES * BOARD_POLICY_SIZE],
+    pub(crate) global: [f32; NUM_GLOBAL_FEATURES],
 }
 
 impl NNInput {
-    pub fn encode(game_state: &GameState) -> Self {
+    pub(crate) fn encode(game_state: &GameState) -> Self {
         let current_player = game_state.next_player();
         let current_color = Color::from(current_player);
         let opponent_color = Color::from(current_player.opponent());

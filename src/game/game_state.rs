@@ -6,7 +6,7 @@ use super::rules::Rules;
 
 use std::collections::HashSet;
 
-pub struct GameState {
+pub(crate) struct GameState {
     board: Board,
     rules: Rules,
     next_player: Player,
@@ -16,7 +16,7 @@ pub struct GameState {
 }
 
 impl GameState {
-    pub fn new(rules: Rules) -> Self {
+    pub(crate) fn new(rules: Rules) -> Self {
         let board = Board::new();
         let mut seen_position_hashes = HashSet::new();
         seen_position_hashes.insert(board.position_hash());
@@ -30,19 +30,19 @@ impl GameState {
             seen_position_hashes,
         }
     }
-    pub fn board(&self) -> &Board {
+    pub(crate) fn board(&self) -> &Board {
         &self.board
     }
-    pub fn rules(&self) -> &Rules {
+    pub(crate) fn rules(&self) -> &Rules {
         &self.rules
     }
-    pub fn next_player(&self) -> Player {
+    pub(crate) fn next_player(&self) -> Player {
         self.next_player
     }
-    pub fn consecutive_ending_passes(&self) -> u8 {
+    pub(crate) fn consecutive_ending_passes(&self) -> u8 {
         self.consecutive_ending_passes
     }
-    pub fn is_superko_banned(&self, loc: Loc) -> bool {
+    pub(crate) fn is_superko_banned(&self, loc: Loc) -> bool {
         debug_assert!(loc.is_on_board());
         self.superko_banned[loc.index()]
     }
@@ -60,7 +60,7 @@ impl GameState {
             );
         }
     }
-    pub fn is_legal(&self, loc: Loc) -> bool {
+    pub(crate) fn is_legal(&self, loc: Loc) -> bool {
         if !self.board.is_legal_ignoring_ko(
             loc,
             self.next_player,
@@ -70,10 +70,10 @@ impl GameState {
         }
         loc == Loc::PASS || !self.superko_banned[loc.index()]
     }
-    pub fn is_finished(&self) -> bool {
+    pub(crate) fn is_finished(&self) -> bool {
         self.consecutive_ending_passes >= 2
     }
-    pub fn play(&mut self, loc: Loc) -> bool {
+    pub(crate) fn play(&mut self, loc: Loc) -> bool {
         if !self.is_legal(loc) {
             return false;
         }
@@ -103,7 +103,7 @@ impl GameState {
         }
         score
     }
-    pub fn final_score_white_minus_black(&self) -> f32 {
+    pub(crate) fn final_score_white_minus_black(&self) -> f32 {
         self.count_area_score_white_minus_black() as f32 + self.rules.komi
     }
 }

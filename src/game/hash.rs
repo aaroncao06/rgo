@@ -24,7 +24,7 @@ impl SplitMix64 {
         ((high as u128) << 64) | (low as u128)
     }
 }
-pub type PositionHash = u128;
+pub(crate) type PositionHash = u128;
 struct Zobrist {
     stone_hashes: [[PositionHash; 4]; ARRAY_LEN],
 }
@@ -42,6 +42,6 @@ impl Zobrist {
     }
 }
 
-pub fn stone_hash(loc: Loc, color: Color) -> PositionHash {
+pub(crate) fn stone_hash(loc: Loc, color: Color) -> PositionHash {
     ZOBRIST.stone_hashes[loc.index()][color as usize]
 }

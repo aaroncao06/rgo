@@ -1,9 +1,9 @@
 use super::hash::{PositionHash, stone_hash};
 
 // can make these runtime-configurable in the future
-pub const BOARD_SIZE: usize = 9;
-pub const STRIDE: usize = BOARD_SIZE + 1; // first element of each row is the wall
-pub const ARRAY_LEN: usize = STRIDE * STRIDE + STRIDE + 1; //need bottom row of walls and bottom corner
+pub(crate) const BOARD_SIZE: usize = 9;
+pub(crate) const STRIDE: usize = BOARD_SIZE + 1; // first element of each row is the wall
+pub(crate) const ARRAY_LEN: usize = STRIDE * STRIDE + STRIDE + 1; //need bottom row of walls and bottom corner
 
 const MAX_PLAYER_HEADS: usize = (BOARD_SIZE * BOARD_SIZE + 1) / 2;
 const MAX_REGIONS: usize = (BOARD_SIZE * BOARD_SIZE + 1) / 2 + 1;
@@ -11,7 +11,7 @@ const VITAL_FOR_CHAIN_HEADS_MAX_LEN: usize = MAX_REGIONS * 4; // max number of (
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Color {
+pub(crate) enum Color {
     Empty = 0,
     Black = 1,
     White = 2,
@@ -29,13 +29,13 @@ impl Color {
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Player {
+pub(crate) enum Player {
     Black = 1,
     White = 2,
 }
 
 impl Player {
-    pub fn opponent(self) -> Self {
+    pub(crate) fn opponent(self) -> Self {
         match self {
             Self::Black => Self::White,
             Self::White => Self::Black,
@@ -54,29 +54,29 @@ impl From<Player> for Color {
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Loc(u16);
+pub(crate) struct Loc(u16);
 
 impl Loc {
-    pub const NULL: Self = Self(0);
-    pub const PASS: Self = Self(1);
-    pub fn new(x: usize, y: usize) -> Option<Loc> {
+    pub(crate) const NULL: Self = Self(0);
+    pub(crate) const PASS: Self = Self(1);
+    pub(crate) fn new(x: usize, y: usize) -> Option<Loc> {
         if x < BOARD_SIZE && y < BOARD_SIZE {
             Some(Self(((x + 1) + (y + 1) * STRIDE) as u16))
         } else {
             None
         }
     }
-    pub fn index(self) -> usize {
+    pub(crate) fn index(self) -> usize {
         self.0 as usize // cant have u16
     }
-    pub fn from_index(index: usize) -> Self {
+    pub(crate) fn from_index(index: usize) -> Self {
         debug_assert!(index < ARRAY_LEN);
         Self(index as u16)
     }
-    pub fn x(self) -> usize {
+    pub(crate) fn x(self) -> usize {
         (self.0 as usize) % STRIDE - 1
     }
-    pub fn y(self) -> usize {
+    pub(crate) fn y(self) -> usize {
         (self.0 as usize) / STRIDE - 1
     }
     fn is_adjacent(loc1: Self, loc2: Self) -> bool {
@@ -86,10 +86,10 @@ impl Loc {
     fn adjacent_indices(i: usize) -> [usize; 4] {
         [i + 1, i - STRIDE, i - 1, i + STRIDE] // unit circle direction lol
     }
-    pub fn board_iter() -> impl Iterator<Item = Loc> {
+    pub(crate) fn board_iter() -> impl Iterator<Item = Loc> {
         (1..=BOARD_SIZE).flat_map(|y| (1..=BOARD_SIZE).map(move |x| Loc((x + y * STRIDE) as u16)))
     }
-    pub fn is_on_board(self) -> bool {
+    pub(crate) fn is_on_board(self) -> bool {
         let i = self.index();
         let padded_x = i % STRIDE;
         let padded_y = i / STRIDE;
@@ -104,7 +104,7 @@ struct ChainData {
 }
 
 #[derive(Clone)]
-pub struct Board {
+pub(crate) struct Board {
     colors: [Color; ARRAY_LEN], // flat board array
     chain_data: [ChainData; ARRAY_LEN],
     chain_head: [Loc; ARRAY_LEN],
@@ -114,7 +114,7 @@ pub struct Board {
 }
 
 impl Board {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let mut colors = [Color::Empty; ARRAY_LEN];
         for i in 0..STRIDE {
             colors[i] = Color::Wall;
@@ -136,7 +136,7 @@ impl Board {
             position_hash: 0,
         }
     }
-    pub fn color_at(&self, loc: Loc) -> Color {
+    pub(crate) fn color_at(&self, loc: Loc) -> Color {
         self.colors[loc.index()]
     }
     fn is_empty(&self) -> bool {
@@ -260,7 +260,7 @@ impl Board {
         counter
     }
 
-    pub fn play_move_assume_legal(&mut self, loc: Loc, player: Player) {
+    pub(crate) fn play_move_assume_legal(&mut self, loc: Loc, player: Player) {
         //create new chain, merge with nearby chains, decrement opponent liberties, kill and increment liberties and mark ko
         self.simple_ko = None;
         if loc == Loc::PASS {
@@ -380,7 +380,7 @@ impl Board {
         }
         !self.is_illegal_suicide(loc, player, multi_stone_suicide_legal)
     }
-    pub fn is_legal_ignoring_ko(
+    pub(crate) fn is_legal_ignoring_ko(
         &self,
         loc: Loc,
         player: Player,
@@ -394,7 +394,7 @@ impl Board {
         }
         !self.is_illegal_suicide(loc, player, multi_stone_suicide_legal)
     }
-    pub fn position_hash(&self) -> PositionHash {
+    pub(crate) fn position_hash(&self) -> PositionHash {
         self.position_hash
     }
     fn chain_iter(&self, start: Loc) -> impl Iterator<Item = Loc> + '_ {
@@ -404,7 +404,7 @@ impl Board {
             (next != start).then_some(next) // just an if statement lol
         })
     }
-    pub fn get_position_hash_after_move(&self, loc: Loc, player: Player) -> PositionHash {
+    pub(crate) fn get_position_hash_after_move(&self, loc: Loc, player: Player) -> PositionHash {
         //see what stones get removed if you do a move. order of moves doesnt matter for the hash
         if loc == Loc::PASS {
             return self.position_hash;
@@ -470,7 +470,7 @@ impl Board {
         new_position_hash
     }
 
-    pub fn calculate_area(&self, multi_stone_suicide_legal: bool) -> [Color; ARRAY_LEN] {
+    pub(crate) fn calculate_area(&self, multi_stone_suicide_legal: bool) -> [Color; ARRAY_LEN] {
         let mut result = [Color::Empty; ARRAY_LEN];
         self.calculate_area_for_player(
             Player::Black,

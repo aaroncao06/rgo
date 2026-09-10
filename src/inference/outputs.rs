@@ -17,7 +17,7 @@ struct RawNNOutputs {
     ownership_logits: [f32; BOARD_POLICY_SIZE],
 }
 
-pub struct NNOutput {
+pub(crate) struct NNOutput {
     policy: [f32; POLICY_SIZE], // logits -> probs
     win: f32,                   // logit -> white prob
     score_mean: f32,            // score mean -> white score mean
@@ -124,27 +124,27 @@ impl NNOutput {
         self.score_aux = score_mean_sq(score_mean, score_stdev);
         self.processed = true;
     }
-    pub fn policy_probs(&self) -> &[f32; POLICY_SIZE] {
+    pub(crate) fn policy_probs(&self) -> &[f32; POLICY_SIZE] {
         debug_assert!(self.processed);
         &self.policy
     }
 
-    pub fn white_win_prob(&self) -> f32 {
+    pub(crate) fn white_win_prob(&self) -> f32 {
         debug_assert!(self.processed);
         self.win
     }
 
-    pub fn white_score_mean(&self) -> f32 {
+    pub(crate) fn white_score_mean(&self) -> f32 {
         debug_assert!(self.processed);
         self.score_mean
     }
 
-    pub fn white_score_mean_sq(&self) -> f32 {
+    pub(crate) fn white_score_mean_sq(&self) -> f32 {
         debug_assert!(self.processed);
         self.score_aux
     }
 
-    pub fn is_processed(&self) -> bool {
+    pub(crate) fn is_processed(&self) -> bool {
         self.processed
     }
 }
