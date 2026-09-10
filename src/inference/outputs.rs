@@ -7,26 +7,22 @@ const SCORE_MULTIPLIER: f32 = 20.0;
 // all nn outputs that we train, some not used during mcts
 #[allow(dead_code)]
 struct RawNNOutputs {
-    search: RawSearchNNOutputs,
+    policy_logits: [f32; POLICY_SIZE],
+    win_logit: f32,
+    raw_score_mean: f32,
+    raw_score_stdev_logit: f32,
     soft_policy_logits: [f32; POLICY_SIZE],
     opponent_policy_logits: [f32; POLICY_SIZE],
     soft_opponent_policy_logits: [f32; POLICY_SIZE],
     ownership_logits: [f32; BOARD_POLICY_SIZE],
 }
 
-pub struct RawSearchNNOutputs {
-    policy_logits: [f32; POLICY_SIZE],
-    win_logit: f32,
-    raw_score_mean: f32,
-    raw_score_stdev_logit: f32,
-}
-
-// nn outputs used by search alg, ownership is too expensive to be propagated up
-pub struct SearchNNOutputs {
-    policy_probs: [f32; POLICY_SIZE],
-    white_win_prob: f32,
-    white_score_mean: f32,
-    white_score_mean_sq: f32,
+pub struct NNOutput {
+    policy: [f32; POLICY_SIZE], // logits -> probs
+    win: f32,                   // logit -> white prob
+    score_mean: f32,            // score mean -> white score mean
+    score_aux: f32,             // stdev logit -> white score mean sq
+    processed: bool,            //just to be safe now that we are modifying in place
 }
 
 fn masked_softmax_in_place(policy: &mut [f32; POLICY_SIZE], legal_mask: &[bool; POLICY_SIZE]) {
@@ -89,9 +85,8 @@ fn signed_value_to_white(value: f32, next_player: Player) -> f32 {
 fn score_mean_sq(mean: f32, stdev: f32) -> f32 {
     mean.mul_add(mean, stdev * stdev)
 }
-
-impl RawSearchNNOutputs {
-    pub fn new(
+impl NNOutput {
+    pub(crate) fn from_raw(
         policy_logits: [f32; POLICY_SIZE],
         win_logit: f32,
         raw_score_mean: f32,
@@ -104,47 +99,53 @@ impl RawSearchNNOutputs {
             "nonfinite value output"
         );
         Self {
-            policy_logits,
-            win_logit,
-            raw_score_mean,
-            raw_score_stdev_logit,
+            policy: policy_logits,
+            win: win_logit,
+            score_mean: raw_score_mean,
+            score_aux: raw_score_stdev_logit,
+            processed: false,
         }
     }
-    pub fn into_search(
-        mut self,
+    pub(crate) fn process_in_place(
+        &mut self,
         next_player: Player,
         legal_mask: &[bool; POLICY_SIZE],
-    ) -> SearchNNOutputs {
-        masked_softmax_in_place(&mut self.policy_logits, legal_mask);
+    ) {
+        debug_assert!(!self.processed, "NN output processed twice");
 
-        let current_win_prob = sigmoid(self.win_logit);
-        let score_mean = self.raw_score_mean * SCORE_MULTIPLIER;
-        let score_stdev = softplus(self.raw_score_stdev_logit) * SCORE_MULTIPLIER;
+        masked_softmax_in_place(&mut self.policy, legal_mask);
 
-        SearchNNOutputs {
-            policy_probs: self.policy_logits,
-            white_win_prob: win_prob_to_white(current_win_prob, next_player),
-            white_score_mean: signed_value_to_white(score_mean, next_player),
-            white_score_mean_sq: score_mean_sq(score_mean, score_stdev),
-        }
+        let current_win_prob = sigmoid(self.win);
+        let score_mean = self.score_mean * SCORE_MULTIPLIER;
+        let score_stdev = softplus(self.score_aux) * SCORE_MULTIPLIER;
+
+        self.win = win_prob_to_white(current_win_prob, next_player);
+        self.score_mean = signed_value_to_white(score_mean, next_player);
+        self.score_aux = score_mean_sq(score_mean, score_stdev);
+        self.processed = true;
     }
-}
-
-impl SearchNNOutputs {
     pub fn policy_probs(&self) -> &[f32; POLICY_SIZE] {
-        &self.policy_probs
+        debug_assert!(self.processed);
+        &self.policy
     }
 
     pub fn white_win_prob(&self) -> f32 {
-        self.white_win_prob
+        debug_assert!(self.processed);
+        self.win
     }
 
     pub fn white_score_mean(&self) -> f32 {
-        self.white_score_mean
+        debug_assert!(self.processed);
+        self.score_mean
     }
 
     pub fn white_score_mean_sq(&self) -> f32 {
-        self.white_score_mean_sq
+        debug_assert!(self.processed);
+        self.score_aux
+    }
+
+    pub fn is_processed(&self) -> bool {
+        self.processed
     }
 }
 
@@ -167,14 +168,17 @@ mod tests {
         raw_score_stdev_logit: f32,
         next_player: Player,
         legal_mask: &[bool; POLICY_SIZE],
-    ) -> SearchNNOutputs {
-        RawSearchNNOutputs::new(
+    ) -> NNOutput {
+        let mut output = NNOutput::from_raw(
             policy_logits,
             win_logit,
             raw_score_mean,
             raw_score_stdev_logit,
-        )
-        .into_search(next_player, legal_mask)
+        );
+        assert!(!output.is_processed());
+        output.process_in_place(next_player, legal_mask);
+        assert!(output.is_processed());
+        output
     }
 
     #[test]
@@ -216,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn into_search_scales_scores_and_converts_perspective() {
+    fn processing_scales_scores_and_converts_perspective() {
         let policy_logits = [0.0; POLICY_SIZE];
         let mut legal_mask = [false; POLICY_SIZE];
         legal_mask[0] = true;
@@ -257,6 +261,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "nonfinite value output")]
     fn raw_outputs_reject_nonfinite_scalar_values() {
-        let _ = RawSearchNNOutputs::new([0.0; POLICY_SIZE], f32::NAN, 0.0, 0.0);
+        let _ = NNOutput::from_raw([0.0; POLICY_SIZE], f32::NAN, 0.0, 0.0);
     }
 }

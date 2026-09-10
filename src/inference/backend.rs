@@ -1,17 +1,23 @@
-use crate::inference::{outputs::RawSearchNNOutputs, policy::POLICY_SIZE};
+use std::sync::Arc;
+
+use crate::inference::outputs::NNOutput;
+
+#[cfg(test)]
+use crate::inference::policy::POLICY_SIZE;
 
 use super::inputs::NNInputs;
 
 #[derive(Debug)]
 pub enum InferenceError {
     ExecutionFailed,
+    RuntimeClosed,
 }
 pub trait InferenceBackend {
     /// Replaces `outputs` with one result per input, preserving input order.
     fn evaluate_batch(
         &mut self,
         inputs: &[NNInputs],
-        outputs: &mut Vec<RawSearchNNOutputs>,
+        outputs: &mut Vec<Arc<NNOutput>>,
     ) -> Result<(), InferenceError>;
 }
 
@@ -26,12 +32,17 @@ impl InferenceBackend for DummyInferenceBackend {
     fn evaluate_batch(
         &mut self,
         inputs: &[NNInputs],
-        outputs: &mut Vec<RawSearchNNOutputs>,
+        outputs: &mut Vec<Arc<NNOutput>>,
     ) -> Result<(), InferenceError> {
         outputs.clear();
         outputs.reserve(inputs.len()); //should be noop if you are keeping consistent batch sizes, safeguard
         for _input in inputs {
-            outputs.push(RawSearchNNOutputs::new([0.0; POLICY_SIZE], 0.0, 0.0, 0.0));
+            outputs.push(Arc::new(NNOutput::from_raw(
+                [0.0; POLICY_SIZE],
+                0.0,
+                0.0,
+                0.0,
+            )));
         }
         self.batch_sizes.push(inputs.len());
         Ok(())
