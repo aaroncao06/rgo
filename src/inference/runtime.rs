@@ -1,14 +1,18 @@
-use crate::inference::inputs::NNInputs;
+use crate::game::game_state::GameState;
+use crate::inference::backend::InferenceBackend;
+use crate::inference::inputs::NNInput;
+use crate::inference::policy::legal_mask;
 use crate::inference::{backend::InferenceError, outputs::NNOutput};
 use std::{
     collections::VecDeque,
     sync::{Arc, Condvar, Mutex},
+    thread::JoinHandle,
 };
 use tokio::sync::Notify;
 
 enum SlotState {
     Idle,
-    Queued(NNInputs),
+    Queued(NNInput),
     Running,
     Completed(Result<Arc<NNOutput>, InferenceError>),
 }
@@ -27,6 +31,32 @@ struct QueueInner {
     requests: VecDeque<Arc<EvalSlot>>,
     closed: bool, // executor exits thread when queue is closed and empty, instead of waiting
 }
+
+struct EvaluationCache {}
+struct ModelRuntime {
+    // each model runtime owns its own queue and cache and executors. makes it easier to switch out and make new ones
+    queue: Arc<BatchQueue>, // model runtime owns this, should be responsible for dropping everything
+    cache: EvaluationCache,
+    executor_threads: Vec<JoinHandle<()>>,
+}
+
+// wrapper so that client doesnt access executor threads and allow easy switching. api for queueing and caching
+#[derive(Clone)]
+struct ModelHandle(Arc<ModelRuntime>);
+
+// search workers own, submits requests to the shared queue
+struct InferenceClient {
+    model_handle: ModelHandle,
+    slot: Arc<EvalSlot>,
+}
+
+// pulls from the queue
+struct InferenceExecutor<T: InferenceBackend> {
+    queue: Arc<BatchQueue>,
+    backend: T,
+    max_batch_size: usize,
+}
+
 impl EvalSlot {
     fn new() -> Self {
         Self {
@@ -34,24 +64,24 @@ impl EvalSlot {
             ready: Notify::new(),
         }
     }
-    fn queue(&self, inputs: NNInputs) {
+    fn queue(&self, input: NNInput) {
         let mut slot_state = self.state.lock().expect("eval slot mutex poisoned");
         debug_assert!(
             matches!(&*slot_state, SlotState::Idle),
             "can only queue in idle slots"
         );
-        *slot_state = SlotState::Queued(inputs);
+        *slot_state = SlotState::Queued(input);
     }
-    fn take_input(&self) -> NNInputs {
+    fn take_input(&self) -> NNInput {
         let mut slot_state = self.state.lock().expect("eval slot mutex poisoned");
         //update state and return the input
         match std::mem::replace(&mut *slot_state, SlotState::Running) {
-            SlotState::Queued(inputs) => inputs,
+            SlotState::Queued(input) => input,
             _ => panic!("can only take input from a queued slot"),
         }
     }
     fn complete(&self, result: Result<Arc<NNOutput>, InferenceError>) {
-        // fill slot with the result
+        // fill slot with the result, moves the pointer so that the worker can process it
         let mut slot_state = self.state.lock().expect("eval slot mutex poisoned");
         debug_assert!(
             matches!(&*slot_state, SlotState::Running),
@@ -60,6 +90,15 @@ impl EvalSlot {
         *slot_state = SlotState::Completed(result);
         drop(slot_state);
         self.ready.notify_one();
+    }
+    fn cancel_queued(&self) {
+        //only called after submit_request fails
+        let mut slot_state = self.state.lock().expect("eval slot mutex poisoned");
+        debug_assert!(
+            matches!(&*slot_state, SlotState::Queued(_)),
+            "only a request that failed submission can be reset"
+        );
+        *slot_state = SlotState::Idle;
     }
     async fn wait_for_result(&self) -> Result<Arc<NNOutput>, InferenceError> {
         // can wait on active tasks (not idle)
@@ -113,7 +152,7 @@ impl BatchQueue {
         Ok(())
     }
     fn receive_batch(&self, max_batch_size: usize, batch: &mut Vec<Arc<EvalSlot>>) -> bool {
-        // take up to max_batch_size requests and put them in slots
+        // take up to max_batch_size requests and put them in slots. return whether it succeeded
         debug_assert!(max_batch_size > 0);
         batch.clear(); //outside the mutex
 
@@ -150,17 +189,87 @@ impl BatchQueue {
         self.state_changed.notify_all();
     }
 }
+impl ModelHandle {
+    fn submit_request(&self, request: Arc<EvalSlot>) -> Result<(), InferenceError> {
+        self.0.queue.submit_request(request)
+    }
+    //todo: lookup and insert cache
+}
+impl InferenceClient {
+    async fn evaluate(&mut self, game_state: &GameState) -> Result<Arc<NNOutput>, InferenceError> {
+        let input = NNInput::encode(game_state);
+        let next_player = game_state.next_player();
+        let legal_mask = legal_mask(game_state);
 
-// search workers own, submits requests to the shared queue
-struct InferenceClient {}
+        //future: check cache before sending to backend
 
-// pulls from the queue
-struct InferenceRuntime {}
+        self.slot.queue(input);
+        // send a clone of the arc pointer
+        if let Err(error) = self.model_handle.submit_request(self.slot.clone()) {
+            self.slot.cancel_queued();
+            return Err(error);
+        }
+
+        // executor moves its Arc<NNOutput> into the slot so it doesnt retain a copy, cache gets its copy after the mutation
+        let mut output = self.slot.wait_for_result().await?;
+        Arc::get_mut(&mut output)
+            .expect("raw NN output must be exclusively owned")
+            .process_in_place(next_player, &legal_mask);
+
+        //future: send copy of output to the eval cache
+
+        Ok(output)
+    }
+}
+
+impl<T: InferenceBackend> InferenceExecutor<T> {
+    fn new(queue: Arc<BatchQueue>, backend: T, max_batch_size: usize) -> Self {
+        assert!(max_batch_size > 0, "need positive batch size");
+        Self {
+            queue,
+            backend,
+            max_batch_size,
+        }
+    }
+    fn run(mut self) {
+        let mut requests: Vec<Arc<EvalSlot>> = Vec::with_capacity(self.max_batch_size);
+        let mut inputs: Vec<NNInput> = Vec::with_capacity(self.max_batch_size);
+        let mut outputs: Vec<Arc<NNOutput>> = Vec::with_capacity(self.max_batch_size);
+        while self.queue.receive_batch(self.max_batch_size, &mut requests) {
+            inputs.clear();
+            outputs.clear(); // backend expects it to be cleared beforehand
+            //gather inputs
+            for slot in &requests {
+                inputs.push(slot.take_input());
+            }
+            //run backend
+            match self.backend.evaluate_batch(&inputs, &mut outputs) {
+                Ok(()) => {
+                    // evaluation successful, go through request,output pairs to send results back
+                    debug_assert_eq!(
+                        requests.len(),
+                        outputs.len(),
+                        "backend returned wrong number of outputs"
+                    );
+                    for (request, output) in requests.drain(..).zip(outputs.drain(..)) {
+                        request.complete(Ok(output));
+                    }
+                }
+                Err(error) => {
+                    // send back errors
+                    for request in requests.drain(..) {
+                        request.complete(Err(error.clone()));
+                    }
+                }
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Arc, mpsc},
+        sync::{Arc, Mutex, mpsc},
         thread,
         time::Duration,
     };
@@ -170,21 +279,46 @@ mod tests {
 
     use super::*;
 
-    fn test_inputs() -> NNInputs {
-        NNInputs::encode(&GameState::new(Rules::TROMP_TAYLORISH))
+    fn test_input() -> NNInput {
+        NNInput::encode(&GameState::new(Rules::TROMP_TAYLORISH))
     }
 
     fn test_output() -> Arc<NNOutput> {
         Arc::new(NNOutput::from_raw([0.0; POLICY_SIZE], 0.0, 0.0, 0.0))
     }
 
+    struct TestBackend {
+        batch_sizes: Arc<Mutex<Vec<usize>>>,
+        fail: bool,
+    }
+
+    impl InferenceBackend for TestBackend {
+        fn evaluate_batch(
+            &mut self,
+            inputs: &[NNInput],
+            outputs: &mut Vec<Arc<NNOutput>>,
+        ) -> Result<(), InferenceError> {
+            debug_assert!(outputs.is_empty());
+            self.batch_sizes.lock().unwrap().push(inputs.len());
+
+            if self.fail {
+                return Err(InferenceError::ExecutionFailed);
+            }
+
+            for _input in inputs {
+                outputs.push(test_output());
+            }
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn eval_slot_transitions_through_a_complete_request() {
         let slot = EvalSlot::new();
-        slot.queue(test_inputs());
+        slot.queue(test_input());
         assert!(matches!(&*slot.state.lock().unwrap(), SlotState::Queued(_)));
 
-        let _inputs = slot.take_input();
+        let _input = slot.take_input();
         assert!(matches!(&*slot.state.lock().unwrap(), SlotState::Running));
 
         let expected = test_output();
@@ -202,13 +336,13 @@ mod tests {
     #[tokio::test]
     async fn eval_slot_can_wait_while_still_queued() {
         let slot = Arc::new(EvalSlot::new());
-        slot.queue(test_inputs());
+        slot.queue(test_input());
 
         let waiting_slot = Arc::clone(&slot);
         let waiter = tokio::spawn(async move { waiting_slot.wait_for_result().await });
         tokio::task::yield_now().await;
 
-        let _inputs = slot.take_input();
+        let _input = slot.take_input();
         let expected = test_output();
         slot.complete(Ok(Arc::clone(&expected)));
 
@@ -220,8 +354,8 @@ mod tests {
     #[tokio::test]
     async fn eval_slot_propagates_inference_errors() {
         let slot = EvalSlot::new();
-        slot.queue(test_inputs());
-        let _inputs = slot.take_input();
+        slot.queue(test_input());
+        let _input = slot.take_input();
         slot.complete(Err(InferenceError::ExecutionFailed));
 
         assert!(matches!(
@@ -229,6 +363,64 @@ mod tests {
             Err(InferenceError::ExecutionFailed)
         ));
         assert!(matches!(&*slot.state.lock().unwrap(), SlotState::Idle));
+    }
+
+    #[tokio::test]
+    async fn inference_executor_processes_batches_and_completes_every_slot() {
+        let queue = Arc::new(BatchQueue::new(3));
+        let slots: Vec<_> = (0..3).map(|_| Arc::new(EvalSlot::new())).collect();
+        for slot in &slots {
+            slot.queue(test_input());
+            queue.submit_request(slot.clone()).unwrap();
+        }
+        queue.close();
+
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+        let backend = TestBackend {
+            batch_sizes: batch_sizes.clone(),
+            fail: false,
+        };
+        let executor = InferenceExecutor::new(queue, backend, 2);
+        let executor_thread = thread::spawn(move || executor.run());
+
+        for slot in &slots {
+            let output = slot.wait_for_result().await.unwrap();
+            assert!(!output.is_processed());
+            assert!(matches!(&*slot.state.lock().unwrap(), SlotState::Idle));
+        }
+        executor_thread.join().unwrap();
+
+        assert_eq!(*batch_sizes.lock().unwrap(), [2, 1]);
+    }
+
+    #[tokio::test]
+    async fn inference_executor_returns_backend_errors_to_every_slot() {
+        let queue = Arc::new(BatchQueue::new(3));
+        let slots: Vec<_> = (0..3).map(|_| Arc::new(EvalSlot::new())).collect();
+        for slot in &slots {
+            slot.queue(test_input());
+            queue.submit_request(slot.clone()).unwrap();
+        }
+        queue.close();
+
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+        let backend = TestBackend {
+            batch_sizes: batch_sizes.clone(),
+            fail: true,
+        };
+        let executor = InferenceExecutor::new(queue, backend, 2);
+        let executor_thread = thread::spawn(move || executor.run());
+
+        for slot in &slots {
+            assert!(matches!(
+                slot.wait_for_result().await,
+                Err(InferenceError::ExecutionFailed)
+            ));
+            assert!(matches!(&*slot.state.lock().unwrap(), SlotState::Idle));
+        }
+        executor_thread.join().unwrap();
+
+        assert_eq!(*batch_sizes.lock().unwrap(), [2, 1]);
     }
 
     #[test]

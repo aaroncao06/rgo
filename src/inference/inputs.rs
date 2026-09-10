@@ -6,12 +6,12 @@ const NUM_SPATIAL_FEATURES: usize = 3; // player masks, superko banned
 const NUM_GLOBAL_FEATURES: usize = 2; // komi, passes
 
 // takes in current board,
-pub struct NNInputs {
+pub struct NNInput {
     pub spatial: [f32; NUM_SPATIAL_FEATURES * BOARD_POLICY_SIZE],
     pub global: [f32; NUM_GLOBAL_FEATURES],
 }
 
-impl NNInputs {
+impl NNInput {
     pub fn encode(game_state: &GameState) -> Self {
         let current_player = game_state.next_player();
         let current_color = Color::from(current_player);
@@ -63,7 +63,7 @@ mod tests {
 
     #[test]
     fn empty_position_has_empty_planes_and_black_relative_komi() {
-        let inputs = NNInputs::encode(&GameState::new(rules()));
+        let inputs = NNInput::encode(&GameState::new(rules()));
 
         assert_eq!(
             inputs.spatial,
@@ -79,7 +79,7 @@ mod tests {
         let white_stone = loc(3, 3);
 
         assert!(game_state.play(black_stone));
-        let white_turn_inputs = NNInputs::encode(&game_state);
+        let white_turn_inputs = NNInput::encode(&game_state);
         let black_pos = loc_to_policy(black_stone);
         assert_eq!(
             white_turn_inputs.spatial[BOARD_POLICY_SIZE + black_pos],
@@ -90,7 +90,7 @@ mod tests {
         assert!(game_state.play(white_stone));
         assert_eq!(game_state.next_player(), Player::Black);
 
-        let inputs = NNInputs::encode(&game_state);
+        let inputs = NNInput::encode(&game_state);
         let white_pos = loc_to_policy(white_stone);
 
         assert_eq!(inputs.spatial[black_pos], 1.0);
@@ -119,7 +119,7 @@ mod tests {
             assert!(game_state.play(move_loc));
         }
 
-        let inputs = NNInputs::encode(&game_state);
+        let inputs = NNInput::encode(&game_state);
         let recapture_pos = loc_to_policy(recapture);
 
         assert!(game_state.is_superko_banned(recapture));
