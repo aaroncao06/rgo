@@ -10,7 +10,7 @@ enum SlotState {
     Idle,
     Queued(NNInputs),
     Running,
-    Ready(Result<Arc<NNOutput>, InferenceError>),
+    Completed(Result<Arc<NNOutput>, InferenceError>),
 }
 // pointers to evalslots are sent to the executor
 struct EvalSlot {
@@ -19,11 +19,11 @@ struct EvalSlot {
 }
 
 struct BatchQueue {
-    state: Mutex<QueueState>,
+    inner: Mutex<QueueInner>,
     state_changed: Condvar, // signals either that it is non empty or that it is closed
     capacity: usize,
 }
-struct QueueState {
+struct QueueInner {
     requests: VecDeque<Arc<EvalSlot>>,
     closed: bool, // executor exits thread when queue is closed and empty, instead of waiting
 }
@@ -34,11 +34,60 @@ impl EvalSlot {
             ready: Notify::new(),
         }
     }
+    fn queue(&self, inputs: NNInputs) {
+        let mut slot_state = self.state.lock().expect("eval slot mutex poisoned");
+        debug_assert!(
+            matches!(&*slot_state, SlotState::Idle),
+            "can only queue in idle slots"
+        );
+        *slot_state = SlotState::Queued(inputs);
+    }
+    fn take_input(&self) -> NNInputs {
+        let mut slot_state = self.state.lock().expect("eval slot mutex poisoned");
+        //update state and return the input
+        match std::mem::replace(&mut *slot_state, SlotState::Running) {
+            SlotState::Queued(inputs) => inputs,
+            _ => panic!("can only take input from a queued slot"),
+        }
+    }
+    fn complete(&self, result: Result<Arc<NNOutput>, InferenceError>) {
+        // fill slot with the result
+        let mut slot_state = self.state.lock().expect("eval slot mutex poisoned");
+        debug_assert!(
+            matches!(&*slot_state, SlotState::Running),
+            "can only put results in running slots"
+        );
+        *slot_state = SlotState::Completed(result);
+        drop(slot_state);
+        self.ready.notify_one();
+    }
+    async fn wait_for_result(&self) -> Result<Arc<NNOutput>, InferenceError> {
+        // can wait on active tasks (not idle)
+        loop {
+            let notified = self.ready.notified();
+            {
+                // scope so that the mutex gets dropped before await
+                let mut slot_state = self.state.lock().expect("eval slot mutex poisoned");
+                match &*slot_state {
+                    SlotState::Completed(_) => {
+                        let previous = std::mem::replace(&mut *slot_state, SlotState::Idle);
+                        let SlotState::Completed(result) = previous else {
+                            unreachable!()
+                        };
+                        return result;
+                    }
+                    SlotState::Queued(_) | SlotState::Running => {}
+                    SlotState::Idle => panic!("cant wait on an idle slot"),
+                }
+            }
+            notified.await;
+        }
+    }
 }
 impl BatchQueue {
     fn new(capacity: usize) -> Self {
         Self {
-            state: Mutex::new(QueueState {
+            inner: Mutex::new(QueueInner {
                 requests: VecDeque::with_capacity(capacity),
                 closed: false,
             }),
@@ -47,18 +96,18 @@ impl BatchQueue {
         }
     }
     fn submit_request(&self, request: Arc<EvalSlot>) -> Result<(), InferenceError> {
-        let mut queue_state = self.state.lock().expect("batch queue mutex poisoned");
-        if queue_state.closed {
+        let mut queue_inner = self.inner.lock().expect("batch queue mutex poisoned");
+        if queue_inner.closed {
             return Err(InferenceError::RuntimeClosed);
         }
         // stay debug since this should never be an issue, our queue should be exactly the size fo the number of workers, it is cheap
         debug_assert!(
-            queue_state.requests.len() < self.capacity,
+            queue_inner.requests.len() < self.capacity,
             "batch queue capacity exceeded"
         );
 
-        queue_state.requests.push_back(request);
-        drop(queue_state);
+        queue_inner.requests.push_back(request);
+        drop(queue_inner);
 
         self.state_changed.notify_one();
         Ok(())
@@ -68,26 +117,26 @@ impl BatchQueue {
         debug_assert!(max_batch_size > 0);
         batch.clear(); //outside the mutex
 
-        let mut queue_state = self.state.lock().expect("batch queue mutex poisoned");
-        while queue_state.requests.is_empty() && !queue_state.closed {
-            queue_state = self
+        let mut queue_inner = self.inner.lock().expect("batch queue mutex poisoned");
+        while queue_inner.requests.is_empty() && !queue_inner.closed {
+            queue_inner = self
                 .state_changed
-                .wait(queue_state)
+                .wait(queue_inner)
                 .expect("batch queue mutex poisoned");
         }
-        if queue_state.requests.is_empty() {
-            debug_assert!(queue_state.closed);
+        if queue_inner.requests.is_empty() {
+            debug_assert!(queue_inner.closed);
             return false;
         }
         while batch.len() < max_batch_size {
-            let Some(request) = queue_state.requests.pop_front() else {
+            let Some(request) = queue_inner.requests.pop_front() else {
                 break;
             };
             batch.push(request);
         }
 
-        let requests_remain = !queue_state.requests.is_empty();
-        drop(queue_state);
+        let requests_remain = !queue_inner.requests.is_empty();
+        drop(queue_inner);
         if requests_remain {
             self.state_changed.notify_one();
         }
@@ -95,9 +144,9 @@ impl BatchQueue {
     }
     fn close(&self) {
         // close the queue, useful for switching out model versions
-        let mut queue_state = self.state.lock().expect("batch queue mutex poisoned");
-        queue_state.closed = true;
-        drop(queue_state);
+        let mut queue_inner = self.inner.lock().expect("batch queue mutex poisoned");
+        queue_inner.closed = true;
+        drop(queue_inner);
         self.state_changed.notify_all();
     }
 }
@@ -116,7 +165,71 @@ mod tests {
         time::Duration,
     };
 
+    use crate::game::{game_state::GameState, rules::Rules};
+    use crate::inference::policy::POLICY_SIZE;
+
     use super::*;
+
+    fn test_inputs() -> NNInputs {
+        NNInputs::encode(&GameState::new(Rules::TROMP_TAYLORISH))
+    }
+
+    fn test_output() -> Arc<NNOutput> {
+        Arc::new(NNOutput::from_raw([0.0; POLICY_SIZE], 0.0, 0.0, 0.0))
+    }
+
+    #[tokio::test]
+    async fn eval_slot_transitions_through_a_complete_request() {
+        let slot = EvalSlot::new();
+        slot.queue(test_inputs());
+        assert!(matches!(&*slot.state.lock().unwrap(), SlotState::Queued(_)));
+
+        let _inputs = slot.take_input();
+        assert!(matches!(&*slot.state.lock().unwrap(), SlotState::Running));
+
+        let expected = test_output();
+        slot.complete(Ok(Arc::clone(&expected)));
+        assert!(matches!(
+            &*slot.state.lock().unwrap(),
+            SlotState::Completed(_)
+        ));
+
+        let actual = slot.wait_for_result().await.unwrap();
+        assert!(Arc::ptr_eq(&actual, &expected));
+        assert!(matches!(&*slot.state.lock().unwrap(), SlotState::Idle));
+    }
+
+    #[tokio::test]
+    async fn eval_slot_can_wait_while_still_queued() {
+        let slot = Arc::new(EvalSlot::new());
+        slot.queue(test_inputs());
+
+        let waiting_slot = Arc::clone(&slot);
+        let waiter = tokio::spawn(async move { waiting_slot.wait_for_result().await });
+        tokio::task::yield_now().await;
+
+        let _inputs = slot.take_input();
+        let expected = test_output();
+        slot.complete(Ok(Arc::clone(&expected)));
+
+        let actual = waiter.await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&actual, &expected));
+        assert!(matches!(&*slot.state.lock().unwrap(), SlotState::Idle));
+    }
+
+    #[tokio::test]
+    async fn eval_slot_propagates_inference_errors() {
+        let slot = EvalSlot::new();
+        slot.queue(test_inputs());
+        let _inputs = slot.take_input();
+        slot.complete(Err(InferenceError::ExecutionFailed));
+
+        assert!(matches!(
+            slot.wait_for_result().await,
+            Err(InferenceError::ExecutionFailed)
+        ));
+        assert!(matches!(&*slot.state.lock().unwrap(), SlotState::Idle));
+    }
 
     #[test]
     fn receive_batch_is_fifo_and_respects_max_batch_size() {
