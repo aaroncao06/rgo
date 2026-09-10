@@ -183,6 +183,7 @@ impl BatchQueue {
     }
     fn close(&self) {
         // close the queue, useful for switching out model versions
+        // signal executors who are waiting on the queue to end their loop
         let mut queue_inner = self.inner.lock().expect("batch queue mutex poisoned");
         queue_inner.closed = true;
         drop(queue_inner);
@@ -262,6 +263,46 @@ impl<T: InferenceBackend> InferenceExecutor<T> {
                     }
                 }
             }
+        }
+    }
+}
+
+impl ModelRuntime {
+    fn start<T>(
+        backends: Vec<T>,
+        max_batch_size: usize,
+        queue_capacity: usize, // max number of inference clients, each with one outstanding request
+    ) -> ModelHandle
+    where
+        T: InferenceBackend + Send + 'static, // send backends to the different executor threads. static is a requirement to move into the thread (backend owns everything it needs)
+    {
+        assert!(!backends.is_empty(), "need at least one inference backend");
+        assert!(max_batch_size > 0, "need positive batch size");
+        assert!(queue_capacity > 0, "need positive queue capacity");
+
+        let queue = Arc::new(BatchQueue::new(queue_capacity));
+        let cache = EvaluationCache {};
+
+        let mut executor_threads = Vec::with_capacity(backends.len());
+        for backend in backends {
+            let executor = InferenceExecutor::new(queue.clone(), backend, max_batch_size);
+            executor_threads.push(std::thread::spawn(move || {
+                executor.run();
+            }));
+        }
+        ModelHandle(Arc::new(Self {
+            queue,
+            cache,
+            executor_threads,
+        }))
+    }
+}
+//destructor that closes the queue and executor threads
+impl Drop for ModelRuntime {
+    fn drop(&mut self) {
+        self.queue.close();
+        for executor_thread in self.executor_threads.drain(..) {
+            let _ = executor_thread.join();
         }
     }
 }
@@ -421,6 +462,47 @@ mod tests {
         executor_thread.join().unwrap();
 
         assert_eq!(*batch_sizes.lock().unwrap(), [2, 1]);
+    }
+
+    #[tokio::test]
+    async fn model_runtime_evaluates_through_a_client() {
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+        let backend = TestBackend {
+            batch_sizes: batch_sizes.clone(),
+            fail: false,
+        };
+        let model_handle = ModelRuntime::start(vec![backend], 4, 1);
+        let queue = model_handle.0.queue.clone();
+        let mut client = InferenceClient {
+            model_handle,
+            slot: Arc::new(EvalSlot::new()),
+        };
+
+        let game_state = GameState::new(Rules::TROMP_TAYLORISH);
+        let output = client.evaluate(&game_state).await.unwrap();
+
+        assert!(output.is_processed());
+        assert_eq!(*batch_sizes.lock().unwrap(), [1]);
+
+        drop(client);
+        assert!(queue.inner.lock().unwrap().closed);
+    }
+
+    #[test]
+    fn model_runtime_shuts_down_after_the_last_handle_is_dropped() {
+        let backend = TestBackend {
+            batch_sizes: Arc::new(Mutex::new(Vec::new())),
+            fail: false,
+        };
+        let first_handle = ModelRuntime::start(vec![backend], 4, 1);
+        let second_handle = first_handle.clone();
+        let queue = first_handle.0.queue.clone();
+
+        drop(first_handle);
+        assert!(!queue.inner.lock().unwrap().closed);
+
+        drop(second_handle);
+        assert!(queue.inner.lock().unwrap().closed);
     }
 
     #[test]
