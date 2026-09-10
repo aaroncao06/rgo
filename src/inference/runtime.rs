@@ -1,4 +1,8 @@
+use crate::game::board::Loc;
 use crate::game::game_state::GameState;
+use crate::game::hash::{
+    PositionHash, komi_hash, pass_hash, player_hash, suicide_hash, superko_hash,
+};
 use crate::inference::backend::InferenceBackend;
 use crate::inference::inputs::NNInput;
 use crate::inference::policy::legal_mask;
@@ -9,7 +13,7 @@ use std::{
     thread::JoinHandle,
 };
 use tokio::sync::Notify;
-// code for the queue,
+// code for the runtime (queue+cache), and what interacts with it (clients + executors)
 
 enum SlotState {
     Idle,
@@ -33,8 +37,13 @@ struct QueueInner {
     closed: bool, // executor exits thread when queue is closed and empty, instead of waiting
 }
 
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EvaluationKey(PositionHash); // for the eval cache
+
+// Striped eval cache between hash(input * mask * player) and an Arc of the processed output.
 struct EvaluationCache {}
-struct ModelRuntime {
+pub(crate) struct ModelRuntime {
     // each model runtime owns its own queue and cache and executors. makes it easier to switch out and make new ones
     queue: Arc<BatchQueue>, // model runtime owns this, should be responsible for dropping everything
     cache: EvaluationCache,
@@ -58,6 +67,24 @@ struct InferenceExecutor<T: InferenceBackend> {
     max_batch_size: usize,
 }
 
+impl EvaluationKey {
+    fn new(game_state: &GameState) -> Self {
+        let mut key = game_state.board().position_hash();
+        key ^= player_hash(game_state.next_player());
+        for loc in Loc::board_iter() {
+            if game_state.is_superko_banned(loc) {
+                key ^= superko_hash(loc);
+            }
+        }
+        key ^= komi_hash(game_state.rules().komi);
+        key ^= pass_hash(game_state.consecutive_ending_passes());
+
+        if game_state.rules().multi_stone_suicide_legal {
+            key ^= suicide_hash();
+        }
+        Self(key)
+    }
+}
 impl EvalSlot {
     fn new() -> Self {
         Self {
@@ -192,35 +219,6 @@ impl BatchQueue {
     }
 }
 impl ModelHandle {
-    pub(crate) fn start<T>(
-        backends: Vec<T>,
-        max_batch_size: usize,
-        queue_capacity: usize, // max number of inference clients, each with one outstanding request
-    ) -> Self
-    where
-        T: InferenceBackend + Send + 'static, // send backends to the different executor threads. static is a requirement to move into the thread (backend owns everything it needs)
-    {
-        assert!(!backends.is_empty(), "need at least one inference backend");
-        assert!(max_batch_size > 0, "need positive batch size");
-        assert!(queue_capacity > 0, "need positive queue capacity");
-
-        let queue = Arc::new(BatchQueue::new(queue_capacity));
-        let cache = EvaluationCache {};
-
-        let mut executor_threads = Vec::with_capacity(backends.len());
-        for backend in backends {
-            let executor = InferenceExecutor::new(queue.clone(), backend, max_batch_size);
-            executor_threads.push(std::thread::spawn(move || {
-                executor.run();
-            }));
-        }
-        Self(Arc::new(ModelRuntime {
-            queue,
-            cache,
-            executor_threads,
-        }))
-    }
-
     fn submit_request(&self, request: Arc<EvalSlot>) -> Result<(), InferenceError> {
         self.0.queue.submit_request(request)
     }
@@ -306,6 +304,36 @@ impl<T: InferenceBackend> InferenceExecutor<T> {
     }
 }
 
+impl ModelRuntime {
+    pub(crate) fn start<T>(
+        backends: Vec<T>,
+        max_batch_size: usize,
+        queue_capacity: usize, // max number of inference clients, each with one outstanding request
+    ) -> ModelHandle
+    where
+        T: InferenceBackend + Send + 'static, // send backends to the different executor threads. static is a requirement to move into the thread (backend owns everything it needs)
+    {
+        assert!(!backends.is_empty(), "need at least one inference backend");
+        assert!(max_batch_size > 0, "need positive batch size");
+        assert!(queue_capacity > 0, "need positive queue capacity");
+
+        let queue = Arc::new(BatchQueue::new(queue_capacity));
+        let cache = EvaluationCache {};
+
+        let mut executor_threads = Vec::with_capacity(backends.len());
+        for backend in backends {
+            let executor = InferenceExecutor::new(queue.clone(), backend, max_batch_size);
+            executor_threads.push(std::thread::spawn(move || {
+                executor.run();
+            }));
+        }
+        ModelHandle(Arc::new(Self {
+            queue,
+            cache,
+            executor_threads,
+        }))
+    }
+}
 //destructor that closes the queue and executor threads
 impl Drop for ModelRuntime {
     fn drop(&mut self) {
@@ -335,6 +363,111 @@ mod tests {
 
     fn test_output() -> Arc<NNOutput> {
         Arc::new(NNOutput::from_raw([0.0; POLICY_SIZE], 0.0, 0.0, 0.0))
+    }
+
+    fn loc(x: usize, y: usize) -> Loc {
+        Loc::new(x, y).expect("test coordinates must be on the board")
+    }
+
+    #[test]
+    fn evaluation_key_is_deterministic_and_changes_with_position_and_passes() {
+        let initial = GameState::new(Rules::TROMP_TAYLORISH);
+        let equivalent = GameState::new(Rules::TROMP_TAYLORISH);
+        assert_eq!(
+            EvaluationKey::new(&initial),
+            EvaluationKey::new(&equivalent)
+        );
+
+        let mut moved = GameState::new(Rules::TROMP_TAYLORISH);
+        assert!(moved.play(loc(4, 4)));
+        assert_ne!(EvaluationKey::new(&initial), EvaluationKey::new(&moved));
+
+        let mut passed_twice = GameState::new(Rules::TROMP_TAYLORISH);
+        assert!(passed_twice.play(Loc::PASS));
+        assert!(passed_twice.play(Loc::PASS));
+        assert_eq!(
+            initial.board().position_hash(),
+            passed_twice.board().position_hash()
+        );
+        assert_eq!(initial.next_player(), passed_twice.next_player());
+        assert_ne!(
+            EvaluationKey::new(&initial),
+            EvaluationKey::new(&passed_twice)
+        );
+    }
+
+    #[test]
+    fn evaluation_key_changes_with_komi_and_suicide_rule() {
+        let baseline = GameState::new(Rules::TROMP_TAYLORISH);
+        let different_komi = GameState::new(Rules {
+            komi: 6.5,
+            multi_stone_suicide_legal: true,
+        });
+        let different_suicide_rule = GameState::new(Rules::OGS_CHINESE);
+
+        assert_ne!(
+            EvaluationKey::new(&baseline),
+            EvaluationKey::new(&different_komi)
+        );
+        assert_ne!(
+            EvaluationKey::new(&baseline),
+            EvaluationKey::new(&different_suicide_rule)
+        );
+    }
+
+    #[test]
+    fn evaluation_key_includes_superko_history_for_the_same_position() {
+        let recapture = loc(4, 4);
+        let capture = loc(4, 5);
+
+        let mut with_repetition = GameState::new(Rules::TROMP_TAYLORISH);
+        for move_loc in [
+            loc(4, 3),
+            recapture,
+            loc(3, 4),
+            loc(4, 6),
+            loc(5, 4),
+            loc(3, 5),
+            loc(0, 0),
+            loc(5, 5),
+            capture,
+        ] {
+            assert!(with_repetition.play(move_loc));
+        }
+
+        let mut without_repetition = GameState::new(Rules::TROMP_TAYLORISH);
+        for move_loc in [
+            loc(4, 3),
+            loc(4, 6),
+            loc(3, 4),
+            loc(3, 5),
+            loc(5, 4),
+            loc(5, 5),
+            loc(0, 0),
+            Loc::PASS,
+            capture,
+        ] {
+            assert!(without_repetition.play(move_loc));
+        }
+
+        assert_eq!(
+            with_repetition.board().position_hash(),
+            without_repetition.board().position_hash()
+        );
+        assert_eq!(
+            with_repetition.next_player(),
+            without_repetition.next_player()
+        );
+        assert_eq!(
+            with_repetition.consecutive_ending_passes(),
+            without_repetition.consecutive_ending_passes()
+        );
+        assert!(with_repetition.is_superko_banned(recapture));
+        assert!(!without_repetition.is_superko_banned(recapture));
+        assert_ne!(
+            EvaluationKey::new(&with_repetition),
+            EvaluationKey::new(&without_repetition)
+        );
     }
 
     struct TestBackend {
@@ -480,7 +613,7 @@ mod tests {
             batch_sizes: batch_sizes.clone(),
             fail: false,
         };
-        let model_handle = ModelHandle::start(vec![backend], 4, 1);
+        let model_handle = ModelRuntime::start(vec![backend], 4, 1);
         let queue = model_handle.0.queue.clone();
         let mut client = InferenceClient::new(model_handle);
 
@@ -500,7 +633,7 @@ mod tests {
             batch_sizes: Arc::new(Mutex::new(Vec::new())),
             fail: false,
         };
-        let first_handle = ModelHandle::start(vec![backend], 4, 1);
+        let first_handle = ModelRuntime::start(vec![backend], 4, 1);
         let second_handle = first_handle.clone();
         let queue = first_handle.0.queue.clone();
 
@@ -518,7 +651,7 @@ mod tests {
             batch_sizes: batch_sizes.clone(),
             fail: false,
         };
-        let model_handle = ModelHandle::start(vec![backend], 2, 2);
+        let model_handle = ModelRuntime::start(vec![backend], 2, 2);
         let mut first_client = InferenceClient::new(model_handle.clone());
         let mut second_client = InferenceClient::new(model_handle);
         let first_game = GameState::new(Rules::TROMP_TAYLORISH);

@@ -1,8 +1,14 @@
-use super::board::{ARRAY_LEN, Color, Loc};
+use super::board::{ARRAY_LEN, Color, Loc, Player};
 
 static ZOBRIST: Zobrist = Zobrist::new();
 
-const ZOBRIST_SEED: u64 = 0x7267_6f5f_7a6f_6272;
+const PLAYER_HASH_SEED: u64 = u64::from_be_bytes(*b"players!");
+const STONE_HASH_SEED: u64 = u64::from_be_bytes(*b"stones!!");
+const SUPERKO_HASH_SEED: u64 = u64::from_be_bytes(*b"superko!");
+const SUICIDE_HASH_SEED: u64 = u64::from_be_bytes(*b"suicide."); // for the binary rule
+const KOMI_HASH_SEED: u64 = u64::from_be_bytes(*b"komi!!!!");
+const PASS_HASH_SEED: u64 = u64::from_be_bytes(*b"passes!!");
+
 struct SplitMix64 {
     state: u64,
 }
@@ -27,10 +33,21 @@ impl SplitMix64 {
 pub(crate) type PositionHash = u128;
 struct Zobrist {
     stone_hashes: [[PositionHash; 4]; ARRAY_LEN],
+    superko_hashes: [PositionHash; ARRAY_LEN],
+    player_hashes: [PositionHash; 4],
+    suicide_hash: PositionHash,
 }
 impl Zobrist {
     const fn new() -> Self {
-        let mut rng = SplitMix64::new(ZOBRIST_SEED);
+        Self {
+            stone_hashes: Self::build_stone_hashes(),
+            superko_hashes: Self::build_superko_hashes(),
+            player_hashes: Self::build_player_hashes(),
+            suicide_hash: Self::build_suicide_hash(),
+        }
+    }
+    const fn build_stone_hashes() -> [[PositionHash; 4]; ARRAY_LEN] {
+        let mut rng = SplitMix64::new(STONE_HASH_SEED);
         let mut stone_hashes = [[0; 4]; ARRAY_LEN];
         let mut i = 0;
         while i < ARRAY_LEN {
@@ -38,10 +55,55 @@ impl Zobrist {
             stone_hashes[i][Color::White as usize] = rng.next_hash();
             i += 1;
         }
-        Self { stone_hashes }
+        stone_hashes
+    }
+    const fn build_superko_hashes() -> [PositionHash; ARRAY_LEN] {
+        let mut rng = SplitMix64::new(SUPERKO_HASH_SEED);
+        let mut superko_hashes = [0; ARRAY_LEN];
+        let mut i = 0;
+        while i < ARRAY_LEN {
+            superko_hashes[i] = rng.next_hash();
+            i += 1;
+        }
+        superko_hashes
+    }
+    const fn build_player_hashes() -> [PositionHash; 4] {
+        let mut rng = SplitMix64::new(PLAYER_HASH_SEED);
+        let black = rng.next_hash();
+        let white = rng.next_hash();
+        [0, black, white, 0]
+    }
+    const fn build_suicide_hash() -> PositionHash {
+        let mut rng = SplitMix64::new(SUICIDE_HASH_SEED);
+        rng.next_hash()
     }
 }
 
 pub(crate) fn stone_hash(loc: Loc, color: Color) -> PositionHash {
     ZOBRIST.stone_hashes[loc.index()][color as usize]
+}
+
+pub(crate) fn player_hash(player: Player) -> PositionHash {
+    ZOBRIST.player_hashes[player as usize]
+}
+
+pub(crate) fn superko_hash(loc: Loc) -> PositionHash {
+    ZOBRIST.superko_hashes[loc.index()]
+}
+
+pub(crate) fn suicide_hash() -> PositionHash {
+    ZOBRIST.suicide_hash
+}
+
+const fn scalar_hash(seed: u64, value: u64) -> PositionHash {
+    let mut rng = SplitMix64::new(seed ^ value);
+    rng.next_hash()
+}
+
+pub(crate) fn komi_hash(komi: f32) -> PositionHash {
+    scalar_hash(KOMI_HASH_SEED, komi.to_bits() as u64)
+}
+
+pub(crate) fn pass_hash(count: u8) -> PositionHash {
+    scalar_hash(PASS_HASH_SEED, count as u64)
 }
