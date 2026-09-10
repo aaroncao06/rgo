@@ -9,6 +9,7 @@ use std::{
     thread::JoinHandle,
 };
 use tokio::sync::Notify;
+// code for the queue,
 
 enum SlotState {
     Idle,
@@ -42,10 +43,10 @@ struct ModelRuntime {
 
 // wrapper so that client doesnt access executor threads and allow easy switching. api for queueing and caching
 #[derive(Clone)]
-struct ModelHandle(Arc<ModelRuntime>);
+pub(crate) struct ModelHandle(Arc<ModelRuntime>);
 
 // search workers own, submits requests to the shared queue
-struct InferenceClient {
+pub(crate) struct InferenceClient {
     model_handle: ModelHandle,
     slot: Arc<EvalSlot>,
 }
@@ -191,13 +192,51 @@ impl BatchQueue {
     }
 }
 impl ModelHandle {
+    pub(crate) fn start<T>(
+        backends: Vec<T>,
+        max_batch_size: usize,
+        queue_capacity: usize, // max number of inference clients, each with one outstanding request
+    ) -> Self
+    where
+        T: InferenceBackend + Send + 'static, // send backends to the different executor threads. static is a requirement to move into the thread (backend owns everything it needs)
+    {
+        assert!(!backends.is_empty(), "need at least one inference backend");
+        assert!(max_batch_size > 0, "need positive batch size");
+        assert!(queue_capacity > 0, "need positive queue capacity");
+
+        let queue = Arc::new(BatchQueue::new(queue_capacity));
+        let cache = EvaluationCache {};
+
+        let mut executor_threads = Vec::with_capacity(backends.len());
+        for backend in backends {
+            let executor = InferenceExecutor::new(queue.clone(), backend, max_batch_size);
+            executor_threads.push(std::thread::spawn(move || {
+                executor.run();
+            }));
+        }
+        Self(Arc::new(ModelRuntime {
+            queue,
+            cache,
+            executor_threads,
+        }))
+    }
+
     fn submit_request(&self, request: Arc<EvalSlot>) -> Result<(), InferenceError> {
         self.0.queue.submit_request(request)
     }
     //todo: lookup and insert cache
 }
 impl InferenceClient {
-    async fn evaluate(&mut self, game_state: &GameState) -> Result<Arc<NNOutput>, InferenceError> {
+    pub(crate) fn new(model_handle: ModelHandle) -> Self {
+        Self {
+            model_handle,
+            slot: Arc::new(EvalSlot::new()),
+        }
+    }
+    pub(crate) async fn evaluate(
+        &mut self,
+        game_state: &GameState,
+    ) -> Result<Arc<NNOutput>, InferenceError> {
         let input = NNInput::encode(game_state);
         let next_player = game_state.next_player();
         let legal_mask = legal_mask(game_state);
@@ -267,36 +306,6 @@ impl<T: InferenceBackend> InferenceExecutor<T> {
     }
 }
 
-impl ModelRuntime {
-    fn start<T>(
-        backends: Vec<T>,
-        max_batch_size: usize,
-        queue_capacity: usize, // max number of inference clients, each with one outstanding request
-    ) -> ModelHandle
-    where
-        T: InferenceBackend + Send + 'static, // send backends to the different executor threads. static is a requirement to move into the thread (backend owns everything it needs)
-    {
-        assert!(!backends.is_empty(), "need at least one inference backend");
-        assert!(max_batch_size > 0, "need positive batch size");
-        assert!(queue_capacity > 0, "need positive queue capacity");
-
-        let queue = Arc::new(BatchQueue::new(queue_capacity));
-        let cache = EvaluationCache {};
-
-        let mut executor_threads = Vec::with_capacity(backends.len());
-        for backend in backends {
-            let executor = InferenceExecutor::new(queue.clone(), backend, max_batch_size);
-            executor_threads.push(std::thread::spawn(move || {
-                executor.run();
-            }));
-        }
-        ModelHandle(Arc::new(Self {
-            queue,
-            cache,
-            executor_threads,
-        }))
-    }
-}
 //destructor that closes the queue and executor threads
 impl Drop for ModelRuntime {
     fn drop(&mut self) {
@@ -471,12 +480,9 @@ mod tests {
             batch_sizes: batch_sizes.clone(),
             fail: false,
         };
-        let model_handle = ModelRuntime::start(vec![backend], 4, 1);
+        let model_handle = ModelHandle::start(vec![backend], 4, 1);
         let queue = model_handle.0.queue.clone();
-        let mut client = InferenceClient {
-            model_handle,
-            slot: Arc::new(EvalSlot::new()),
-        };
+        let mut client = InferenceClient::new(model_handle);
 
         let game_state = GameState::new(Rules::TROMP_TAYLORISH);
         let output = client.evaluate(&game_state).await.unwrap();
@@ -494,7 +500,7 @@ mod tests {
             batch_sizes: Arc::new(Mutex::new(Vec::new())),
             fail: false,
         };
-        let first_handle = ModelRuntime::start(vec![backend], 4, 1);
+        let first_handle = ModelHandle::start(vec![backend], 4, 1);
         let second_handle = first_handle.clone();
         let queue = first_handle.0.queue.clone();
 
@@ -503,6 +509,29 @@ mod tests {
 
         drop(second_handle);
         assert!(queue.inner.lock().unwrap().closed);
+    }
+
+    #[tokio::test]
+    async fn multiple_clients_share_one_model_runtime() {
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+        let backend = TestBackend {
+            batch_sizes: batch_sizes.clone(),
+            fail: false,
+        };
+        let model_handle = ModelHandle::start(vec![backend], 2, 2);
+        let mut first_client = InferenceClient::new(model_handle.clone());
+        let mut second_client = InferenceClient::new(model_handle);
+        let first_game = GameState::new(Rules::TROMP_TAYLORISH);
+        let second_game = GameState::new(Rules::TROMP_TAYLORISH);
+
+        let (first_result, second_result) = tokio::join!(
+            first_client.evaluate(&first_game),
+            second_client.evaluate(&second_game)
+        );
+
+        assert!(first_result.unwrap().is_processed());
+        assert!(second_result.unwrap().is_processed());
+        assert_eq!(batch_sizes.lock().unwrap().iter().sum::<usize>(), 2);
     }
 
     #[test]
