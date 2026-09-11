@@ -40,9 +40,22 @@ struct QueueInner {
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EvaluationKey(PositionHash); // for the eval cache
-
 // Striped eval cache between hash(input * mask * player) and an Arc of the processed output.
-struct EvaluationCache {}
+
+struct CacheEntry {
+    key: EvaluationKey,
+    output: Arc<NNOutput>,
+}
+struct CacheShard {
+    entries: Box<[Option<CacheEntry>]>, //dyn array of entries
+}
+
+struct EvaluationCache {
+    //indexing: xxxx{shard bits}{entry bits}
+    shards: Box<[Mutex<CacheShard>]>, //dyn array of shards
+    shard_bits: u32,                  // upper
+    entry_bits: u32,                  // lower
+}
 pub(crate) struct ModelRuntime {
     // each model runtime owns its own queue and cache and executors. makes it easier to switch out and make new ones
     queue: Arc<BatchQueue>, // model runtime owns this, should be responsible for dropping everything
@@ -65,6 +78,77 @@ struct InferenceExecutor<T: InferenceBackend> {
     queue: Arc<BatchQueue>,
     backend: T,
     max_batch_size: usize,
+}
+impl CacheShard {
+    fn new(entries_per_shard: usize) -> Self {
+        let mut entries = Vec::with_capacity(entries_per_shard);
+        entries.resize_with(entries_per_shard, || None);
+        Self {
+            entries: entries.into_boxed_slice(),
+        }
+    }
+}
+impl EvaluationCache {
+    fn new(capacity: usize, num_shards: usize) -> Self {
+        assert!(
+            capacity.is_power_of_two(),
+            "cache capacity must be a power of two"
+        );
+        assert!(
+            num_shards.is_power_of_two(),
+            "cache shard count must be a power of two"
+        );
+        assert!(
+            num_shards <= capacity,
+            "cache cannot have more shards than entries"
+        );
+
+        let entries_per_shard = capacity / num_shards;
+        let mut shards = Vec::with_capacity(num_shards);
+        for _ in 0..num_shards {
+            shards.push(Mutex::new(CacheShard::new(entries_per_shard)));
+        }
+        let shards = shards.into_boxed_slice();
+        Self {
+            shards,
+            shard_bits: num_shards.ilog2(),
+            entry_bits: entries_per_shard.ilog2(),
+        }
+    }
+    fn indices(&self, key: EvaluationKey) -> (usize, usize) {
+        let bits = key.0 as usize;
+        let entry_mask = (1_usize << self.entry_bits) - 1;
+        let shard_mask = (1_usize << self.shard_bits) - 1;
+        let entry_index = bits & entry_mask;
+        let shard_index = (bits >> self.entry_bits) & shard_mask;
+        (shard_index, entry_index)
+    }
+    fn lookup(&self, key: EvaluationKey) -> Option<Arc<NNOutput>> {
+        let (shard_index, entry_index) = self.indices(key);
+        //take guard, check if it matches our key
+        let shard = self.shards[shard_index]
+            .lock()
+            .expect("evaluation cache mutex poisoned");
+        match &shard.entries[entry_index] {
+            Some(entry) if entry.key == key => Some(entry.output.clone()),
+            _ => None,
+        }
+    }
+    fn insert(&self, key: EvaluationKey, output: Arc<NNOutput>) {
+        debug_assert!(
+            output.is_processed(),
+            "evaluation cache only takes processed outputs"
+        );
+        let (shard_index, entry_index) = self.indices(key);
+        let old_entry = {
+            let mut shard = self.shards[shard_index]
+                .lock()
+                .expect("evaluation cache mutex poisoned");
+            shard.entries[entry_index].replace(CacheEntry { key, output })
+            //mutex drops
+        };
+        drop(old_entry); // outside of the mutex
+    }
 }
 
 impl EvaluationKey {
@@ -222,7 +306,12 @@ impl ModelHandle {
     fn submit_request(&self, request: Arc<EvalSlot>) -> Result<(), InferenceError> {
         self.0.queue.submit_request(request)
     }
-    //todo: lookup and insert cache
+    fn lookup(&self, key: EvaluationKey) -> Option<Arc<NNOutput>> {
+        self.0.cache.lookup(key)
+    }
+    fn insert(&self, key: EvaluationKey, output: Arc<NNOutput>) {
+        self.0.cache.insert(key, output);
+    }
 }
 impl InferenceClient {
     pub(crate) fn new(model_handle: ModelHandle) -> Self {
@@ -235,11 +324,15 @@ impl InferenceClient {
         &mut self,
         game_state: &GameState,
     ) -> Result<Arc<NNOutput>, InferenceError> {
+        //first check cache
+        let key = EvaluationKey::new(game_state);
+        if let Some(output) = self.model_handle.lookup(key) {
+            return Ok(output);
+        }
+
         let input = NNInput::encode(game_state);
         let next_player = game_state.next_player();
         let legal_mask = legal_mask(game_state);
-
-        //future: check cache before sending to backend
 
         self.slot.queue(input);
         // send a clone of the arc pointer
@@ -254,7 +347,7 @@ impl InferenceClient {
             .expect("raw NN output must be exclusively owned")
             .process_in_place(next_player, &legal_mask);
 
-        //future: send copy of output to the eval cache
+        self.model_handle.insert(key, output.clone());
 
         Ok(output)
     }
@@ -309,6 +402,8 @@ impl ModelRuntime {
         backends: Vec<T>,
         max_batch_size: usize,
         queue_capacity: usize, // max number of inference clients, each with one outstanding request
+        cache_capacity: usize,
+        num_cache_shards: usize,
     ) -> ModelHandle
     where
         T: InferenceBackend + Send + 'static, // send backends to the different executor threads. static is a requirement to move into the thread (backend owns everything it needs)
@@ -318,7 +413,7 @@ impl ModelRuntime {
         assert!(queue_capacity > 0, "need positive queue capacity");
 
         let queue = Arc::new(BatchQueue::new(queue_capacity));
-        let cache = EvaluationCache {};
+        let cache = EvaluationCache::new(cache_capacity, num_cache_shards);
 
         let mut executor_threads = Vec::with_capacity(backends.len());
         for backend in backends {
@@ -363,6 +458,15 @@ mod tests {
 
     fn test_output() -> Arc<NNOutput> {
         Arc::new(NNOutput::from_raw([0.0; POLICY_SIZE], 0.0, 0.0, 0.0))
+    }
+
+    fn test_processed_output() -> Arc<NNOutput> {
+        let game_state = GameState::new(Rules::TROMP_TAYLORISH);
+        let mut output = test_output();
+        Arc::get_mut(&mut output)
+            .unwrap()
+            .process_in_place(game_state.next_player(), &legal_mask(&game_state));
+        output
     }
 
     fn loc(x: usize, y: usize) -> Loc {
@@ -468,6 +572,40 @@ mod tests {
             EvaluationKey::new(&with_repetition),
             EvaluationKey::new(&without_repetition)
         );
+    }
+
+    #[test]
+    fn evaluation_cache_misses_then_returns_the_inserted_output() {
+        let cache = EvaluationCache::new(8, 2);
+        let key = EvaluationKey(3);
+        let output = test_processed_output();
+
+        assert!(cache.lookup(key).is_none());
+        cache.insert(key, output.clone());
+
+        let cached = cache.lookup(key).unwrap();
+        assert!(Arc::ptr_eq(&cached, &output));
+    }
+
+    #[test]
+    fn evaluation_cache_replaces_collisions_without_invalidating_old_outputs() {
+        let cache = EvaluationCache::new(8, 2);
+        let first_key = EvaluationKey(3);
+        let colliding_key = EvaluationKey(11);
+        assert_eq!(cache.indices(first_key), cache.indices(colliding_key));
+
+        let first_output = test_processed_output();
+        cache.insert(first_key, first_output.clone());
+        let retained = cache.lookup(first_key).unwrap();
+
+        let second_output = test_processed_output();
+        cache.insert(colliding_key, second_output.clone());
+
+        assert!(cache.lookup(first_key).is_none());
+        let cached = cache.lookup(colliding_key).unwrap();
+        assert!(Arc::ptr_eq(&cached, &second_output));
+        assert!(Arc::ptr_eq(&retained, &first_output));
+        assert!(retained.is_processed());
     }
 
     struct TestBackend {
@@ -613,7 +751,7 @@ mod tests {
             batch_sizes: batch_sizes.clone(),
             fail: false,
         };
-        let model_handle = ModelRuntime::start(vec![backend], 4, 1);
+        let model_handle = ModelRuntime::start(vec![backend], 4, 1, 8, 2);
         let queue = model_handle.0.queue.clone();
         let mut client = InferenceClient::new(model_handle);
 
@@ -627,13 +765,31 @@ mod tests {
         assert!(queue.inner.lock().unwrap().closed);
     }
 
+    #[tokio::test]
+    async fn repeated_evaluation_uses_the_model_cache() {
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+        let backend = TestBackend {
+            batch_sizes: batch_sizes.clone(),
+            fail: false,
+        };
+        let model_handle = ModelRuntime::start(vec![backend], 4, 1, 8, 2);
+        let mut client = InferenceClient::new(model_handle);
+        let game_state = GameState::new(Rules::TROMP_TAYLORISH);
+
+        let first = client.evaluate(&game_state).await.unwrap();
+        let second = client.evaluate(&game_state).await.unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(*batch_sizes.lock().unwrap(), [1]);
+    }
+
     #[test]
     fn model_runtime_shuts_down_after_the_last_handle_is_dropped() {
         let backend = TestBackend {
             batch_sizes: Arc::new(Mutex::new(Vec::new())),
             fail: false,
         };
-        let first_handle = ModelRuntime::start(vec![backend], 4, 1);
+        let first_handle = ModelRuntime::start(vec![backend], 4, 1, 8, 2);
         let second_handle = first_handle.clone();
         let queue = first_handle.0.queue.clone();
 
@@ -651,11 +807,12 @@ mod tests {
             batch_sizes: batch_sizes.clone(),
             fail: false,
         };
-        let model_handle = ModelRuntime::start(vec![backend], 2, 2);
+        let model_handle = ModelRuntime::start(vec![backend], 2, 2, 8, 2);
         let mut first_client = InferenceClient::new(model_handle.clone());
         let mut second_client = InferenceClient::new(model_handle);
         let first_game = GameState::new(Rules::TROMP_TAYLORISH);
-        let second_game = GameState::new(Rules::TROMP_TAYLORISH);
+        let mut second_game = GameState::new(Rules::TROMP_TAYLORISH);
+        assert!(second_game.play(loc(4, 4)));
 
         let (first_result, second_result) = tokio::join!(
             first_client.evaluate(&first_game),
