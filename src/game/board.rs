@@ -1,4 +1,4 @@
-use super::hash::{PositionHash, stone_hash};
+use super::hash::{Hash128, stone_hash};
 
 // can make these runtime-configurable in the future
 pub(crate) const BOARD_SIZE: usize = 9;
@@ -110,7 +110,7 @@ pub(crate) struct Board {
     chain_head: [Loc; ARRAY_LEN],
     next_in_chain: [Loc; ARRAY_LEN],
     simple_ko: Option<Loc>,
-    position_hash: PositionHash,
+    position_hash: Hash128,
 }
 
 impl Board {
@@ -394,8 +394,93 @@ impl Board {
         }
         !self.is_illegal_suicide(loc, player, multi_stone_suicide_legal)
     }
-    pub(crate) fn position_hash(&self) -> PositionHash {
+    pub(crate) fn position_hash(&self) -> Hash128 {
         self.position_hash
+    }
+    fn empty_region_pushes_count_over_bound(
+        &self,
+        initial_loc: Loc,
+        counted: &mut [bool; ARRAY_LEN],
+        count: &mut usize,
+        bound: usize,
+    ) -> bool {
+        let initial_i = initial_loc.index();
+        if counted[initial_i] {
+            return false;
+        }
+
+        *count += 1;
+        counted[initial_i] = true;
+        if *count > bound {
+            return true;
+        }
+
+        let mut queue = [Loc::NULL; ARRAY_LEN];
+        let mut queue_head = 0;
+        let mut queue_tail = 1;
+        queue[0] = initial_loc;
+
+        while queue_head < queue_tail {
+            let current = queue[queue_head];
+            queue_head += 1;
+
+            for adj_i in Loc::adjacent_indices(current.index()) {
+                if self.colors[adj_i] == Color::Empty && !counted[adj_i] {
+                    *count += 1;
+                    counted[adj_i] = true;
+                    if *count > bound {
+                        return true;
+                    }
+
+                    queue[queue_tail] = Loc::from_index(adj_i);
+                    queue_tail += 1;
+                }
+            }
+        }
+
+        false
+    }
+    pub(crate) fn repetition_region_is_small(&self, loc: Loc, bound: usize) -> bool {
+        if loc == Loc::NULL || loc == Loc::PASS {
+            return true;
+        }
+        debug_assert!(loc.is_on_board());
+
+        let mut count = 0;
+        let loc_color = self.colors[loc.index()];
+
+        if loc_color != Color::Empty {
+            debug_assert!(loc_color == Color::Black || loc_color == Color::White);
+            let data = self.chain_data[self.chain_head[loc.index()].index()];
+            count += data.num_locs as usize;
+
+            // Every liberty belongs to one of the empty regions counted below.
+            if count + data.num_liberties as usize > bound {
+                return false;
+            }
+        }
+
+        let mut counted = [false; ARRAY_LEN];
+
+        if loc_color == Color::Empty {
+            !self.empty_region_pushes_count_over_bound(loc, &mut counted, &mut count, bound)
+        } else {
+            for chain_loc in self.chain_iter(loc) {
+                for adj_i in Loc::adjacent_indices(chain_loc.index()) {
+                    if self.colors[adj_i] == Color::Empty
+                        && self.empty_region_pushes_count_over_bound(
+                            Loc::from_index(adj_i),
+                            &mut counted,
+                            &mut count,
+                            bound,
+                        )
+                    {
+                        return false;
+                    }
+                }
+            }
+            true
+        }
     }
     fn chain_iter(&self, start: Loc) -> impl Iterator<Item = Loc> + '_ {
         //'_ is tied to self
@@ -404,7 +489,7 @@ impl Board {
             (next != start).then_some(next) // just an if statement lol
         })
     }
-    pub(crate) fn get_position_hash_after_move(&self, loc: Loc, player: Player) -> PositionHash {
+    pub(crate) fn get_position_hash_after_move(&self, loc: Loc, player: Player) -> Hash128 {
         //see what stones get removed if you do a move. order of moves doesnt matter for the hash
         if loc == Loc::PASS {
             return self.position_hash;
@@ -920,6 +1005,47 @@ mod tests {
 
         assert_eq!(board.get_chain_size(corner), 1);
         assert_eq!(board.get_num_liberties(corner), 2);
+    }
+
+    #[test]
+    fn repetition_region_counts_a_stone_chain_and_its_adjacent_empty_regions() {
+        let board = board_from_ascii([
+            ".........",
+            ".........",
+            ".........",
+            "....oo...",
+            "...ox.o..",
+            "....oo...",
+            ".........",
+            ".........",
+            ".........",
+        ]);
+        let played = loc(4, 4);
+
+        // One Black stone plus its enclosed one-point liberty.
+        assert!(!board.repetition_region_is_small(played, 1));
+        assert!(board.repetition_region_is_small(played, 2));
+    }
+
+    #[test]
+    fn repetition_region_counts_the_empty_component_after_suicide() {
+        let board = board_from_ascii([
+            ".........",
+            ".........",
+            ".........",
+            "....oo...",
+            "...o..o..",
+            "....oo...",
+            ".........",
+            ".........",
+            ".........",
+        ]);
+        let played = loc(4, 4);
+
+        // The move location belongs to an enclosed two-point empty region.
+        assert!(!board.repetition_region_is_small(played, 1));
+        assert!(board.repetition_region_is_small(played, 2));
+        assert!(board.repetition_region_is_small(Loc::PASS, 0));
     }
 
     #[test]

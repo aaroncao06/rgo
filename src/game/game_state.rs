@@ -1,7 +1,7 @@
 use crate::game::board::ARRAY_LEN;
 
 use super::board::{Board, Color, Loc, Player};
-use super::hash::PositionHash;
+use super::hash::Hash128;
 use super::rules::Rules;
 
 use std::collections::HashSet;
@@ -12,7 +12,7 @@ pub(crate) struct GameState {
     next_player: Player,
     consecutive_ending_passes: u8,
     superko_banned: [bool; ARRAY_LEN],
-    seen_position_hashes: HashSet<PositionHash>,
+    seen_position_hashes: HashSet<Hash128>,
 }
 
 impl GameState {

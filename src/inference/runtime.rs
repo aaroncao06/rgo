@@ -1,8 +1,6 @@
 use crate::game::board::Loc;
 use crate::game::game_state::GameState;
-use crate::game::hash::{
-    PositionHash, komi_hash, pass_hash, player_hash, suicide_hash, superko_hash,
-};
+use crate::game::hash::{Hash128, komi_hash, pass_hash, player_hash, suicide_hash, superko_hash};
 use crate::inference::backend::InferenceBackend;
 use crate::inference::inputs::NNInput;
 use crate::inference::policy::legal_mask;
@@ -39,7 +37,7 @@ struct QueueInner {
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EvaluationKey(PositionHash); // for the eval cache
+struct EvaluationKey(Hash128); // for the eval cache
 // Striped eval cache between hash(input * mask * player) and an Arc of the processed output.
 
 struct CacheEntry {
@@ -160,8 +158,10 @@ impl EvaluationKey {
                 key ^= superko_hash(loc);
             }
         }
-        key ^= komi_hash(game_state.rules().komi);
         key ^= pass_hash(game_state.consecutive_ending_passes());
+
+        //state hash done, hash rules now
+        key ^= komi_hash(game_state.rules().komi); //randomized komi will cause more cache misses for similar positions. should be discrete
 
         if game_state.rules().multi_stone_suicide_legal {
             key ^= suicide_hash();
