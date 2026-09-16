@@ -72,9 +72,9 @@ pub(crate) struct InferenceClient {
 }
 
 // pulls from the queue
-struct InferenceExecutor<T: InferenceBackend> {
+struct InferenceExecutor<B: InferenceBackend> {
     queue: Arc<BatchQueue>,
-    backend: T,
+    backend: B,
     max_batch_size: usize,
 }
 impl CacheShard {
@@ -353,8 +353,8 @@ impl InferenceClient {
     }
 }
 
-impl<T: InferenceBackend> InferenceExecutor<T> {
-    fn new(queue: Arc<BatchQueue>, backend: T, max_batch_size: usize) -> Self {
+impl<B: InferenceBackend> InferenceExecutor<B> {
+    fn new(queue: Arc<BatchQueue>, backend: B, max_batch_size: usize) -> Self {
         assert!(max_batch_size > 0, "need positive batch size");
         Self {
             queue,
@@ -398,15 +398,15 @@ impl<T: InferenceBackend> InferenceExecutor<T> {
 }
 
 impl ModelRuntime {
-    pub(crate) fn start<T>(
-        backends: Vec<T>,
+    pub(crate) fn start<B>(
+        backends: Vec<B>,
         max_batch_size: usize,
         queue_capacity: usize, // max number of inference clients, each with one outstanding request
         cache_capacity: usize,
         num_cache_shards: usize,
     ) -> ModelHandle
     where
-        T: InferenceBackend + Send + 'static, // send backends to the different executor threads. static is a requirement to move into the thread (backend owns everything it needs)
+        B: InferenceBackend + Send + 'static, // send backends to the different executor threads. static is a requirement to move into the thread (backend owns everything it needs)
     {
         assert!(!backends.is_empty(), "need at least one inference backend");
         assert!(max_batch_size > 0, "need positive batch size");

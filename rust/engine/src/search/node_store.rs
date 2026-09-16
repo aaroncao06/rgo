@@ -8,7 +8,15 @@ const EMPTY_INDEX: u32 = u32::MAX; //max index is empty_index-1
 pub(crate) struct StoreFull;
 
 // can have different types of storages for different uses (dynamic vs static search budgets)
-pub(crate) trait NodeStore {
+/// Storage whose nodes may be referenced through raw pointers.
+///
+/// # Safety
+///
+/// Every `NonNull<SearchNode>` returned by an implementation must point to a
+/// valid, initialized node and remain at the same address until `clear` is
+/// called or the store is dropped. Inserting or looking up other nodes must not
+/// move or invalidate any previously returned node.
+pub(crate) unsafe trait NodeStore {
     fn find(&mut self, key: GraphKey) -> Option<NonNull<SearchNode>>;
     fn find_or_insert(&mut self, key: GraphKey) -> Result<(NonNull<SearchNode>, bool), StoreFull>; // returns pointer to the slot followed by whether it was just inserted or not
     fn len(&self) -> usize;
@@ -56,7 +64,11 @@ impl FixedArenaNodeStore {
         }
     }
 }
-impl NodeStore for FixedArenaNodeStore {
+// SAFETY: `entries` reserves `node_capacity` slots during construction, and
+// `find_or_insert` refuses to push once that capacity is reached. It therefore
+// never reallocates while nodes are live. Entries are not individually moved
+// or removed, so returned node pointers remain stable until `clear` or drop.
+unsafe impl NodeStore for FixedArenaNodeStore {
     fn find(&mut self, key: GraphKey) -> Option<NonNull<SearchNode>> {
         let bucket_mask = self.bucket_heads.len() - 1; // bucket capacity is already a power of two
         let bucket_index = (key.raw() as usize) & bucket_mask;

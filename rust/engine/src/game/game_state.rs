@@ -6,6 +6,7 @@ use super::rules::Rules;
 
 use std::collections::HashSet;
 
+#[derive(Clone)]
 pub(crate) struct GameState {
     board: Board,
     rules: Rules,
@@ -32,6 +33,20 @@ impl GameState {
     }
     pub(crate) fn board(&self) -> &Board {
         &self.board
+    }
+
+    /// Restores this state from `source` while retaining the hash-set's
+    /// allocated capacity for reuse across playouts.
+    pub(crate) fn reset_from(&mut self, source: &GameState) {
+        self.board.clone_from(&source.board);
+        self.rules = source.rules;
+        self.next_player = source.next_player;
+        self.consecutive_ending_passes = source.consecutive_ending_passes;
+        self.superko_banned = source.superko_banned;
+
+        self.seen_position_hashes.clear();
+        self.seen_position_hashes
+            .extend(source.seen_position_hashes.iter().copied());
     }
     pub(crate) fn rules(&self) -> &Rules {
         &self.rules
@@ -131,6 +146,31 @@ mod tests {
         assert!(history.play(loc(4, 4)));
         assert_eq!(history.next_player, Player::White);
         assert!(!history.is_legal(loc(4, 4)));
+    }
+
+    #[test]
+    fn reset_from_restores_the_complete_game_state() {
+        let mut source = GameState::new(rules());
+        assert!(source.play(loc(4, 4)));
+        assert!(source.play(Loc::PASS));
+
+        let mut scratch = GameState::new(Rules::OGS_CHINESE);
+        assert!(scratch.play(loc(0, 0)));
+        scratch.reset_from(&source);
+
+        assert_eq!(scratch.board.position_hash(), source.board.position_hash());
+        assert_eq!(scratch.rules.komi, source.rules.komi);
+        assert_eq!(
+            scratch.rules.multi_stone_suicide_legal,
+            source.rules.multi_stone_suicide_legal
+        );
+        assert_eq!(scratch.next_player, source.next_player);
+        assert_eq!(
+            scratch.consecutive_ending_passes,
+            source.consecutive_ending_passes
+        );
+        assert_eq!(scratch.superko_banned, source.superko_banned);
+        assert_eq!(scratch.seen_position_hashes, source.seen_position_hashes);
     }
 
     #[test]

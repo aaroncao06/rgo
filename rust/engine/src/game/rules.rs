@@ -1,3 +1,4 @@
+#[derive(Clone, Copy)]
 pub(crate) struct Rules {
     pub(crate) komi: f32,
     pub(crate) multi_stone_suicide_legal: bool,
