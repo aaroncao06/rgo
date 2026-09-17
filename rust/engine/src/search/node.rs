@@ -6,6 +6,8 @@ pub(crate) struct SearchNode {
     white_win_sum: f64, //higher precision
     white_score_sum: f64,
     white_score_mean_sq_sum: f64,
+    white_utility_sum: f64,
+    white_utility_sq_sum: f64,
     children: ChildStorage,
 }
 
@@ -25,6 +27,9 @@ pub(crate) struct Edge {
 }
 
 impl Edge {
+    pub(crate) fn move_loc(&self) -> Loc {
+        self.move_loc
+    }
     pub(crate) fn visits(&self) -> i32 {
         self.visits
     }
@@ -33,6 +38,9 @@ impl Edge {
     }
     pub(crate) fn child(&self) -> NonNull<SearchNode> {
         self.child
+    }
+    pub(crate) fn record_visit(&mut self) {
+        self.visits += 1;
     }
 }
 
@@ -44,6 +52,8 @@ impl SearchNode {
             white_win_sum: 0.0,
             white_score_sum: 0.0,
             white_score_mean_sq_sum: 0.0,
+            white_utility_sum: 0.0,
+            white_utility_sq_sum: 0.0,
             children: ChildStorage::new(),
         }
     }
@@ -57,11 +67,14 @@ impl SearchNode {
         white_win: f64,
         white_score: f64,
         white_score_mean_sq: f64,
+        white_utility: f64,
     ) {
         self.visits += 1;
         self.white_win_sum += white_win;
         self.white_score_sum += white_score;
         self.white_score_mean_sq_sum += white_score_mean_sq;
+        self.white_utility_sum += white_utility;
+        self.white_utility_sq_sum += white_utility * white_utility;
     }
     pub(crate) fn policy_probs(&self) -> &[f32; crate::inference::policy::POLICY_SIZE] {
         self.nn_output
@@ -69,8 +82,20 @@ impl SearchNode {
             .expect("search nodes must be evaluated before traversal")
             .policy_probs()
     }
+    pub(crate) fn nn_output(&self) -> &NNOutput {
+        self.nn_output
+            .as_deref()
+            .expect("search nodes must be evaluated before traversal")
+    }
     pub(crate) fn edge_visit_sum(&self) -> i32 {
         self.children.0.iter().map(|edge| edge.visits).sum()
+    }
+    pub(crate) fn visited_policy_mass(&self) -> f64 {
+        self.children
+            .0
+            .iter()
+            .map(|edge| f64::from(edge.policy_prior))
+            .sum()
     }
     pub(crate) fn edge_for_move(&self, move_loc: Loc) -> Option<(EdgeIndex, &Edge)> {
         self.children
@@ -80,12 +105,31 @@ impl SearchNode {
             .find(|(_, edge)| edge.move_loc == move_loc)
             .map(|(index, edge)| (EdgeIndex(index), edge))
     }
+    pub(crate) fn edge_mut(&mut self, edge_index: EdgeIndex) -> &mut Edge {
+        self.children.get_mut(edge_index)
+    }
     pub(crate) fn visits(&self) -> i32 {
         self.visits
     }
     pub(crate) fn white_win_rate(&self) -> f64 {
         debug_assert!(self.visits > 0);
         self.white_win_sum / f64::from(self.visits)
+    }
+    pub(crate) fn white_score_mean(&self) -> f64 {
+        debug_assert!(self.visits > 0);
+        self.white_score_sum / f64::from(self.visits)
+    }
+    pub(crate) fn white_score_mean_sq(&self) -> f64 {
+        debug_assert!(self.visits > 0);
+        self.white_score_mean_sq_sum / f64::from(self.visits)
+    }
+    pub(crate) fn white_utility(&self) -> f64 {
+        debug_assert!(self.visits > 0);
+        self.white_utility_sum / f64::from(self.visits)
+    }
+    pub(crate) fn white_utility_mean_sq(&self) -> f64 {
+        debug_assert!(self.visits > 0);
+        self.white_utility_sq_sum / f64::from(self.visits)
     }
     pub(crate) fn add_child(
         &mut self,
@@ -112,6 +156,12 @@ impl ChildStorage {
     fn new() -> Self {
         Self(Vec::new())
     }
+    fn get(&self, edge_index: EdgeIndex) -> &Edge {
+        &self.0[edge_index.0]
+    }
+    fn get_mut(&mut self, edge_index: EdgeIndex) -> &mut Edge {
+        &mut self.0[edge_index.0]
+    }
 }
 
 #[cfg(test)]
@@ -136,6 +186,8 @@ mod tests {
         assert_eq!(node.white_win_sum, 0.0);
         assert_eq!(node.white_score_sum, 0.0);
         assert_eq!(node.white_score_mean_sq_sum, 0.0);
+        assert_eq!(node.white_utility_sum, 0.0);
+        assert_eq!(node.white_utility_sq_sum, 0.0);
         assert!(node.children.0.is_empty());
     }
 
@@ -145,16 +197,22 @@ mod tests {
         let output = processed_output();
 
         node.attach_nn_output(output.clone());
-        node.record_visit(0.75, 3.5, 14.0);
-        node.record_visit(0.25, -1.5, 6.0);
+        node.record_visit(0.75, 3.5, 14.0, 0.6);
+        node.record_visit(0.25, -1.5, 6.0, -0.2);
 
         assert!(Arc::ptr_eq(node.nn_output.as_ref().unwrap(), &output));
         assert_eq!(node.visits, 2);
         assert_eq!(node.white_win_sum, 1.0);
         assert_eq!(node.white_score_sum, 2.0);
         assert_eq!(node.white_score_mean_sq_sum, 20.0);
+        assert!((node.white_utility_sum - 0.4).abs() < 1e-12);
+        assert!((node.white_utility_sq_sum - 0.4).abs() < 1e-12);
         assert_eq!(node.visits(), 2);
         assert_eq!(node.white_win_rate(), 0.5);
+        assert_eq!(node.white_score_mean(), 1.0);
+        assert_eq!(node.white_score_mean_sq(), 10.0);
+        assert!((node.white_utility() - 0.2).abs() < 1e-12);
+        assert!((node.white_utility_mean_sq() - 0.2).abs() < 1e-12);
         assert_eq!(node.policy_probs(), output.policy_probs());
     }
 
@@ -173,12 +231,12 @@ mod tests {
 
         assert_eq!(first_index, EdgeIndex(0));
         assert_eq!(second_index, EdgeIndex(1));
-        assert_eq!(parent.children.0[first_index.0].move_loc, first_move);
-        assert_eq!(parent.children.0[first_index.0].visits, 0);
-        assert_eq!(parent.children.0[first_index.0].policy_prior, 0.6);
-        assert_eq!(parent.children.0[first_index.0].child, first_ptr);
-        assert_eq!(parent.children.0[second_index.0].move_loc, second_move);
-        assert_eq!(parent.children.0[second_index.0].child, second_ptr);
+        assert_eq!(parent.children.get(first_index).move_loc(), first_move);
+        assert_eq!(parent.children.get(first_index).visits(), 0);
+        assert_eq!(parent.children.get(first_index).policy_prior(), 0.6);
+        assert_eq!(parent.children.get(first_index).child(), first_ptr);
+        assert_eq!(parent.children.get(second_index).move_loc(), second_move);
+        assert_eq!(parent.children.get(second_index).child(), second_ptr);
 
         assert_eq!(parent.edge_visit_sum(), 0);
         let (found_index, first_edge) = parent.edge_for_move(first_move).unwrap();
@@ -187,5 +245,9 @@ mod tests {
         assert_eq!(first_edge.policy_prior(), 0.6);
         assert_eq!(first_edge.child(), first_ptr);
         assert!(parent.edge_for_move(Loc::PASS).is_none());
+
+        parent.edge_mut(first_index).record_visit();
+        assert_eq!(parent.edge_for_move(first_move).unwrap().1.visits(), 1);
+        assert_eq!(parent.edge_visit_sum(), 1);
     }
 }
