@@ -360,20 +360,34 @@ impl<N: NodeStore> SearchWorker<N> {
             }
 
             let policy_probability = f64::from(node.policy_probs()[policy_index]);
-            let (child_utility, edge_visits) = match node.edge_for_move(move_loc) {
+            let (child_utility, edge_visits, force_root_visit) = match node.edge_for_move(move_loc)
+            {
                 Some((_, edge)) => {
                     let child = unsafe { edge.child().as_ref() };
-                    (child.white_utility(), f64::from(edge.visits()))
+                    let edge_visits = f64::from(edge.visits());
+                    let desired_visits = (policy_probability
+                        * total_child_visits
+                        * self.params.root_desired_per_child_visits_coeff)
+                        .sqrt();
+                    (
+                        child.white_utility(),
+                        edge_visits,
+                        is_root && policy_probability > 0.0 && edge_visits < desired_visits,
+                    )
                 }
-                None => (fpu, 0.0),
+                None => (fpu, 0.0, false),
             };
-            let selection_value = selection_value(
-                child_utility,
-                game_state.next_player(),
-                policy_probability,
-                edge_visits,
-                exploration_scaling,
-            );
+            let selection_value = if force_root_visit {
+                f64::INFINITY
+            } else {
+                selection_value(
+                    child_utility,
+                    game_state.next_player(),
+                    policy_probability,
+                    edge_visits,
+                    exploration_scaling,
+                )
+            };
 
             if selection_value > best_selection_value {
                 best_selection_value = selection_value;
@@ -586,6 +600,47 @@ mod tests {
             worker.choose_move(&parent, &game_state, true),
             black_favored_move
         );
+    }
+
+    #[test]
+    fn root_selection_forces_an_existing_child_below_its_desired_visits() {
+        let worker = worker();
+        let game_state = GameState::new(Rules::TROMP_TAYLORISH);
+        let forced_move = Loc::new(3, 3).unwrap();
+        let otherwise_best_move = Loc::new(4, 4).unwrap();
+        let mut logits = [-20.0; POLICY_SIZE];
+        logits[loc_to_policy(forced_move)] = 4.0;
+        logits[loc_to_policy(otherwise_best_move)] = 0.0;
+        let parent_output = processed_output(logits, 0.0);
+        let mut parent = initialized_node(parent_output, 0.0);
+        let mut forced_child =
+            initialized_node(processed_output([0.0; POLICY_SIZE], 9.0_f32.ln()), 1.0);
+        let mut otherwise_best_child = initialized_node(
+            processed_output([0.0; POLICY_SIZE], (1.0_f32 / 9.0).ln()),
+            -1.0,
+        );
+        let forced_edge = parent.add_child(
+            forced_move,
+            parent.policy_probs()[loc_to_policy(forced_move)],
+            NonNull::from(forced_child.as_mut()),
+        );
+        let otherwise_best_edge = parent.add_child(
+            otherwise_best_move,
+            parent.policy_probs()[loc_to_policy(otherwise_best_move)],
+            NonNull::from(otherwise_best_child.as_mut()),
+        );
+        for _ in 0..10 {
+            parent.edge_mut(forced_edge).record_visit();
+        }
+        for _ in 0..100 {
+            parent.edge_mut(otherwise_best_edge).record_visit();
+        }
+
+        assert_eq!(
+            worker.choose_move(&parent, &game_state, false),
+            otherwise_best_move
+        );
+        assert_eq!(worker.choose_move(&parent, &game_state, true), forced_move);
     }
 
     #[tokio::test]

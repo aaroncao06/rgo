@@ -11,6 +11,7 @@ pub(crate) struct SearchParams {
     pub(crate) fpu_reduction_max: f64,
     pub(crate) root_fpu_reduction_max: f64,
     pub(crate) fpu_parent_weight_by_visited_policy_pow: f64,
+    pub(crate) root_desired_per_child_visits_coeff: f64,
 }
 
 impl SearchParams {
@@ -28,5 +29,6 @@ impl SearchParams {
         fpu_reduction_max: 0.2,
         root_fpu_reduction_max: 0.0,
         fpu_parent_weight_by_visited_policy_pow: 2.0,
+        root_desired_per_child_visits_coeff: 2.0,
     };
 }
