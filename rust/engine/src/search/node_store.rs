@@ -71,6 +71,8 @@ impl FixedArenaNodeStore {
 // `insert` refuses to push once that capacity is reached. It therefore
 // never reallocates while nodes are live. Entries are not individually moved
 // or removed, so returned node pointers remain stable until `clear` or drop.
+// Access through `as_mut_ptr` avoids creating slice/entry references that could
+// invalidate outstanding node pointers. Lookup reads only the metadata fields.
 unsafe impl NodeStore for FixedArenaNodeStore {
     fn find(&mut self, key: GraphKey) -> Option<NonNull<SearchNode>> {
         let bucket_mask = self.bucket_heads.len() - 1; // bucket capacity is already a power of two
@@ -78,11 +80,15 @@ unsafe impl NodeStore for FixedArenaNodeStore {
         let mut entry_index = self.bucket_heads[bucket_index];
         while entry_index != EMPTY_INDEX {
             debug_assert!((entry_index as usize) < self.entries.len());
-            let entry = &mut self.entries[entry_index as usize];
-            if entry.key == key {
-                return Some(NonNull::from(&mut entry.node));
+            // SAFETY: bucket links index initialized entries. Use raw field
+            // projections so other live node pointers retain their permissions.
+            unsafe {
+                let entry = self.entries.as_mut_ptr().add(entry_index as usize);
+                if (*entry).key == key {
+                    return Some(NonNull::new_unchecked(&raw mut (*entry).node));
+                }
+                entry_index = (*entry).next_in_bucket;
             }
-            entry_index = entry.next_in_bucket;
         }
         None
     }
@@ -95,11 +101,15 @@ unsafe impl NodeStore for FixedArenaNodeStore {
         let mut entry_index = bucket_head;
         while entry_index != EMPTY_INDEX {
             debug_assert!((entry_index as usize) < self.entries.len());
-            let entry = &mut self.entries[entry_index as usize];
-            if entry.key == key {
-                return Err(InsertError::KeyAlreadyExists);
+            // SAFETY: bucket links index initialized entries; only metadata is
+            // read, without borrowing the entries or their nodes.
+            unsafe {
+                let entry = self.entries.as_mut_ptr().add(entry_index as usize);
+                if (*entry).key == key {
+                    return Err(InsertError::KeyAlreadyExists);
+                }
+                entry_index = (*entry).next_in_bucket;
             }
-            entry_index = entry.next_in_bucket;
         }
         //check should be an internal invariant, as long as you only use this when you bound search budget strictly
         let new_entry_index = self.entries.len();
@@ -114,7 +124,12 @@ unsafe impl NodeStore for FixedArenaNodeStore {
         };
         self.entries.push(new_entry);
         self.bucket_heads[bucket_index] = new_entry_index as u32;
-        Ok(NonNull::from(&mut self.entries[new_entry_index].node))
+        // SAFETY: the push initialized this slot without reallocating. Project
+        // its node pointer without a mutable borrow of the backing slice.
+        unsafe {
+            let entry = self.entries.as_mut_ptr().add(new_entry_index);
+            Ok(NonNull::new_unchecked(&raw mut (*entry).node))
+        }
     }
     fn len(&self) -> usize {
         self.entries.len()
@@ -186,6 +201,36 @@ mod tests {
         }
 
         assert_eq!(store.find(key(1)), Some(first_node));
+    }
+
+    #[test]
+    fn old_pointers_remain_usable_after_insertions_and_lookups() {
+        let mut store = FixedArenaNodeStore::new(3);
+        let stride = store.bucket_heads.len() as u128;
+        let first_key = key(1);
+        let second_key = key(1 + stride);
+        let mut first = store.insert(first_key).unwrap();
+        let mut second = store.insert(second_key).unwrap();
+        store.insert(key(1 + 2 * stride)).unwrap();
+
+        // Address equality alone does not check pointer validity under Miri.
+        // Exercise collision traversal, repeated lookup, and failed insertions.
+        let mut found = store.find(first_key).unwrap();
+        assert_eq!(store.find(key(1 + 3 * stride)), None);
+        assert_eq!(store.insert(first_key), Err(InsertError::KeyAlreadyExists));
+        assert_eq!(
+            store.insert(key(1 + 3 * stride)),
+            Err(InsertError::StoreFull)
+        );
+        // SAFETY: all pointers refer to live nodes, and each borrow ends before
+        // another pointer is used. The store has not been cleared or dropped.
+        unsafe {
+            first.as_mut().record_visit(0.5, 0.0, 0.0, 0.0);
+            second.as_mut().record_visit(0.5, 0.0, 0.0, 0.0);
+            found.as_mut().record_visit(0.5, 0.0, 0.0, 0.0);
+            assert_eq!(first.as_ref().visits(), 2);
+            assert_eq!(second.as_ref().visits(), 1);
+        }
     }
 
     #[test]
