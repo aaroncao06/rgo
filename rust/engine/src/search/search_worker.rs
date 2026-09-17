@@ -8,13 +8,13 @@ use crate::{
     inference::{
         backend::InferenceError,
         outputs::NNOutput,
-        policy::{POLICY_SIZE, policy_to_loc},
+        policy::{POLICY_SIZE, loc_to_policy, policy_to_loc},
         runtime::InferenceClient,
     },
     search::{
         graph_key::GraphKey,
         node::{EdgeIndex, SearchNode},
-        node_store::{NodeStore, StoreFull},
+        node_store::{InsertError, NodeStore},
         search_params::SearchParams,
         utility::{recent_score_center, white_utility},
     },
@@ -76,25 +76,10 @@ struct PlayoutStep {
     edge_index: EdgeIndex,
 }
 
-struct PlayoutPath {
-    steps: Vec<PlayoutStep>,
-}
-impl PlayoutPath {
-    fn new() -> Self {
-        Self { steps: Vec::new() }
-    }
-    fn clear(&mut self) {
-        self.steps.clear();
-    }
-    fn push(&mut self, parent: NonNull<SearchNode>, edge_index: EdgeIndex) {
-        self.steps.push(PlayoutStep { parent, edge_index });
-    }
-}
-
 struct SearchWorker<N: NodeStore> {
     // keeps mutating its search state, one worker per game, eventually supports subgraph reuse
     search_graph: SearchGraph<N>,
-    playout_path: PlayoutPath, // scratch work to avoid reallocating
+    playout_path: Vec<PlayoutStep>, // scratch work to avoid reallocating
     scratch_game_state: Option<GameState>, // mutates through each playout
     params: SearchParams,
     recent_score_center: f64,
@@ -102,7 +87,7 @@ struct SearchWorker<N: NodeStore> {
 
 #[derive(Debug)]
 pub(crate) enum SearchError {
-    StoreFull,
+    NodeStore(InsertError),
     InferenceError(InferenceError),
 }
 
@@ -112,9 +97,9 @@ impl From<InferenceError> for SearchError {
     }
 }
 
-impl From<StoreFull> for SearchError {
-    fn from(_: StoreFull) -> Self {
-        Self::StoreFull
+impl From<InsertError> for SearchError {
+    fn from(error: InsertError) -> Self {
+        Self::NodeStore(error)
     }
 }
 
@@ -122,11 +107,21 @@ impl<N: NodeStore> SearchWorker<N> {
     fn new(node_store: N, params: SearchParams) -> Self {
         Self {
             search_graph: SearchGraph::new(node_store),
-            playout_path: PlayoutPath::new(),
+            playout_path: Vec::new(),
             scratch_game_state: None,
             params,
             recent_score_center: 0.0,
         }
+    }
+    fn scratch_game_state(&self) -> &GameState {
+        self.scratch_game_state
+            .as_ref()
+            .expect("active game requires scratch state")
+    }
+    fn scratch_game_state_mut(&mut self) -> &mut GameState {
+        self.scratch_game_state
+            .as_mut()
+            .expect("active game requires scratch state")
     }
     async fn start_game(
         &mut self,
@@ -166,33 +161,155 @@ impl<N: NodeStore> SearchWorker<N> {
     }
     async fn playout(&mut self, inference_client: &mut InferenceClient) -> Result<(), SearchError> {
         self.playout_path.clear();
-        let root = self
-            .search_graph
-            .root
-            .as_mut()
-            .expect("playout requires an active game");
-        let scratch_game_state = self
-            .scratch_game_state
-            .as_mut()
-            .expect("active game requires scratch state");
-        scratch_game_state.reset_from(&root.game_state);
-        let mut current_node = NonNull::from(root.node.as_mut());
-
-        loop {
-            if self
-                .scratch_game_state
-                .as_ref()
+        // mut borrow search root
+        let (mut current_node, mut current_key) = {
+            let root = self
+                .search_graph
+                .root
+                .as_mut()
+                .expect("playout requires an active game");
+            self.scratch_game_state
+                .as_mut()
                 .expect("active game requires scratch state")
-                .is_finished()
-            {
-                break;
-            }
-            let node = unsafe { current_node.as_ref() };
+                .reset_from(&root.game_state);
+            (NonNull::from(root.node.as_mut()), root.key)
+        };
+        let mut is_root = true;
 
-            // choose move, check if move is in children. if so go down, if not break
-        }
+        let leaf_node = loop {
+            // scope for borrowing node: choose move and get relevant info regarding it (policy for it, whether edge already exists)
+            let (move_loc, policy_prior, existing_edge) = {
+                let node = unsafe { current_node.as_ref() };
+                let move_loc = self.choose_move(node, self.scratch_game_state(), is_root);
+                let policy_prior = node.policy_probs()[loc_to_policy(move_loc)];
+                let existing_edge = node
+                    .edge_for_move(move_loc)
+                    .map(|(edge_index, edge)| (edge_index, edge.child()));
+                (move_loc, policy_prior, existing_edge)
+            };
+
+            // update the game state
+            let played = self.scratch_game_state_mut().play(move_loc);
+            debug_assert!(played);
+
+            // scope for borrowing game state (now the child game state, move already played): update key and check if it is finished
+            let is_finished = {
+                let scratch_game_state = self.scratch_game_state();
+                current_key.advance(scratch_game_state, move_loc);
+                scratch_game_state.is_finished()
+            };
+
+            match existing_edge {
+                Some((edge_index, child)) => {
+                    // descend
+                    self.playout_path.push(PlayoutStep {
+                        parent: current_node,
+                        edge_index,
+                    });
+                    if is_finished {
+                        break child;
+                    }
+                    current_node = child;
+                    is_root = false;
+                }
+                None => {
+                    // child already exists in the node store, can just connect a new edge to it for the current parent
+                    // can keep descending to find a new node to create if current isnt finished
+                    if let Some(child) = self.search_graph.node_store.find(current_key) {
+                        let edge_index = unsafe { current_node.as_mut() }.add_child(
+                            move_loc,
+                            policy_prior,
+                            child,
+                        );
+                        self.playout_path.push(PlayoutStep {
+                            parent: current_node,
+                            edge_index,
+                        });
+                        if is_finished {
+                            break child;
+                        }
+                        current_node = child;
+                        is_root = false;
+                        continue;
+                    }
+                    //create a new node. inference before creating node so that if inference fails we dont leave an invalid node
+                    let output = if is_finished {
+                        None
+                    } else {
+                        Some(inference_client.evaluate(self.scratch_game_state()).await?)
+                    };
+                    let mut child = self.search_graph.node_store.insert(current_key)?;
+
+                    // populate node
+                    if let Some(output) = output {
+                        let utility = white_utility(
+                            f64::from(output.white_win_prob()),
+                            f64::from(output.white_score_mean()),
+                            f64::from(output.white_score_mean_sq()),
+                            self.recent_score_center,
+                            self.params,
+                        );
+                        let child = unsafe { child.as_mut() };
+                        child.attach_nn_output(output.clone());
+                        child.record_visit(
+                            f64::from(output.white_win_prob()),
+                            f64::from(output.white_score_mean()),
+                            f64::from(output.white_score_mean_sq()),
+                            utility,
+                        );
+                    } else {
+                        // use terminal state stats not model output
+                        let white_score =
+                            f64::from(self.scratch_game_state().final_score_white_minus_black());
+                        let white_win = if white_score > 0.0 {
+                            1.0
+                        } else if white_score < 0.0 {
+                            0.0
+                        } else {
+                            0.5
+                        };
+                        let white_utility = white_utility(
+                            white_win,
+                            white_score,
+                            white_score * white_score,
+                            self.recent_score_center,
+                            self.params,
+                        );
+                        unsafe { child.as_mut() }.record_visit(
+                            white_win,
+                            white_score,
+                            white_score * white_score,
+                            white_utility,
+                        );
+                    }
+                    // connect the child to the parent
+                    let edge_index =
+                        unsafe { current_node.as_mut() }.add_child(move_loc, policy_prior, child);
+                    self.playout_path.push(PlayoutStep {
+                        parent: current_node,
+                        edge_index,
+                    });
+                    break child;
+                }
+            }
+        };
+        self.backup(leaf_node);
 
         Ok(())
+    }
+    fn backup(&mut self, leaf_node: NonNull<SearchNode>) {
+        let leaf = unsafe { leaf_node.as_ref() };
+        let white_win = leaf.white_win_rate();
+        let white_score = leaf.white_score_mean();
+        let white_score_mean_sq = leaf.white_score_mean_sq();
+        let white_utility = leaf.white_utility();
+
+        while let Some(step) = self.playout_path.pop() {
+            let mut parent = step.parent;
+            let parent = unsafe { parent.as_mut() };
+            parent.edge_mut(step.edge_index).record_visit();
+            parent.record_visit(white_win, white_score, white_score_mean_sq, white_utility);
+        }
     }
     fn choose_move(&self, node: &SearchNode, game_state: &GameState, is_root: bool) -> Loc {
         // KataGo increases exploration slowly as the node accumulates visits.
@@ -297,6 +414,7 @@ mod tests {
 
     struct TestBackend {
         fail: bool,
+        policy_logits: [f32; POLICY_SIZE],
     }
 
     impl InferenceBackend for TestBackend {
@@ -310,7 +428,7 @@ mod tests {
             }
             for _ in inputs {
                 outputs.push(Arc::new(NNOutput::from_raw(
-                    [0.0; POLICY_SIZE],
+                    self.policy_logits,
                     0.0,
                     0.0,
                     0.0,
@@ -321,7 +439,64 @@ mod tests {
     }
 
     fn inference_client(fail: bool) -> InferenceClient {
-        let model_handle = ModelRuntime::start(vec![TestBackend { fail }], 1, 1, 16, 1);
+        inference_client_with_policy(fail, [0.0; POLICY_SIZE])
+    }
+
+    fn inference_client_with_policy(
+        fail: bool,
+        policy_logits: [f32; POLICY_SIZE],
+    ) -> InferenceClient {
+        let model_handle = ModelRuntime::start(
+            vec![TestBackend {
+                fail,
+                policy_logits,
+            }],
+            1,
+            1,
+            16,
+            1,
+        );
+        InferenceClient::new(model_handle)
+    }
+
+    struct OneShotBackend {
+        policy_logits: [f32; POLICY_SIZE],
+        evaluated: bool,
+    }
+
+    impl InferenceBackend for OneShotBackend {
+        fn evaluate_batch(
+            &mut self,
+            inputs: &[NNInput],
+            outputs: &mut Vec<Arc<NNOutput>>,
+        ) -> Result<(), InferenceError> {
+            if self.evaluated {
+                return Err(InferenceError::ExecutionFailed);
+            }
+            self.evaluated = true;
+            for _ in inputs {
+                outputs.push(Arc::new(NNOutput::from_raw(
+                    self.policy_logits,
+                    0.0,
+                    0.0,
+                    0.0,
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    fn one_shot_inference_client(policy_logits: [f32; POLICY_SIZE]) -> InferenceClient {
+        let model_handle = ModelRuntime::start(
+            vec![OneShotBackend {
+                policy_logits,
+                evaluated: false,
+            }],
+            1,
+            1,
+            16,
+            1,
+        );
         InferenceClient::new(model_handle)
     }
 
@@ -364,7 +539,7 @@ mod tests {
         assert!(worker.search_graph.root.is_none());
         assert_eq!(worker.search_graph.node_store.len(), 0);
         assert!(worker.scratch_game_state.is_none());
-        assert!(worker.playout_path.steps.is_empty());
+        assert!(worker.playout_path.is_empty());
     }
 
     #[test]
@@ -432,6 +607,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn playout_expands_and_evaluates_a_missing_child() {
+        let mut worker = worker();
+        let mut client = inference_client(false);
+        worker
+            .start_game(GameState::new(Rules::TROMP_TAYLORISH), &mut client)
+            .await
+            .unwrap();
+
+        worker.playout(&mut client).await.unwrap();
+
+        assert_eq!(worker.search_graph.node_store.len(), 1);
+        assert!(worker.playout_path.is_empty());
+        let root = &worker.search_graph.root.as_ref().unwrap().node;
+        assert_eq!(root.visits(), 2);
+        assert_eq!(root.edge_visit_sum(), 1);
+    }
+
+    #[tokio::test]
+    async fn consecutive_playouts_descend_and_back_up_through_existing_edges() {
+        let preferred_move = Loc::new(4, 4).unwrap();
+        let mut logits = [0.0; POLICY_SIZE];
+        logits[loc_to_policy(preferred_move)] = 20.0;
+        let mut client = inference_client_with_policy(false, logits);
+        let mut worker = worker();
+        worker
+            .start_game(GameState::new(Rules::TROMP_TAYLORISH), &mut client)
+            .await
+            .unwrap();
+
+        worker.playout(&mut client).await.unwrap();
+        worker.playout(&mut client).await.unwrap();
+
+        assert_eq!(worker.search_graph.node_store.len(), 2);
+        assert!(worker.playout_path.is_empty());
+        let root = &worker.search_graph.root.as_ref().unwrap().node;
+        assert_eq!(root.visits(), 3);
+        assert_eq!(root.edge_visit_sum(), 2);
+        let root_edge = root.edge_for_move(preferred_move).unwrap().1;
+        assert_eq!(root_edge.visits(), 2);
+        let child = unsafe { root_edge.child().as_ref() };
+        assert_eq!(child.visits(), 2);
+        assert_eq!(child.edge_visit_sum(), 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_leaf_uses_exact_score_without_inference() {
+        let mut root_state = GameState::new(Rules::TROMP_TAYLORISH);
+        assert!(root_state.play(Loc::PASS));
+        let mut logits = [0.0; POLICY_SIZE];
+        logits[loc_to_policy(Loc::PASS)] = 20.0;
+        let mut client = one_shot_inference_client(logits);
+        let mut worker = worker();
+        worker.start_game(root_state, &mut client).await.unwrap();
+
+        worker.playout(&mut client).await.unwrap();
+
+        assert_eq!(worker.search_graph.node_store.len(), 1);
+        assert!(worker.scratch_game_state().is_finished());
+        let root = &worker.search_graph.root.as_ref().unwrap().node;
+        let pass_edge = root.edge_for_move(Loc::PASS).unwrap().1;
+        assert_eq!(pass_edge.visits(), 1);
+        let terminal = unsafe { pass_edge.child().as_ref() };
+        assert_eq!(terminal.visits(), 1);
+        assert_eq!(terminal.white_win_rate(), 1.0);
+        assert_eq!(terminal.white_score_mean(), 7.5);
+        assert_eq!(terminal.white_score_mean_sq(), 7.5 * 7.5);
+    }
+
+    #[tokio::test]
+    async fn playout_inference_failure_does_not_attach_an_unevaluated_child() {
+        let mut worker = worker();
+        let mut working_client = inference_client(false);
+        worker
+            .start_game(GameState::new(Rules::TROMP_TAYLORISH), &mut working_client)
+            .await
+            .unwrap();
+
+        let mut failing_client = inference_client(true);
+        let result = worker.playout(&mut failing_client).await;
+
+        assert!(matches!(result, Err(SearchError::InferenceError(_))));
+        assert_eq!(worker.search_graph.node_store.len(), 0);
+        assert!(worker.playout_path.is_empty());
+        assert_eq!(
+            worker
+                .search_graph
+                .root
+                .as_ref()
+                .unwrap()
+                .node
+                .visited_policy_mass(),
+            0.0
+        );
+    }
+
+    #[tokio::test]
     async fn resetting_graph_clears_stored_nodes_and_replaces_the_root() {
         let mut worker = worker();
         let mut client = inference_client(false);
@@ -442,7 +713,7 @@ mod tests {
         worker
             .search_graph
             .node_store
-            .find_or_insert(GraphKey::from_raw(1))
+            .insert(GraphKey::from_raw(1))
             .unwrap();
 
         let mut next_state = GameState::new(Rules::TROMP_TAYLORISH);
@@ -465,7 +736,7 @@ mod tests {
         worker
             .search_graph
             .node_store
-            .find_or_insert(GraphKey::from_raw(1))
+            .insert(GraphKey::from_raw(1))
             .unwrap();
         let original_key = worker.search_graph.root.as_ref().unwrap().key;
 

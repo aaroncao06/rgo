@@ -5,7 +5,10 @@ use crate::search::{graph_key::GraphKey, node::SearchNode};
 const EMPTY_INDEX: u32 = u32::MAX; //max index is empty_index-1
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StoreFull;
+pub(crate) enum InsertError {
+    KeyAlreadyExists,
+    StoreFull,
+}
 
 // can have different types of storages for different uses (dynamic vs static search budgets)
 /// Storage whose nodes may be referenced through raw pointers.
@@ -18,7 +21,7 @@ pub(crate) struct StoreFull;
 /// move or invalidate any previously returned node.
 pub(crate) unsafe trait NodeStore {
     fn find(&mut self, key: GraphKey) -> Option<NonNull<SearchNode>>;
-    fn find_or_insert(&mut self, key: GraphKey) -> Result<(NonNull<SearchNode>, bool), StoreFull>; // returns pointer to the slot followed by whether it was just inserted or not
+    fn insert(&mut self, key: GraphKey) -> Result<NonNull<SearchNode>, InsertError>;
     fn len(&self) -> usize;
     fn capacity(&self) -> usize;
     fn clear(&mut self);
@@ -65,7 +68,7 @@ impl FixedArenaNodeStore {
     }
 }
 // SAFETY: `entries` reserves `node_capacity` slots during construction, and
-// `find_or_insert` refuses to push once that capacity is reached. It therefore
+// `insert` refuses to push once that capacity is reached. It therefore
 // never reallocates while nodes are live. Entries are not individually moved
 // or removed, so returned node pointers remain stable until `clear` or drop.
 unsafe impl NodeStore for FixedArenaNodeStore {
@@ -83,8 +86,7 @@ unsafe impl NodeStore for FixedArenaNodeStore {
         }
         None
     }
-    fn find_or_insert(&mut self, key: GraphKey) -> Result<(NonNull<SearchNode>, bool), StoreFull> {
-        //if returns true, you need to populate the newly returned pointer, otherwise it was found and already populated
+    fn insert(&mut self, key: GraphKey) -> Result<NonNull<SearchNode>, InsertError> {
         let bucket_mask = self.bucket_heads.len() - 1; // bucket capacity is already a power of two
         let bucket_index = (key.raw() as usize) & bucket_mask;
         let bucket_head = self.bucket_heads[bucket_index];
@@ -95,14 +97,14 @@ unsafe impl NodeStore for FixedArenaNodeStore {
             debug_assert!((entry_index as usize) < self.entries.len());
             let entry = &mut self.entries[entry_index as usize];
             if entry.key == key {
-                return Ok((NonNull::from(&mut entry.node), false));
+                return Err(InsertError::KeyAlreadyExists);
             }
             entry_index = entry.next_in_bucket;
         }
         //check should be an internal invariant, as long as you only use this when you bound search budget strictly
         let new_entry_index = self.entries.len();
         if new_entry_index >= self.node_capacity {
-            return Err(StoreFull);
+            return Err(InsertError::StoreFull);
         }
         //insert new entry to head of the chain
         let new_entry = NodeEntry {
@@ -112,7 +114,7 @@ unsafe impl NodeStore for FixedArenaNodeStore {
         };
         self.entries.push(new_entry);
         self.bucket_heads[bucket_index] = new_entry_index as u32;
-        Ok((NonNull::from(&mut self.entries[new_entry_index].node), true))
+        Ok(NonNull::from(&mut self.entries[new_entry_index].node))
     }
     fn len(&self) -> usize {
         self.entries.len()
@@ -144,17 +146,12 @@ mod tests {
     fn insertion_and_lookup_return_the_same_node() {
         let mut store = FixedArenaNodeStore::new(4);
 
-        let (inserted_node, inserted) = store.find_or_insert(key(3)).expect("store has capacity");
-        assert!(inserted);
+        let inserted_node = store.insert(key(3)).expect("store has capacity");
         assert_eq!(store.len(), 1);
         assert_eq!(store.capacity(), 4);
         assert_eq!(store.find(key(3)), Some(inserted_node));
 
-        let (existing_node, inserted) = store
-            .find_or_insert(key(3))
-            .expect("existing key does not consume capacity");
-        assert!(!inserted);
-        assert_eq!(existing_node, inserted_node);
+        assert_eq!(store.insert(key(3)), Err(InsertError::KeyAlreadyExists));
         assert_eq!(store.len(), 1);
     }
 
@@ -165,15 +162,13 @@ mod tests {
         let first_key = key(1);
         let colliding_key = key(1 + bucket_count as u128);
 
-        let (first_node, first_inserted) = store
-            .find_or_insert(first_key)
+        let first_node = store
+            .insert(first_key)
             .expect("store has capacity for first key");
-        let (second_node, second_inserted) = store
-            .find_or_insert(colliding_key)
+        let second_node = store
+            .insert(colliding_key)
             .expect("store has capacity for colliding key");
 
-        assert!(first_inserted);
-        assert!(second_inserted);
         assert_ne!(first_node, second_node);
         assert_eq!(store.find(first_key), Some(first_node));
         assert_eq!(store.find(colliding_key), Some(second_node));
@@ -182,11 +177,11 @@ mod tests {
     #[test]
     fn inserting_other_nodes_does_not_move_existing_nodes() {
         let mut store = FixedArenaNodeStore::new(4);
-        let (first_node, _) = store.find_or_insert(key(1)).expect("store has capacity");
+        let first_node = store.insert(key(1)).expect("store has capacity");
 
         for value in 2..=4 {
             store
-                .find_or_insert(key(value))
+                .insert(key(value))
                 .expect("store has reserved capacity");
         }
 
@@ -194,30 +189,25 @@ mod tests {
     }
 
     #[test]
-    fn full_store_rejects_only_new_keys() {
+    fn insert_distinguishes_full_store_from_existing_key() {
         let mut store = FixedArenaNodeStore::new(2);
-        let (first_node, _) = store
-            .find_or_insert(key(1))
+        store
+            .insert(key(1))
             .expect("store has capacity for first key");
         store
-            .find_or_insert(key(2))
+            .insert(key(2))
             .expect("store has capacity for second key");
 
-        assert!(matches!(store.find_or_insert(key(3)), Err(StoreFull)));
+        assert_eq!(store.insert(key(3)), Err(InsertError::StoreFull));
         assert_eq!(store.len(), 2);
-
-        let (existing_node, inserted) = store
-            .find_or_insert(key(1))
-            .expect("a full store can still find an existing key");
-        assert_eq!(existing_node, first_node);
-        assert!(!inserted);
+        assert_eq!(store.insert(key(1)), Err(InsertError::KeyAlreadyExists));
     }
 
     #[test]
     fn clear_resets_lookup_state_and_preserves_capacity_for_reuse() {
         let mut store = FixedArenaNodeStore::new(2);
-        store.find_or_insert(key(1)).expect("store has capacity");
-        store.find_or_insert(key(2)).expect("store has capacity");
+        store.insert(key(1)).expect("store has capacity");
+        store.insert(key(2)).expect("store has capacity");
 
         store.clear();
 
@@ -226,10 +216,7 @@ mod tests {
         assert_eq!(store.find(key(1)), None);
         assert!(store.bucket_heads.iter().all(|&index| index == EMPTY_INDEX));
 
-        let (_, inserted) = store
-            .find_or_insert(key(3))
-            .expect("cleared storage can be reused");
-        assert!(inserted);
+        store.insert(key(3)).expect("cleared storage can be reused");
         assert_eq!(store.len(), 1);
     }
 
