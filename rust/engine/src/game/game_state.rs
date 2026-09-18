@@ -1,7 +1,7 @@
 use crate::game::board::ARRAY_LEN;
 
 use super::board::{Board, Color, Loc, Player};
-use super::hash::Hash128;
+use super::hash::{Hash128, pass_hash, player_hash, superko_hash};
 use super::rules::Rules;
 
 use std::collections::HashSet;
@@ -56,6 +56,20 @@ impl GameState {
     }
     pub(crate) fn next_player(&self) -> Player {
         self.next_player
+    }
+    /// Stones, player to move, current superko bans, and consecutive passes.
+    /// This common key component excludes rules, komi, and repetition history
+    /// beyond the current ban mask. It is not a complete graph identity.
+    pub(crate) fn current_state_hash(&self) -> Hash128 {
+        let mut key = self.board.position_hash();
+        key ^= player_hash(self.next_player);
+        for loc in Loc::board_iter() {
+            if self.is_superko_banned(loc) {
+                key ^= superko_hash(loc);
+            }
+        }
+        key ^= pass_hash(self.consecutive_ending_passes);
+        key
     }
     /// Number of successfully played moves, including passes. Starts at zero.
     pub(crate) fn turn_number(&self) -> usize {

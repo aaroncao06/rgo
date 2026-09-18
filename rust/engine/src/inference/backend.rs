@@ -14,8 +14,15 @@ pub(crate) enum InferenceError {
     RuntimeClosed,
 }
 pub(crate) trait InferenceBackend {
-    /// appends to outputs one result per input, preserving input order.
-    /// on success, outputs.len must equal inputs.len, else returns err
+    /// Evaluate raw model activations in input order.
+    ///
+    /// The executor supplies an empty, reusable output vector. On success,
+    /// append exactly one output per input; return an error if the backend
+    /// cannot produce that complete batch. Partial outputs on error are ignored.
+    /// Each output must be unprocessed and exclusively owned: do not retain
+    /// other strong or weak Arc references or share one output between rows.
+    /// The client uses Arc::get_mut to apply legal masking and perspective/score
+    /// transformations before sharing the result with the model cache and search.
     fn evaluate_batch(
         &mut self,
         inputs: &[NNInput],

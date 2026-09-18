@@ -1,0 +1,66 @@
+# rgo
+
+An experimental Go engine for low-cost 9x9 self-play and training research.
+
+The Rust crate implements board rules, positional superko, scoring, a batched
+inference runtime/cache, and graph search using a selected KataGo self-play
+baseline. Its executable entry point is currently empty: it is not yet a usable
+CLI or a library crate. Real model backends, the self-play runner, and the Python
+trainer remain to be implemented.
+
+## Build and test
+
+Run from the repository root with a Rust toolchain supporting edition 2024:
+
+```sh
+cd rust
+cargo build --workspace
+cargo test --workspace
+cargo test --workspace --release
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets
+```
+
+The empty executable currently produces dead-code warnings. Miri tests that
+initialize the score-utility table are slow because they interpret its numerical
+initialization; there is no separate Miri table-generation path.
+
+## Source map
+
+| Location | Responsibility |
+|---|---|
+| `rust/engine/src/game/board.rs` | Coordinates, colors, chains, local legality, move application, and position hashing |
+| `rust/engine/src/game/board/scoring.rs` | Read-only area scoring and pass-alive analysis |
+| `rust/engine/src/game/game_state.rs` | Turns, rules, positional-superko history, scratch reset, and shared current-state hashing |
+| `rust/engine/src/game/hash.rs` | Deterministic hash primitives and Zobrist keys |
+| `rust/engine/src/inference/{inputs,outputs,policy}.rs` | Model encoding, output postprocessing, and policy indexing |
+| `rust/engine/src/inference/backend.rs` | Backend contract |
+| `rust/engine/src/inference/runtime.rs` | Model lifetime, client evaluation, and executor loop |
+| `rust/engine/src/inference/runtime/{cache,queue}.rs` | Model cache and request/batch synchronization |
+| `rust/engine/src/search/` | Worker, graph identity/storage, search statistics, utility, and selection formulas |
+
+Large test suites live in child `tests.rs` modules; shorter suites remain inline.
+Python model/trainer directories are placeholders with no implementation yet.
+Client/server orchestration will be built on top of standalone self-play and
+training components.
+
+## Documentation
+
+- [Architecture and boundaries](docs/01_PROJECT_OBJECTIVE_AND_ARCHITECTURE.md)
+- [Board geometry](docs/02_BOARD_GEOMETRY.md), [chains](docs/03_CHAINS.md),
+  [local legality](docs/04_KO_AND_LEGALITY.md), [moves and game end](docs/05_MOVE_AND_GAMEEND.md),
+  [superko and hashes](docs/06_SUPERKO_AND_HISTORY.md), and [scoring](docs/07_SCORING.md)
+- [Model I/O contract](docs/08_MODEL_IO.md)
+- [Search ownership and storage](docs/09_SEARCH_SYNCHRONIZATION.md)
+- [Runtime design rationale](docs/11_KATAGO_KZERO_RUNTIME_REVIEW.md)
+- [Search formulas](docs/13_KATAGO_SEARCH_UTILITY_AND_SELECTION.md) and
+  [implemented/deferred search features](docs/search_feature_review.md)
+- Future work: [experiments](docs/12_DEFERRED_EXPERIMENTS.md),
+  [distributed orchestration](docs/distributed_selfplay_training.md),
+  [interactive application](docs/10_INTERACTIVE_APP.md), and
+  [bidirectional-search research](docs/99_BIDIRECTIONAL_SEARCH_RESEARCH.md)
+- Historical discussion: [original review worksheet](docs/REVIEW_FEEDBACK.md)
+
+Future plans and historical feedback do not imply that those interfaces are
+implemented. The numbered specifications describe the current baseline and
+identify deferred work; the source defines the actual internal API.

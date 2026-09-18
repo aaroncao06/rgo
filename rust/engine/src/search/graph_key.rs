@@ -1,7 +1,7 @@
 use crate::game::{
     board::Loc,
     game_state::GameState,
-    hash::{Hash128, nasam, pass_hash, player_hash, splitmix64, superko_hash},
+    hash::{Hash128, nasam, splitmix64},
 };
 
 const REPETITION_BOUND: usize = 11;
@@ -27,21 +27,10 @@ fn mix(previous: Hash128, state: Hash128) -> Hash128 {
 
 impl GraphKey {
     pub(crate) fn new(game_state: &GameState) -> Self {
-        Self(Self::state_key(game_state))
-    }
-    fn state_key(game_state: &GameState) -> Hash128 {
-        let mut key = game_state.board().position_hash();
-        key ^= player_hash(game_state.next_player());
-        for loc in Loc::board_iter() {
-            if game_state.is_superko_banned(loc) {
-                key ^= superko_hash(loc);
-            }
-        }
-        key ^= pass_hash(game_state.consecutive_ending_passes());
-        key
+        Self(game_state.current_state_hash())
     }
     pub(crate) fn advance(&mut self, game_state: &GameState, last_move: Loc) {
-        let state_key = Self::state_key(game_state);
+        let state_key = game_state.current_state_hash();
         self.0 = if last_move != Loc::NULL
             && game_state
                 .board()
@@ -89,7 +78,7 @@ mod tests {
         let previous = key.raw();
 
         assert!(game_state.play(Loc::PASS));
-        let state_key = GraphKey::state_key(&game_state);
+        let state_key = game_state.current_state_hash();
         key.advance(&game_state, Loc::PASS);
 
         assert_eq!(key.raw(), mix(previous, state_key));
