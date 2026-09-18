@@ -11,6 +11,7 @@ pub(crate) struct GameState {
     board: Board,
     rules: Rules,
     next_player: Player,
+    turn_number: usize,
     consecutive_ending_passes: u8,
     superko_banned: [bool; ARRAY_LEN],
     seen_position_hashes: HashSet<Hash128>,
@@ -26,6 +27,7 @@ impl GameState {
             board,
             rules,
             next_player: Player::Black,
+            turn_number: 0,
             consecutive_ending_passes: 0,
             superko_banned,
             seen_position_hashes,
@@ -41,6 +43,7 @@ impl GameState {
         self.board.clone_from(&source.board);
         self.rules = source.rules;
         self.next_player = source.next_player;
+        self.turn_number = source.turn_number;
         self.consecutive_ending_passes = source.consecutive_ending_passes;
         self.superko_banned = source.superko_banned;
 
@@ -53,6 +56,10 @@ impl GameState {
     }
     pub(crate) fn next_player(&self) -> Player {
         self.next_player
+    }
+    /// Number of successfully played moves, including passes. Starts at zero.
+    pub(crate) fn turn_number(&self) -> usize {
+        self.turn_number
     }
     pub(crate) fn consecutive_ending_passes(&self) -> u8 {
         self.consecutive_ending_passes
@@ -100,6 +107,7 @@ impl GameState {
             self.seen_position_hashes.insert(self.board.position_hash());
         }
         self.next_player = self.next_player.opponent();
+        self.turn_number += 1;
         // recompute mask
         self.rebuild_superko_banned();
         true
@@ -165,12 +173,33 @@ mod tests {
             source.rules.multi_stone_suicide_legal
         );
         assert_eq!(scratch.next_player, source.next_player);
+        assert_eq!(scratch.turn_number(), source.turn_number());
         assert_eq!(
             scratch.consecutive_ending_passes,
             source.consecutive_ending_passes
         );
         assert_eq!(scratch.superko_banned, source.superko_banned);
         assert_eq!(scratch.seen_position_hashes, source.seen_position_hashes);
+    }
+
+    #[test]
+    fn turn_number_counts_successful_moves_and_passes_only() {
+        let mut state = GameState::new(rules());
+        assert_eq!(state.turn_number(), 0);
+        assert!(state.play(loc(4, 4)));
+        assert_eq!(state.turn_number(), 1);
+        assert!(!state.play(loc(4, 4)));
+        assert_eq!(state.turn_number(), 1);
+        assert!(state.play(Loc::PASS));
+        assert_eq!(state.turn_number(), 2);
+
+        let mut cloned = state.clone();
+        assert_eq!(cloned.turn_number(), 2);
+        assert!(cloned.play(Loc::PASS));
+        assert_eq!(cloned.turn_number(), 3);
+        assert_eq!(state.turn_number(), 2);
+        cloned.reset_from(&GameState::new(rules()));
+        assert_eq!(cloned.turn_number(), 0);
     }
 
     #[test]

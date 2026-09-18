@@ -13,6 +13,14 @@ pub(crate) struct SearchParams {
     pub(crate) fpu_parent_weight_by_visited_policy_pow: f64,
     pub(crate) root_desired_per_child_visits_coeff: f64,
     pub(crate) value_weight_exponent: f64,
+    pub(crate) chosen_move_temperature_early: f64,
+    pub(crate) chosen_move_temperature: f64,
+    pub(crate) chosen_move_temperature_halflife: f64,
+    pub(crate) chosen_move_subtract: f64,
+    pub(crate) chosen_move_prune: f64,
+    pub(crate) use_lcb_for_selection: bool,
+    pub(crate) lcb_stdevs: f64,
+    pub(crate) min_visit_prop_for_lcb: f64,
 }
 
 impl SearchParams {
@@ -32,5 +40,13 @@ impl SearchParams {
         fpu_parent_weight_by_visited_policy_pow: 2.0,
         root_desired_per_child_visits_coeff: 2.0,
         value_weight_exponent: 0.5,
+        chosen_move_temperature_early: 0.75,
+        chosen_move_temperature: 0.15,
+        chosen_move_temperature_halflife: 19.0,
+        chosen_move_subtract: 0.0,
+        chosen_move_prune: 1.0,
+        use_lcb_for_selection: true,
+        lcb_stdevs: 5.0,
+        min_visit_prop_for_lcb: 0.15,
     };
 }
