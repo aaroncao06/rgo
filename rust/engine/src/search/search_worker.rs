@@ -21,6 +21,7 @@ use crate::{
         move_selection,
         node::{EdgeIndex, SearchNode, SearchStats},
         node_store::{InsertError, NodeStore},
+        root_policy,
         search_params::SearchParams,
         utility::{recent_score_center, white_utility},
     },
@@ -32,8 +33,8 @@ struct SearchRoot {
     node: Box<SearchNode>, // owned separately from the rest of the nodestore
 }
 
-//search state tracks traversal through mcts tree. reset in between moves, not playouts. eventually will support pruning
-//owned by search worker
+/// Owns the root position and stored graph nodes. Self-play resets the graph
+/// between moves; traversal and reusable scratch buffers belong to the worker.
 pub(crate) struct SearchGraph<N: NodeStore> {
     root: Option<SearchRoot>,
     node_store: N,
@@ -84,6 +85,7 @@ impl<N: NodeStore> SearchGraph<N> {
     }
     pub(crate) fn advance_root(&mut self, move_loc: Loc) {
         // later for normal play
+        todo!();
     }
 }
 
@@ -105,7 +107,7 @@ struct ChildContribution {
 }
 
 struct SearchWorker<N: NodeStore> {
-    // keeps mutating its search state, one worker per game, eventually supports subgraph reuse
+    // The worker reuses its graph storage and scratch buffers across moves.
     search_graph: SearchGraph<N>,
     playout_path: Vec<PlayoutStep>, // scratch work to avoid reallocating
     visited_nodes: HashSet<NonNull<SearchNode>>, // cycle detection within one playout
@@ -198,7 +200,8 @@ impl<N: NodeStore> SearchWorker<N> {
         inference_client: &mut InferenceClient,
     ) -> Result<(), SearchError> {
         for _ in 0..budget {
-            self.playout(inference_client).await?; // backend should handle retryable errors internally. stuff at thsi level should kill, indicates an unrecoverable problem with the current run
+            // Backends handle retryable failures; search propagates remaining errors.
+            self.playout(inference_client).await?;
         }
         Ok(())
     }
@@ -211,6 +214,7 @@ impl<N: NodeStore> SearchWorker<N> {
     ) -> Result<Loc, SearchError> {
         // choose move for self play, without retaining subgraph between moves
         self.reset_graph(game_state, inference_client).await?;
+        self.apply_root_policy_temperature_and_noise(game_state, rng);
         self.search(budget, inference_client).await?;
 
         let (moves, weights) = self.root_selection_weights();
@@ -222,6 +226,39 @@ impl<N: NodeStore> SearchWorker<N> {
             self.params.chosen_move_temperature_halflife,
         );
         Ok(moves[move_selection::sample_index(&weights, temperature, rng)])
+    }
+
+    fn apply_root_policy_temperature_and_noise<R: Rng + ?Sized>(
+        &mut self,
+        game_state: &GameState,
+        rng: &mut R,
+    ) {
+        let params = self.params;
+        let temperature = move_selection::temperature(
+            game_state.turn_number(),
+            BOARD_SIZE,
+            params.root_policy_temperature_early,
+            params.root_policy_temperature,
+            params.chosen_move_temperature_halflife,
+        );
+        let legal = crate::inference::policy::legal_mask(game_state);
+        let root = self
+            .search_graph
+            .root
+            .as_mut()
+            .expect("root policy requires an active game");
+        let policy = root.node.policy_probs_mut();
+        // KataGo shapes the policy before constructing the noise distribution.
+        root_policy::apply_temperature(policy, &legal, temperature);
+        if params.root_noise_enabled {
+            root_policy::add_dirichlet_noise(
+                policy,
+                &legal,
+                params.root_dirichlet_noise_total_concentration,
+                params.root_dirichlet_noise_weight,
+                rng,
+            );
+        }
     }
 
     // Final play-selection weights, not raw visits or a training-policy target.
@@ -275,10 +312,6 @@ impl<N: NodeStore> SearchWorker<N> {
                 reference_weight,
                 explore_scaling,
             );
-            let mut lcbs = Vec::new();
-            let utility_radius = self.params.win_loss_utility_factor
-                + self.params.static_score_utility_factor
-                + self.params.dynamic_score_utility_factor;
             for (i, edge) in root.node.edges().enumerate() {
                 // SAFETY: same graph-lifetime and shared-borrow guarantee as above.
                 let child = unsafe { edge.child().as_ref() };
@@ -295,30 +328,9 @@ impl<N: NodeStore> SearchWorker<N> {
                         best_selection,
                     );
                 }
-                if self.params.use_lcb_for_selection {
-                    let fraction = f64::from(edge.visits()) / f64::from(child.visits().max(1));
-                    // LCB matches KataGo's getChildWeightSq: LINEAR edge fraction.
-                    // This estimates edge sample count, unlike the squared scaling
-                    // used when combining weighted child samples during backup.
-                    lcbs.push(move_selection::lcb_and_radius(
-                        self_utility,
-                        child.white_utility_mean_sq(),
-                        child.weight_sum() * fraction,
-                        child.weight_sq_sum() * fraction,
-                        utility_radius,
-                        self.params.lcb_stdevs,
-                    ));
-                }
             }
             if self.params.use_lcb_for_selection {
-                // The selected config enables useNonBuggyLcb, so index zero is
-                // eligible for the same bonus as every other child.
-                move_selection::adjust_lcb(
-                    &mut weights,
-                    &lcbs,
-                    reference_weight,
-                    self.params.min_visit_prop_for_lcb,
-                );
+                self.adjust_root_weights_by_lcb(&mut weights, reference_weight);
             }
         } else {
             // Zero-budget search still has a root evaluation: use its legal policy.
@@ -346,6 +358,49 @@ impl<N: NodeStore> SearchWorker<N> {
         );
         (moves, weights)
     }
+    /// Apply LCB after exploration-weight reduction, using the reference weight
+    /// saved before reduction. Weights follow root edge iteration order.
+    fn adjust_root_weights_by_lcb(&self, weights: &mut [f64], reference_weight: f64) {
+        let root = self
+            .search_graph
+            .root
+            .as_ref()
+            .expect("selection requires an active game");
+        let player = root.game_state.next_player();
+        let utility_radius = self.params.win_loss_utility_factor
+            + self.params.static_score_utility_factor
+            + self.params.dynamic_score_utility_factor;
+        let mut lcbs = Vec::with_capacity(weights.len());
+        for edge in root.node.edges() {
+            // SAFETY: the worker owns the graph and only shared borrows are live.
+            let child = unsafe { edge.child().as_ref() };
+            let self_utility = match player {
+                Player::White => child.white_utility(),
+                Player::Black => -child.white_utility(),
+            };
+            let fraction = f64::from(edge.visits()) / f64::from(child.visits().max(1));
+            // LCB matches KataGo's getChildWeightSq: LINEAR edge fraction.
+            // This estimates edge sample count, unlike the squared scaling
+            // used when combining weighted child samples during backup.
+            lcbs.push(move_selection::lcb_and_radius(
+                self_utility,
+                child.white_utility_mean_sq(),
+                child.weight_sum() * fraction,
+                child.weight_sq_sum() * fraction,
+                utility_radius,
+                self.params.lcb_stdevs,
+            ));
+        }
+        // The selected config enables useNonBuggyLcb, so index zero is
+        // eligible for the same bonus as every other child.
+        move_selection::adjust_lcb(
+            weights,
+            &lcbs,
+            reference_weight,
+            self.params.min_visit_prop_for_lcb,
+        );
+    }
+
     async fn playout(&mut self, inference_client: &mut InferenceClient) -> Result<(), SearchError> {
         self.playout_path.clear();
         self.visited_nodes.clear();
@@ -824,1062 +879,4 @@ fn selection_value(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        game::rules::Rules,
-        inference::{
-            backend::InferenceBackend, inputs::NNInput, policy::POLICY_SIZE, runtime::ModelRuntime,
-        },
-        search::node_store::FixedArenaNodeStore,
-    };
-    use rand::{SeedableRng, rngs::SmallRng};
-
-    struct TestBackend {
-        fail: bool,
-        policy_logits: [f32; POLICY_SIZE],
-    }
-
-    impl InferenceBackend for TestBackend {
-        fn evaluate_batch(
-            &mut self,
-            inputs: &[NNInput],
-            outputs: &mut Vec<Arc<NNOutput>>,
-        ) -> Result<(), InferenceError> {
-            if self.fail {
-                return Err(InferenceError::ExecutionFailed);
-            }
-            for _ in inputs {
-                outputs.push(Arc::new(NNOutput::from_raw(
-                    self.policy_logits,
-                    0.0,
-                    0.0,
-                    0.0,
-                )));
-            }
-            Ok(())
-        }
-    }
-
-    fn inference_client(fail: bool) -> InferenceClient {
-        inference_client_with_policy(fail, [0.0; POLICY_SIZE])
-    }
-
-    fn inference_client_with_policy(
-        fail: bool,
-        policy_logits: [f32; POLICY_SIZE],
-    ) -> InferenceClient {
-        let model_handle = ModelRuntime::start(
-            vec![TestBackend {
-                fail,
-                policy_logits,
-            }],
-            1,
-            1,
-            16,
-            1,
-        );
-        InferenceClient::new(model_handle)
-    }
-
-    struct OneShotBackend {
-        policy_logits: [f32; POLICY_SIZE],
-        evaluated: bool,
-    }
-
-    impl InferenceBackend for OneShotBackend {
-        fn evaluate_batch(
-            &mut self,
-            inputs: &[NNInput],
-            outputs: &mut Vec<Arc<NNOutput>>,
-        ) -> Result<(), InferenceError> {
-            if self.evaluated {
-                return Err(InferenceError::ExecutionFailed);
-            }
-            self.evaluated = true;
-            for _ in inputs {
-                outputs.push(Arc::new(NNOutput::from_raw(
-                    self.policy_logits,
-                    0.0,
-                    0.0,
-                    0.0,
-                )));
-            }
-            Ok(())
-        }
-    }
-
-    fn one_shot_inference_client(policy_logits: [f32; POLICY_SIZE]) -> InferenceClient {
-        let model_handle = ModelRuntime::start(
-            vec![OneShotBackend {
-                policy_logits,
-                evaluated: false,
-            }],
-            1,
-            1,
-            16,
-            1,
-        );
-        InferenceClient::new(model_handle)
-    }
-
-    fn worker() -> SearchWorker<FixedArenaNodeStore> {
-        SearchWorker::new(
-            FixedArenaNodeStore::new(16),
-            SearchParams::KATAGO_SELFPLAY8_MAIN_B18,
-        )
-    }
-
-    fn processed_output(policy_logits: [f32; POLICY_SIZE], white_win_logit: f32) -> Arc<NNOutput> {
-        let mut output = Arc::new(NNOutput::from_raw(
-            policy_logits,
-            white_win_logit,
-            0.0,
-            -20.0,
-        ));
-        Arc::get_mut(&mut output)
-            .unwrap()
-            .process_in_place(Player::White, &[true; POLICY_SIZE]);
-        output
-    }
-
-    fn initialized_node(output: Arc<NNOutput>, utility: f64) -> Box<SearchNode> {
-        let mut node = Box::new(SearchNode::new());
-        node.attach_nn_output(output.clone());
-        node.record_visit(
-            f64::from(output.white_win_prob()),
-            f64::from(output.white_score_mean()),
-            f64::from(output.white_score_mean_sq()),
-            utility,
-        );
-        node
-    }
-
-    #[derive(Debug, PartialEq)]
-    struct NodeSnapshot {
-        visits: i32,
-        values: [f64; 7],
-        edges: Vec<(Loc, i32, f32, NonNull<SearchNode>)>,
-    }
-
-    fn node_snapshot(node: &SearchNode) -> NodeSnapshot {
-        NodeSnapshot {
-            visits: node.visits(),
-            values: [
-                node.white_win_rate(),
-                node.white_score_mean(),
-                node.white_score_mean_sq(),
-                node.white_utility(),
-                node.white_utility_mean_sq(),
-                node.weight_sum(),
-                node.weight_sq_sum(),
-            ],
-            edges: node
-                .edges()
-                .map(|edge| {
-                    (
-                        edge.move_loc(),
-                        edge.visits(),
-                        edge.policy_prior(),
-                        edge.child(),
-                    )
-                })
-                .collect(),
-        }
-    }
-
-    // Snapshot every reachable node, including edge identity and all aggregate
-    // values, so failure tests detect partial backup or partial attachment.
-    fn graph_snapshot(worker: &SearchWorker<FixedArenaNodeStore>) -> Vec<NodeSnapshot> {
-        let root = &worker.search_graph.root.as_ref().unwrap().node;
-        let mut snapshots = vec![node_snapshot(root)];
-        let mut pending: Vec<_> = root.edges().map(|edge| edge.child()).collect();
-        let mut seen = HashSet::new();
-        while let Some(pointer) = pending.pop() {
-            if !seen.insert(pointer) {
-                continue;
-            }
-            // SAFETY: the worker owns these nodes and is only shared-borrowed.
-            let node = unsafe { pointer.as_ref() };
-            snapshots.push(node_snapshot(node));
-            pending.extend(node.edges().map(|edge| edge.child()));
-        }
-        snapshots
-    }
-
-    fn focused_policy() -> [f32; POLICY_SIZE] {
-        let mut logits = [-20.0; POLICY_SIZE];
-        logits[loc_to_policy(Loc::new(4, 4).unwrap())] = 20.0;
-        logits[loc_to_policy(Loc::new(3, 3).unwrap())] = 10.0;
-        logits
-    }
-
-    #[tokio::test]
-    async fn choose_move_runs_the_budget_and_preserves_the_callers_position() {
-        let preferred = Loc::new(4, 4).unwrap();
-        let mut state = GameState::new(Rules::TROMP_TAYLORISH);
-        assert!(state.play(Loc::PASS));
-        let key = GraphKey::new(&state);
-        for budget in [0, 1, 8] {
-            let mut worker = worker();
-            worker.params.chosen_move_temperature_early = 0.0;
-            worker.params.chosen_move_temperature = 0.0;
-            let mut client = inference_client_with_policy(false, focused_policy());
-            let mut rng = SmallRng::seed_from_u64(7);
-            let chosen = worker
-                .choose_move(&state, budget, &mut client, &mut rng)
-                .await
-                .unwrap();
-            assert_eq!(chosen, preferred);
-            assert!(state.is_legal(chosen));
-            assert_eq!(GraphKey::new(&state), key);
-            assert_eq!(state.turn_number(), 1);
-            assert_eq!(
-                worker.search_graph.root.as_ref().unwrap().node.visits(),
-                budget as i32 + 1
-            );
-            assert_eq!(
-                worker
-                    .search_graph
-                    .root
-                    .as_ref()
-                    .unwrap()
-                    .game_state
-                    .turn_number(),
-                1
-            );
-            let before = graph_snapshot(&worker);
-            let (_, weights) = worker.root_selection_weights();
-            assert!(weights.iter().any(|&weight| weight > 0.0));
-            assert_eq!(graph_snapshot(&worker), before);
-        }
-    }
-
-    #[tokio::test]
-    async fn choose_move_propagates_inference_failure_without_sampling() {
-        let mut worker = worker();
-        let state = GameState::new(Rules::TROMP_TAYLORISH);
-        let mut client = one_shot_inference_client(focused_policy());
-        let mut rng = SmallRng::seed_from_u64(11);
-        let mut untouched_rng = rng.clone();
-        assert!(matches!(
-            worker.choose_move(&state, 1, &mut client, &mut rng).await,
-            Err(SearchError::InferenceError(_))
-        ));
-        assert_eq!(rng.next_u64(), untouched_rng.next_u64());
-        assert_eq!(worker.search_graph.root.as_ref().unwrap().node.visits(), 1);
-    }
-
-    #[tokio::test]
-    async fn final_lcb_weights_use_edge_sample_size_for_transpositions() {
-        let mut worker = worker();
-        let moves = [Loc::new(3, 3).unwrap(), Loc::new(4, 4).unwrap()];
-        let mut logits = [-1000.0; POLICY_SIZE];
-        for loc in moves {
-            logits[loc_to_policy(loc)] = 0.0;
-        }
-        let mut client = inference_client_with_policy(false, logits);
-        worker
-            .start_game(&GameState::new(Rules::TROMP_TAYLORISH), &mut client)
-            .await
-            .unwrap();
-        for (i, loc) in moves.into_iter().enumerate() {
-            let mut pointer = worker
-                .search_graph
-                .node_store
-                .insert(GraphKey::from_raw(i as u128 + 1))
-                .unwrap();
-            // SAFETY: fresh live arena node, initialized before linking it.
-            let child = unsafe { pointer.as_mut() };
-            child.attach_nn_output(processed_output(logits, 0.0));
-            child.replace_stats(SearchStats {
-                visits: 100,
-                white_win_sum: 50.0,
-                white_score_sum: 0.0,
-                white_score_mean_sq_sum: 0.0,
-                white_utility_sum: if i == 0 { 20.0 } else { -20.0 },
-                white_utility_sq_sum: 29.0,
-                weight_sum: 100.0,
-                weight_sq_sum: 160.0,
-            });
-            let root = &mut worker.search_graph.root.as_mut().unwrap().node;
-            let edge = root.add_child(loc, 0.5, pointer);
-            for _ in 0..25 {
-                root.edge_mut(edge).record_visit();
-            }
-        }
-        let before = graph_snapshot(&worker);
-        let (_, weights) = worker.root_selection_weights();
-        // Native KataGo fixture: radius=.632893836585088, LCB gap=.4.
-        // The second child is better for Black, despite equal edge weights.
-        assert_eq!(weights[0], 25.0);
-        assert!((weights[1] - 52.480946693222528).abs() < 1e-10);
-        assert_eq!(graph_snapshot(&worker), before);
-    }
-
-    #[tokio::test]
-    async fn final_weights_reduce_overexploration_without_changing_graph_stats() {
-        let mut worker = worker();
-        worker.params.use_lcb_for_selection = false;
-        worker.params.cpuct_exploration = 1.0;
-        worker.params.cpuct_exploration_log = 0.0;
-        let first_move = Loc::new(3, 3).unwrap();
-        let second_move = Loc::new(4, 4).unwrap();
-        // Finite logits whose softmax underflows to zero on the other moves.
-        let mut logits = [-1000.0; POLICY_SIZE];
-        logits[loc_to_policy(first_move)] = 0.0;
-        logits[loc_to_policy(second_move)] = 0.0;
-        let mut client = inference_client_with_policy(false, logits);
-        worker
-            .start_game(&GameState::new(Rules::TROMP_TAYLORISH), &mut client)
-            .await
-            .unwrap();
-        for (i, (loc, visits, utility)) in [(first_move, 60, -0.5), (second_move, 40, 0.5)]
-            .into_iter()
-            .enumerate()
-        {
-            let mut ptr = worker
-                .search_graph
-                .node_store
-                .insert(GraphKey::from_raw(i as u128 + 1))
-                .unwrap();
-            // SAFETY: fresh arena node; no other references to this node are live.
-            let child = unsafe { ptr.as_mut() };
-            child.attach_nn_output(processed_output(logits, 0.0));
-            for _ in 0..visits {
-                child.record_visit(0.5, 0.0, 0.0, utility);
-            }
-            let root = &mut worker.search_graph.root.as_mut().unwrap().node;
-            let edge = root.add_child(loc, 0.5, ptr);
-            for _ in 0..visits {
-                root.edge_mut(edge).record_visit();
-            }
-        }
-        let before = graph_snapshot(&worker);
-        let (moves, weights) = worker.root_selection_weights();
-        assert_eq!(moves, vec![first_move, second_move]);
-        // Black prefers the first child. Inverting its PUCT score for the
-        // second gives ~3.62 visits; KataGo rounds that reduced weight UP.
-        assert_eq!(weights, vec![60.0, 4.0]);
-        assert_eq!(graph_snapshot(&worker), before);
-    }
-
-    #[test]
-    fn new_worker_has_no_active_graph_or_scratch_state() {
-        let worker = worker();
-
-        assert!(worker.search_graph.root.is_none());
-        assert_eq!(worker.search_graph.node_store.len(), 0);
-        assert!(worker.scratch_game_state.is_none());
-        assert!(worker.playout_path.is_empty());
-    }
-
-    #[test]
-    fn selection_chooses_the_highest_policy_unexpanded_move() {
-        let worker = worker();
-        let game_state = GameState::new(Rules::TROMP_TAYLORISH);
-        let expected_move = Loc::new(4, 4).unwrap();
-        let mut logits = [0.0; POLICY_SIZE];
-        logits[crate::inference::policy::loc_to_policy(expected_move)] = 5.0;
-        let output = processed_output(logits, 0.0);
-        let node = initialized_node(output, 0.0);
-
-        assert_eq!(
-            worker.select_child(&node, &game_state, true),
-            (expected_move, None)
-        );
-    }
-
-    #[test]
-    fn selection_orients_child_utility_for_the_player_to_move() {
-        let worker = worker();
-        let game_state = GameState::new(Rules::TROMP_TAYLORISH);
-        assert_eq!(game_state.next_player(), Player::Black);
-        let parent_output = processed_output([0.0; POLICY_SIZE], 0.0);
-        let mut parent = initialized_node(parent_output, 0.0);
-
-        let white_favored_move = Loc::new(3, 3).unwrap();
-        let black_favored_move = Loc::new(4, 4).unwrap();
-        let mut white_favored_child =
-            initialized_node(processed_output([0.0; POLICY_SIZE], 9.0_f32.ln()), 0.8);
-        let mut black_favored_child = initialized_node(
-            processed_output([0.0; POLICY_SIZE], (1.0_f32 / 9.0).ln()),
-            -0.8,
-        );
-        parent.add_child(
-            white_favored_move,
-            parent.policy_probs()[crate::inference::policy::loc_to_policy(white_favored_move)],
-            NonNull::from(white_favored_child.as_mut()),
-        );
-        parent.add_child(
-            black_favored_move,
-            parent.policy_probs()[crate::inference::policy::loc_to_policy(black_favored_move)],
-            NonNull::from(black_favored_child.as_mut()),
-        );
-
-        assert_eq!(
-            worker.select_child(&parent, &game_state, true).0,
-            black_favored_move
-        );
-    }
-
-    #[test]
-    fn root_selection_forces_an_existing_child_below_its_desired_visits() {
-        let worker = worker();
-        let game_state = GameState::new(Rules::TROMP_TAYLORISH);
-        let forced_move = Loc::new(3, 3).unwrap();
-        let otherwise_best_move = Loc::new(4, 4).unwrap();
-        let mut logits = [-20.0; POLICY_SIZE];
-        logits[loc_to_policy(forced_move)] = 4.0;
-        logits[loc_to_policy(otherwise_best_move)] = 0.0;
-        let parent_output = processed_output(logits, 0.0);
-        let mut parent = initialized_node(parent_output, 0.0);
-        let mut forced_child =
-            initialized_node(processed_output([0.0; POLICY_SIZE], 9.0_f32.ln()), 1.0);
-        let mut otherwise_best_child = initialized_node(
-            processed_output([0.0; POLICY_SIZE], (1.0_f32 / 9.0).ln()),
-            -1.0,
-        );
-        let forced_edge = parent.add_child(
-            forced_move,
-            parent.policy_probs()[loc_to_policy(forced_move)],
-            NonNull::from(forced_child.as_mut()),
-        );
-        let otherwise_best_edge = parent.add_child(
-            otherwise_best_move,
-            parent.policy_probs()[loc_to_policy(otherwise_best_move)],
-            NonNull::from(otherwise_best_child.as_mut()),
-        );
-        for _ in 0..10 {
-            parent.edge_mut(forced_edge).record_visit();
-        }
-        for _ in 0..100 {
-            parent.edge_mut(otherwise_best_edge).record_visit();
-        }
-
-        assert_eq!(
-            worker.select_child(&parent, &game_state, false).0,
-            otherwise_best_move
-        );
-        assert_eq!(
-            worker.select_child(&parent, &game_state, true).0,
-            forced_move
-        );
-    }
-
-    #[test]
-    fn forced_root_visit_ties_follow_child_insertion_order() {
-        let worker = worker();
-        let game_state = GameState::new(Rules::TROMP_TAYLORISH);
-        let first_move = Loc::new(4, 4).unwrap();
-        let second_move = Loc::new(3, 3).unwrap();
-        assert!(loc_to_policy(first_move) > loc_to_policy(second_move));
-        let mut logits = [-20.0; POLICY_SIZE];
-        logits[loc_to_policy(first_move)] = 0.0;
-        logits[loc_to_policy(second_move)] = 0.0;
-        let mut parent = initialized_node(processed_output(logits, 0.0), 0.0);
-        let mut first_child = initialized_node(processed_output(logits, 0.0), 0.0);
-        let mut second_child = initialized_node(processed_output(logits, 0.0), 0.0);
-        let first_edge = parent.add_child(first_move, 0.5, NonNull::from(first_child.as_mut()));
-        let second_edge = parent.add_child(second_move, 0.5, NonNull::from(second_child.as_mut()));
-        parent.edge_mut(first_edge).record_visit();
-        parent.edge_mut(second_edge).record_visit();
-        // Each child has weight 1, below sqrt(0.5 * 2 * 2).
-        assert_eq!(
-            worker.select_child(&parent, &game_state, true),
-            (first_move, Some(first_edge))
-        );
-    }
-
-    #[test]
-    fn existing_child_wins_exact_tie_against_unexpanded_move() {
-        let mut worker = worker();
-        worker.params.cpuct_exploration = 0.0;
-        worker.params.cpuct_exploration_log = 0.0;
-        worker.params.fpu_reduction_max = 0.0;
-        let game_state = GameState::new(Rules::TROMP_TAYLORISH);
-        let existing_move = Loc::new(4, 4).unwrap();
-        let output = processed_output([0.0; POLICY_SIZE], 0.0);
-        let mut parent = initialized_node(output.clone(), 0.0);
-        let mut child = initialized_node(output, 0.0);
-        let edge = parent.add_child(existing_move, 0.5, NonNull::from(child.as_mut()));
-        parent.edge_mut(edge).record_visit();
-        assert_eq!(
-            worker.select_child(&parent, &game_state, false).0,
-            existing_move
-        );
-    }
-
-    #[test]
-    fn value_weighting_favors_the_better_child_and_preserves_total_weight() {
-        let mut worker = worker();
-        let mut parent = initialized_node(processed_output([0.0; POLICY_SIZE], 0.0), 0.0);
-        let mut good_child =
-            initialized_node(processed_output([0.0; POLICY_SIZE], 9.0_f32.ln()), 1.0);
-        let mut bad_child = initialized_node(
-            processed_output([0.0; POLICY_SIZE], (1.0_f32 / 9.0).ln()),
-            -1.0,
-        );
-        for _ in 0..9 {
-            good_child.record_visit(1.0, 0.0, 0.0, 1.0);
-            bad_child.record_visit(0.0, 0.0, 0.0, -1.0);
-        }
-
-        let good_edge = parent.add_child(
-            Loc::new(3, 3).unwrap(),
-            0.5,
-            NonNull::from(good_child.as_mut()),
-        );
-        let bad_edge = parent.add_child(
-            Loc::new(4, 4).unwrap(),
-            0.5,
-            NonNull::from(bad_child.as_mut()),
-        );
-        for _ in 0..10 {
-            parent.edge_mut(good_edge).record_visit();
-            parent.edge_mut(bad_edge).record_visit();
-        }
-
-        worker.recompute_node_stats(&mut parent, Player::White);
-
-        assert_eq!(parent.visits(), 2); // One completed playout, not a sum of child visits.
-        assert!((parent.weight_sum() - 21.0).abs() < 1e-12);
-        assert!(parent.white_utility() > 0.0);
-    }
-
-    #[test]
-    fn transposed_child_squared_weights_scale_by_squared_edge_fraction() {
-        let mut worker = worker();
-        let output = processed_output([0.0; POLICY_SIZE], 0.0);
-        let mut child = initialized_node(output.clone(), 0.0);
-        for _ in 0..9 {
-            child.record_visit(0.5, 0.0, 0.0, 0.0);
-        }
-        let mut first_parent = initialized_node(output.clone(), 0.0);
-        let mut second_parent = initialized_node(output, 0.0);
-        let child_ptr = NonNull::from(child.as_mut());
-        for parent in [&mut first_parent, &mut second_parent] {
-            let edge = parent.add_child(Loc::PASS, 1.0, child_ptr);
-            for _ in 0..5 {
-                parent.edge_mut(edge).record_visit();
-            }
-            worker.recompute_node_stats(parent, Player::White);
-
-            assert_eq!(parent.visits(), 2);
-            assert!((parent.weight_sum() - 6.0).abs() < 1e-12);
-            // Ten child samples scaled by 1/2, plus the parent's unit-weight eval.
-            assert!((parent.weight_sq_sum() - 3.5).abs() < 1e-12);
-        }
-        assert_eq!(child.weight_sq_sum(), 10.0);
-    }
-
-    #[test]
-    fn student_t_cdf_degrees_3_is_centered_and_symmetric() {
-        assert!((student_t_cdf_degrees_3(0.0) - 0.5).abs() < 1e-12);
-        let positive = student_t_cdf_degrees_3(2.0);
-        let negative = student_t_cdf_degrees_3(-2.0);
-        assert!((positive + negative - 1.0).abs() < 1e-12);
-        assert!(positive > 0.5);
-    }
-
-    #[tokio::test]
-    async fn graph_cycles_end_the_playout_and_back_up_without_inference() {
-        for self_loop in [false, true] {
-            let root_move = Loc::new(0, 0).unwrap();
-            let first_move = Loc::new(1, 0).unwrap();
-            let second_move = Loc::new(2, 0).unwrap();
-            let policy = |loc| {
-                let mut logits = [-20.0; POLICY_SIZE];
-                logits[loc_to_policy(loc)] = 20.0;
-                logits
-            };
-            let mut client = one_shot_inference_client(policy(root_move));
-            let mut worker = worker();
-            worker
-                .start_game(&GameState::new(Rules::TROMP_TAYLORISH), &mut client)
-                .await
-                .unwrap();
-            let mut first = worker
-                .search_graph
-                .node_store
-                .insert(GraphKey::from_raw(1))
-                .unwrap();
-            let mut second = if self_loop {
-                first
-            } else {
-                worker
-                    .search_graph
-                    .node_store
-                    .insert(GraphKey::from_raw(2))
-                    .unwrap()
-            };
-            // Synthetic graph: deliberately seed equal edge/node counts to
-            // exercise the cycle guard rather than the earlier catch-up check.
-            unsafe {
-                first
-                    .as_mut()
-                    .attach_nn_output(processed_output(policy(first_move), 0.0));
-                first.as_mut().record_visit(0.5, 0.0, 0.0, 0.0);
-                if !self_loop {
-                    second
-                        .as_mut()
-                        .attach_nn_output(processed_output(policy(second_move), 0.0));
-                    second.as_mut().record_visit(0.5, 0.0, 0.0, 0.0);
-                }
-            }
-            let root = &mut worker.search_graph.root.as_mut().unwrap().node;
-            let root_edge = root.add_child(root_move, 1.0, first);
-            root.edge_mut(root_edge).record_visit();
-            let first_edge = unsafe { first.as_mut() }.add_child(first_move, 1.0, second);
-            unsafe { first.as_mut() }
-                .edge_mut(first_edge)
-                .record_visit();
-            let second_edge = if self_loop {
-                None
-            } else {
-                let edge = unsafe { second.as_mut() }.add_child(second_move, 1.0, first);
-                unsafe { second.as_mut() }.edge_mut(edge).record_visit();
-                Some(edge)
-            };
-
-            // Repeat to check that cycle tracking resets between playouts and
-            // every closing edge/ancestor receives exactly one update each time.
-            for expected_visits in 2..=6 {
-                worker.playout(&mut client).await.unwrap();
-                let root = &worker.search_graph.root.as_ref().unwrap().node;
-                assert_eq!(root.visits(), expected_visits);
-                assert_eq!(root.edge(root_edge).visits(), expected_visits);
-                let first_node = unsafe { first.as_ref() };
-                assert_eq!(first_node.visits(), expected_visits);
-                assert_eq!(first_node.edge(first_edge).visits(), expected_visits);
-                if let Some(edge) = second_edge {
-                    let second_node = unsafe { second.as_ref() };
-                    assert_eq!(second_node.visits(), expected_visits);
-                    assert_eq!(second_node.edge(edge).visits(), expected_visits);
-                }
-                assert_eq!(
-                    worker.search_graph.node_store.len(),
-                    if self_loop { 1 } else { 2 }
-                );
-                assert!(
-                    graph_snapshot(&worker)
-                        .iter()
-                        .all(|node| node.values.iter().all(|value| value.is_finite()))
-                );
-                assert!(worker.playout_path.is_empty());
-                assert!(worker.visited_nodes.is_empty());
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn transposed_child_catches_up_before_requesting_more_inference() {
-        let move_loc = Loc::new(4, 4).unwrap();
-        let mut logits = [-20.0; POLICY_SIZE];
-        logits[loc_to_policy(move_loc)] = 20.0;
-        let mut client = one_shot_inference_client(logits);
-        let mut worker = worker();
-        let root_state = GameState::new(Rules::TROMP_TAYLORISH);
-        let mut child_state = root_state.clone();
-        let mut child_key = GraphKey::new(&root_state);
-        assert!(child_state.play(move_loc));
-        child_key.advance(&child_state, move_loc);
-        worker.start_game(&root_state, &mut client).await.unwrap();
-
-        // Model a node already searched three times through another parent.
-        let mut child_ptr = worker.search_graph.node_store.insert(child_key).unwrap();
-        {
-            let child = unsafe { child_ptr.as_mut() };
-            child.attach_nn_output(processed_output([0.0; POLICY_SIZE], 0.0));
-            for _ in 0..3 {
-                child.record_visit(0.5, 0.0, 0.0, 0.0);
-            }
-        }
-        // First playout links a new edge; subsequent ones catch up that edge.
-        // The backend rejects any inference after the root's evaluation.
-        for expected_visits in 1..=3 {
-            worker.playout(&mut client).await.unwrap();
-            let root = &worker.search_graph.root.as_ref().unwrap().node;
-            assert_eq!(
-                root.edge_for_move(move_loc).unwrap().1.visits(),
-                expected_visits
-            );
-            assert_eq!(root.visits(), expected_visits + 1);
-            assert_eq!(unsafe { child_ptr.as_ref() }.visits(), 3);
-            assert_eq!(worker.search_graph.node_store.len(), 1);
-            assert!(worker.playout_path.is_empty());
-            if expected_visits > 1 {
-                // Existing-edge catch-up stops before changing the board,
-                // player, or superko state. New-edge lookup still plays the move.
-                let root_state = &worker.search_graph.root.as_ref().unwrap().game_state;
-                assert_eq!(
-                    GraphKey::new(worker.scratch_game_state()),
-                    GraphKey::new(root_state)
-                );
-                assert_eq!(
-                    worker.scratch_game_state().next_player(),
-                    root_state.next_player()
-                );
-            }
-        }
-        // Once caught up, search must descend and request a fresh evaluation.
-        assert!(matches!(
-            worker.playout(&mut client).await,
-            Err(SearchError::InferenceError(_))
-        ));
-    }
-
-    #[test]
-    fn student_t_table_clamps_and_linearly_interpolates() {
-        assert_eq!(student_t_cdf_degrees_3(-100.0), 0.0);
-        assert_eq!(student_t_cdf_degrees_3(-50.0), 0.0);
-        assert_eq!(student_t_cdf_degrees_3(50.0), 1.0);
-        assert_eq!(student_t_cdf_degrees_3(100.0), 1.0);
-        let left = -50.0 + 1030.0 * 100.0 / 1999.0;
-        let right = -50.0 + 1031.0 * 100.0 / 1999.0;
-        let midpoint = (left + right) * 0.5;
-        let expected = (student_t_cdf_degrees_3(left) + student_t_cdf_degrees_3(right)) * 0.5;
-        assert!((student_t_cdf_degrees_3(midpoint) - expected).abs() < 1e-12);
-        // Reference Student-t(3) probability at x=2 (allow table interpolation error).
-        assert!((student_t_cdf_degrees_3(2.0) - 0.9303370157205785).abs() < 1e-4);
-    }
-
-    #[tokio::test]
-    async fn start_game_installs_an_evaluated_root_and_scratch_state() {
-        let mut worker = worker();
-        let mut client = inference_client(false);
-        let game_state = GameState::new(Rules::TROMP_TAYLORISH);
-        let expected_key = GraphKey::new(&game_state);
-
-        worker.start_game(&game_state, &mut client).await.unwrap();
-
-        let root = worker.search_graph.root.as_ref().unwrap();
-        assert_eq!(root.key, expected_key);
-        assert_eq!(root.node.visits(), 1);
-        assert_eq!(
-            GraphKey::new(worker.scratch_game_state.as_ref().unwrap()),
-            expected_key
-        );
-    }
-
-    #[tokio::test]
-    async fn playout_expands_and_evaluates_a_missing_child() {
-        let mut worker = worker();
-        let mut client = inference_client(false);
-        worker
-            .start_game(&GameState::new(Rules::TROMP_TAYLORISH), &mut client)
-            .await
-            .unwrap();
-
-        worker.playout(&mut client).await.unwrap();
-
-        assert_eq!(worker.search_graph.node_store.len(), 1);
-        assert!(worker.playout_path.is_empty());
-        let root = &worker.search_graph.root.as_ref().unwrap().node;
-        assert_eq!(root.visits(), 2);
-        assert_eq!(root.edge_visit_sum(), 1);
-    }
-
-    #[tokio::test]
-    async fn consecutive_playouts_descend_and_back_up_through_existing_edges() {
-        let preferred_move = Loc::new(4, 4).unwrap();
-        let mut logits = [0.0; POLICY_SIZE];
-        logits[loc_to_policy(preferred_move)] = 20.0;
-        let mut client = inference_client_with_policy(false, logits);
-        let mut worker = worker();
-        worker
-            .start_game(&GameState::new(Rules::TROMP_TAYLORISH), &mut client)
-            .await
-            .unwrap();
-
-        worker.playout(&mut client).await.unwrap();
-        worker.playout(&mut client).await.unwrap();
-
-        assert_eq!(worker.search_graph.node_store.len(), 2);
-        assert!(worker.playout_path.is_empty());
-        let root = &worker.search_graph.root.as_ref().unwrap().node;
-        assert_eq!(root.visits(), 3);
-        assert_eq!(root.edge_visit_sum(), 2);
-        let root_edge = root.edge_for_move(preferred_move).unwrap().1;
-        assert_eq!(root_edge.visits(), 2);
-        let child = unsafe { root_edge.child().as_ref() };
-        assert_eq!(child.visits(), 2);
-        assert_eq!(child.edge_visit_sum(), 1);
-    }
-
-    #[tokio::test]
-    async fn integer_terminal_scores_use_katago_gridded_second_moment() {
-        for komi in [-7.0, 0.0, 7.0] {
-            let mut root_state = GameState::new(Rules {
-                komi,
-                ..Rules::TROMP_TAYLORISH
-            });
-            assert!(root_state.play(Loc::PASS));
-            let mut logits = [-20.0; POLICY_SIZE];
-            logits[loc_to_policy(Loc::PASS)] = 20.0;
-            let mut client = one_shot_inference_client(logits);
-            let mut worker = worker();
-            worker.start_game(&root_state, &mut client).await.unwrap();
-
-            for _ in 0..2 {
-                worker.playout(&mut client).await.unwrap();
-                let root = &worker.search_graph.root.as_ref().unwrap().node;
-                let terminal = unsafe { root.edge_for_move(Loc::PASS).unwrap().1.child().as_ref() };
-                let score = f64::from(komi);
-                let win = if score > 0.0 {
-                    1.0
-                } else if score < 0.0 {
-                    0.0
-                } else {
-                    0.5
-                };
-                assert_eq!(terminal.white_win_rate(), win);
-                assert_eq!(terminal.white_score_mean(), score);
-                assert_eq!(terminal.white_score_mean_sq(), score * score + 0.25);
-                let expected_utility = white_utility(
-                    win,
-                    score,
-                    score * score + 0.25,
-                    worker.recent_score_center,
-                    worker.params,
-                );
-                assert!((terminal.white_utility() - expected_utility).abs() < 1e-12);
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn terminal_leaf_uses_exact_score_without_inference() {
-        let mut root_state = GameState::new(Rules::TROMP_TAYLORISH);
-        assert!(root_state.play(Loc::PASS));
-        let mut logits = [0.0; POLICY_SIZE];
-        logits[loc_to_policy(Loc::PASS)] = 20.0;
-        let mut client = one_shot_inference_client(logits);
-        let mut worker = worker();
-        worker.start_game(&root_state, &mut client).await.unwrap();
-
-        worker.playout(&mut client).await.unwrap();
-        worker.playout(&mut client).await.unwrap();
-
-        assert_eq!(worker.search_graph.node_store.len(), 1);
-        assert!(worker.scratch_game_state().is_finished());
-        let root = &worker.search_graph.root.as_ref().unwrap().node;
-        let pass_edge = root.edge_for_move(Loc::PASS).unwrap().1;
-        assert_eq!(pass_edge.visits(), 2);
-        let terminal = unsafe { pass_edge.child().as_ref() };
-        assert_eq!(terminal.visits(), 2);
-        assert_eq!(terminal.white_win_rate(), 1.0);
-        assert_eq!(terminal.white_score_mean(), 7.5);
-        assert_eq!(terminal.white_score_mean_sq(), 7.5 * 7.5);
-    }
-
-    #[tokio::test]
-    async fn playout_inference_failure_does_not_attach_an_unevaluated_child() {
-        let mut worker = worker();
-        let mut working_client = inference_client(false);
-        worker
-            .start_game(&GameState::new(Rules::TROMP_TAYLORISH), &mut working_client)
-            .await
-            .unwrap();
-
-        let mut failing_client = inference_client(true);
-        let result = worker.playout(&mut failing_client).await;
-
-        assert!(matches!(result, Err(SearchError::InferenceError(_))));
-        assert_eq!(worker.search_graph.node_store.len(), 0);
-        assert!(worker.playout_path.is_empty());
-        assert_eq!(
-            worker
-                .search_graph
-                .root
-                .as_ref()
-                .unwrap()
-                .node
-                .visited_policy_mass(),
-            0.0
-        );
-    }
-
-    #[tokio::test]
-    async fn deep_inference_failure_preserves_graph_and_retry_backs_up_once() {
-        let mut worker = worker();
-        let mut client = inference_client_with_policy(false, focused_policy());
-        worker
-            .start_game(&GameState::new(Rules::TROMP_TAYLORISH), &mut client)
-            .await
-            .unwrap();
-        for _ in 0..2 {
-            worker.playout(&mut client).await.unwrap();
-        }
-        let before = graph_snapshot(&worker);
-        assert_eq!(before.len(), 3);
-        let mut failing = inference_client(true);
-        assert!(matches!(
-            worker.playout(&mut failing).await,
-            Err(SearchError::InferenceError(_))
-        ));
-        assert_eq!(
-            worker.playout_path.len(),
-            2,
-            "failure must occur below two existing edges"
-        );
-        assert_eq!(worker.search_graph.node_store.len(), 2);
-        assert_eq!(graph_snapshot(&worker), before);
-
-        worker.playout(&mut client).await.unwrap();
-        let after = graph_snapshot(&worker);
-        assert_eq!(after.len(), 4);
-        assert_eq!(worker.search_graph.node_store.len(), 3);
-        for (old, new) in before.iter().zip(&after) {
-            assert_eq!(new.visits, old.visits + 1);
-            for (old_edge, new_edge) in old.edges.iter().zip(&new.edges) {
-                assert_eq!(new_edge.1, old_edge.1 + 1);
-                assert_eq!(new_edge.3, old_edge.3);
-            }
-        }
-        assert_eq!(after[2].edges.len(), 1);
-        assert_eq!(after[2].edges[0].1, 1);
-        assert_eq!(after[3].visits, 1);
-        assert!(after[3].edges.is_empty());
-        assert!(worker.playout_path.is_empty());
-        assert!(worker.visited_nodes.is_empty());
-    }
-
-    #[tokio::test]
-    async fn full_store_preserves_graph_and_reset_reuses_capacity() {
-        let mut worker = SearchWorker::new(
-            FixedArenaNodeStore::new(1),
-            SearchParams::KATAGO_SELFPLAY8_MAIN_B18,
-        );
-        let mut client = inference_client_with_policy(false, focused_policy());
-        worker
-            .start_game(&GameState::new(Rules::TROMP_TAYLORISH), &mut client)
-            .await
-            .unwrap();
-        worker.playout(&mut client).await.unwrap();
-        let before = graph_snapshot(&worker);
-        // A fresh one-shot client proves the inference before insertion succeeds.
-        let mut one_shot = one_shot_inference_client(focused_policy());
-        assert!(matches!(
-            worker.playout(&mut one_shot).await,
-            Err(SearchError::NodeStore(InsertError::StoreFull))
-        ));
-        assert_eq!(worker.playout_path.len(), 1);
-        assert_eq!(worker.search_graph.node_store.len(), 1);
-        assert_eq!(graph_snapshot(&worker), before);
-
-        worker
-            .reset_graph(&GameState::new(Rules::TROMP_TAYLORISH), &mut client)
-            .await
-            .unwrap();
-        assert_eq!(worker.search_graph.node_store.len(), 0);
-        assert_eq!(worker.search_graph.node_store.capacity(), 1);
-        assert!(worker.playout_path.is_empty());
-        assert!(worker.visited_nodes.is_empty());
-        worker.playout(&mut client).await.unwrap();
-        assert_eq!(worker.search_graph.node_store.len(), 1);
-        let root = &worker.search_graph.root.as_ref().unwrap().node;
-        assert_eq!(root.visits(), 2);
-        assert_eq!(root.edge_visit_sum(), 1);
-    }
-
-    #[tokio::test]
-    async fn reset_graph_borrows_the_callers_state_and_keeps_independent_snapshots() {
-        let mut worker = worker();
-        let mut client = inference_client(false);
-        let mut game_state = GameState::new(Rules::TROMP_TAYLORISH);
-        let initial_key = GraphKey::new(&game_state);
-        worker.start_game(&game_state, &mut client).await.unwrap();
-
-        // The caller retains ownership and can advance without changing the root.
-        assert!(game_state.play(Loc::new(4, 4).unwrap()));
-        assert_eq!(
-            GraphKey::new(&worker.search_graph.root.as_ref().unwrap().game_state),
-            initial_key
-        );
-        worker.playout(&mut client).await.unwrap();
-        let next_key = GraphKey::new(&game_state);
-        worker.reset_graph(&game_state, &mut client).await.unwrap();
-        let root = worker.search_graph.root.as_ref().unwrap();
-        assert_eq!(root.key, next_key);
-        assert_eq!(GraphKey::new(&root.game_state), next_key);
-        assert_eq!(GraphKey::new(worker.scratch_game_state()), next_key);
-        assert_eq!(root.node.visits(), 1);
-        assert_eq!(root.node.edges().count(), 0);
-        assert_eq!(worker.search_graph.node_store.len(), 0);
-
-        // Scratch traversal and later caller moves must not mutate the snapshot.
-        worker.playout(&mut client).await.unwrap();
-        assert_eq!(GraphKey::new(&game_state), next_key);
-        assert!(game_state.play(Loc::PASS));
-        let root = worker.search_graph.root.as_ref().unwrap();
-        assert_eq!(GraphKey::new(&root.game_state), next_key);
-        assert_eq!(root.game_state.consecutive_ending_passes(), 0);
-    }
-
-    #[tokio::test]
-    async fn resetting_graph_clears_stored_nodes_and_replaces_the_root() {
-        let mut worker = worker();
-        let mut client = inference_client(false);
-        worker
-            .start_game(&GameState::new(Rules::TROMP_TAYLORISH), &mut client)
-            .await
-            .unwrap();
-        worker
-            .search_graph
-            .node_store
-            .insert(GraphKey::from_raw(1))
-            .unwrap();
-
-        let mut next_state = GameState::new(Rules::TROMP_TAYLORISH);
-        assert!(next_state.play(Loc::new(4, 4).unwrap()));
-        let expected_key = GraphKey::new(&next_state);
-        worker.reset_graph(&next_state, &mut client).await.unwrap();
-
-        assert_eq!(worker.search_graph.node_store.len(), 0);
-        assert_eq!(worker.search_graph.root.as_ref().unwrap().key, expected_key);
-    }
-
-    #[tokio::test]
-    async fn inference_failure_preserves_the_existing_graph() {
-        let mut worker = worker();
-        let mut working_client = inference_client_with_policy(false, focused_policy());
-        worker
-            .start_game(&GameState::new(Rules::TROMP_TAYLORISH), &mut working_client)
-            .await
-            .unwrap();
-        // Use a nonzero center so an accidental reset to zero is observable.
-        // Subsequent playouts back up the graph using this center.
-        worker.recent_score_center = 3.0;
-        for _ in 0..2 {
-            worker.playout(&mut working_client).await.unwrap();
-        }
-        let before = graph_snapshot(&worker);
-        let original_center = worker.recent_score_center;
-        let original_scratch_key = GraphKey::new(worker.scratch_game_state());
-        let original_key = worker.search_graph.root.as_ref().unwrap().key;
-
-        let mut failing_client = inference_client(true);
-        let mut replacement = GameState::new(Rules::TROMP_TAYLORISH);
-        assert!(replacement.play(Loc::new(4, 4).unwrap()));
-        let result = worker.reset_graph(&replacement, &mut failing_client).await;
-
-        assert!(matches!(result, Err(SearchError::InferenceError(_))));
-        assert_eq!(worker.search_graph.root.as_ref().unwrap().key, original_key);
-        assert_eq!(worker.search_graph.node_store.len(), 2);
-        assert_eq!(graph_snapshot(&worker), before);
-        assert_eq!(worker.recent_score_center, original_center);
-        assert_eq!(
-            GraphKey::new(worker.scratch_game_state()),
-            original_scratch_key
-        );
-        worker.playout(&mut working_client).await.unwrap();
-        assert_eq!(worker.search_graph.node_store.len(), 3);
-        let after = graph_snapshot(&worker);
-        for (old, new) in before.iter().zip(&after) {
-            assert_eq!(new.visits, old.visits + 1);
-        }
-        assert!(worker.playout_path.is_empty());
-        assert!(worker.visited_nodes.is_empty());
-    }
-}
+mod tests;

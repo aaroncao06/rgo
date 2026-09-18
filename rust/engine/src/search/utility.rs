@@ -1,8 +1,6 @@
 use std::sync::OnceLock;
 
-#[cfg_attr(miri, allow(dead_code))]
 mod score_value_table;
-#[cfg(not(miri))]
 use score_value_table::build_expected_score_value_table;
 #[cfg(test)]
 use score_value_table::score_value;
@@ -85,20 +83,6 @@ fn expected_white_score_value(
     let mean_0 = value_00 + stdev_fraction * (value_01 - value_00);
     let mean_1 = value_10 + stdev_fraction * (value_11 - value_10);
     mean_0 + mean_fraction * (mean_1 - mean_0)
-}
-
-// Miri interprets the graph and table lookups normally, but skips the costly
-// numerical initialization. build.rs generates these values natively from the
-// same builder used by normal runs. Explicit little-endian encoding also works
-// when the build host and interpreted target differ in endianness.
-#[cfg(miri)]
-fn build_expected_score_value_table() -> Box<[f64]> {
-    let bytes = include_bytes!(concat!(env!("OUT_DIR"), "/score_value_table.bin"));
-    assert_eq!(bytes.len(), TABLE_MEAN_LEN * TABLE_STDEV_LEN * 8);
-    bytes
-        .chunks_exact(8)
-        .map(|chunk| f64::from_le_bytes(chunk.try_into().unwrap()))
-        .collect()
 }
 
 #[cfg(test)]

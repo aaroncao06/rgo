@@ -17,6 +17,7 @@ struct RawNNOutputs {
     ownership_logits: [f32; BOARD_POLICY_SIZE],
 }
 
+#[derive(Clone)]
 pub(crate) struct NNOutput {
     policy: [f32; POLICY_SIZE], // logits -> probs
     win: f32,                   // logit -> white prob
@@ -127,6 +128,11 @@ impl NNOutput {
     pub(crate) fn policy_probs(&self) -> &[f32; POLICY_SIZE] {
         debug_assert!(self.processed);
         &self.policy
+    }
+
+    pub(crate) fn policy_probs_mut(&mut self) -> &mut [f32; POLICY_SIZE] {
+        debug_assert!(self.processed);
+        &mut self.policy
     }
 
     pub(crate) fn white_win_prob(&self) -> f32 {

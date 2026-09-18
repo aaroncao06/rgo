@@ -102,6 +102,17 @@ impl SearchNode {
             .expect("search nodes must be evaluated before traversal")
             .policy_probs()
     }
+    /// Prepare the root policy before creating children. Clones the inference
+    /// output if it is shared, so cached outputs remain unchanged. Existing
+    /// edges retain their own priors and would not reflect later policy edits.
+    pub(crate) fn policy_probs_mut(&mut self) -> &mut [f32; crate::inference::policy::POLICY_SIZE] {
+        std::sync::Arc::make_mut(
+            self.nn_output
+                .as_mut()
+                .expect("search nodes must be evaluated before traversal"),
+        )
+        .policy_probs_mut()
+    }
     pub(crate) fn nn_output(&self) -> &NNOutput {
         self.nn_output
             .as_deref()
