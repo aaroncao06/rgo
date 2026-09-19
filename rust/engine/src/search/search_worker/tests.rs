@@ -196,7 +196,7 @@ async fn root_preprocessing_preserves_shared_cached_output() {
     let mut rng = SmallRng::seed_from_u64(17);
 
     worker
-        .choose_move(&state, 0, &mut client, &mut rng)
+        .search(&state, 0, &mut client, &mut rng)
         .await
         .unwrap();
 
@@ -218,7 +218,7 @@ async fn root_preprocessing_preserves_shared_cached_output() {
 }
 
 #[tokio::test]
-async fn choose_move_runs_the_budget_and_preserves_the_callers_position() {
+async fn search_returns_move_and_policy_target_without_mutating_the_position() {
     let preferred = Loc::new(4, 4).unwrap();
     let mut state = GameState::new(Rules::TROMP_TAYLORISH);
     assert!(state.play(Loc::PASS));
@@ -229,12 +229,15 @@ async fn choose_move_runs_the_budget_and_preserves_the_callers_position() {
         worker.params.chosen_move_temperature = 0.0;
         let mut client = inference_client_with_policy(false, focused_policy());
         let mut rng = SmallRng::seed_from_u64(7);
-        let chosen = worker
-            .choose_move(&state, budget, &mut client, &mut rng)
+        let result = worker
+            .search(&state, budget, &mut client, &mut rng)
             .await
             .unwrap();
+        let chosen = result.selected_move;
         assert_eq!(chosen, preferred);
         assert!(state.is_legal(chosen));
+        assert!((result.policy_target.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        assert!(result.policy_target[loc_to_policy(chosen)] > 0.0);
         assert_eq!(GraphKey::new(&state), key);
         assert_eq!(state.turn_number(), 1);
         assert_eq!(
@@ -259,7 +262,52 @@ async fn choose_move_runs_the_budget_and_preserves_the_callers_position() {
 }
 
 #[tokio::test]
-async fn choose_move_propagates_inference_failure_without_sampling() {
+async fn search_value_target_uses_current_player_and_converts_moments_to_stdev() {
+    for player in [Player::Black, Player::White] {
+        let mut state = GameState::new(Rules::TROMP_TAYLORISH);
+        if player == Player::White {
+            assert!(state.play(Loc::PASS));
+        }
+        let mut worker = worker();
+        let mut client = inference_client(false);
+        worker.start_game(&state, &mut client).await.unwrap();
+        worker
+            .search_graph
+            .root
+            .as_mut()
+            .unwrap()
+            .node
+            .replace_stats(SearchStats {
+                visits: 4,
+                white_win_sum: 3.0,
+                white_score_sum: 12.0,
+                white_score_mean_sq_sum: 52.0,
+                white_utility_sum: 0.0,
+                white_utility_sq_sum: 0.0,
+                weight_sum: 4.0,
+                weight_sq_sum: 4.0,
+            });
+
+        let mut rng = SmallRng::seed_from_u64(0);
+        let target = worker.build_search_result(&mut rng).unwrap().value_target;
+        let expected = match player {
+            Player::White => SearchValueTarget {
+                win_probability: 0.75,
+                score_mean: 3.0,
+                score_stdev: 2.0,
+            },
+            Player::Black => SearchValueTarget {
+                win_probability: 0.25,
+                score_mean: -3.0,
+                score_stdev: 2.0,
+            },
+        };
+        assert_eq!(target, expected);
+    }
+}
+
+#[tokio::test]
+async fn search_propagates_inference_failure_without_sampling() {
     let mut worker = worker();
     // Root Dirichlet noise is intentionally sampled before search in the
     // normal self-play path; disable it here to isolate failure behavior.
@@ -269,7 +317,7 @@ async fn choose_move_propagates_inference_failure_without_sampling() {
     let mut rng = SmallRng::seed_from_u64(11);
     let mut untouched_rng = rng.clone();
     assert!(matches!(
-        worker.choose_move(&state, 1, &mut client, &mut rng).await,
+        worker.search(&state, 1, &mut client, &mut rng).await,
         Err(SearchError::InferenceError(_))
     ));
     assert_eq!(rng.next_u64(), untouched_rng.next_u64());
@@ -279,16 +327,16 @@ async fn choose_move_propagates_inference_failure_without_sampling() {
 #[tokio::test]
 async fn final_lcb_weights_use_edge_sample_size_for_transpositions() {
     let mut worker = worker();
+    worker.params.chosen_move_temperature_early = 0.0;
+    worker.params.chosen_move_temperature = 0.0;
     let moves = [Loc::new(3, 3).unwrap(), Loc::new(4, 4).unwrap()];
     let mut logits = [-1000.0; POLICY_SIZE];
     for loc in moves {
         logits[loc_to_policy(loc)] = 0.0;
     }
     let mut client = inference_client_with_policy(false, logits);
-    worker
-        .start_game(&GameState::new(Rules::TROMP_TAYLORISH), &mut client)
-        .await
-        .unwrap();
+    let state = GameState::new(Rules::TROMP_TAYLORISH);
+    worker.start_game(&state, &mut client).await.unwrap();
     for (i, loc) in moves.into_iter().enumerate() {
         let mut pointer = worker
             .search_graph
@@ -321,6 +369,16 @@ async fn final_lcb_weights_use_edge_sample_size_for_transpositions() {
     assert_eq!(weights[0], 25.0);
     assert!((weights[1] - 52.480946693222528).abs() < 1e-10);
     assert_eq!(graph_snapshot(&worker), before);
+
+    let mut rng = SmallRng::seed_from_u64(0);
+    let result = worker.build_search_result(&mut rng).unwrap();
+    // Self-play samples without LCB, so the equal unadjusted weights retain
+    // insertion order at zero temperature. The recorded target still uses LCB.
+    assert_eq!(result.selected_move, moves[0]);
+    assert!(
+        result.policy_target[loc_to_policy(moves[1])]
+            > result.policy_target[loc_to_policy(moves[0])]
+    );
 }
 
 #[tokio::test]

@@ -257,7 +257,7 @@ fn ending_bonus_changes_root_selection_and_lcb_without_changing_graph_stats() {
 }
 
 #[tokio::test]
-async fn choose_move_prunes_pass_alive_eyes_with_and_without_playouts() {
+async fn search_prunes_pass_alive_eyes_with_and_without_playouts() {
     let state = pass_alive_position();
     let eye = loc(4, 4);
     let mut logits = [-1000.0; POLICY_SIZE];
@@ -269,9 +269,10 @@ async fn choose_move_prunes_pass_alive_eyes_with_and_without_playouts() {
         let mut client = inference_client_with_policy(false, logits);
         let mut rng = SmallRng::seed_from_u64(123);
         let chosen = worker
-            .choose_move(&state, budget, &mut client, &mut rng)
+            .search(&state, budget, &mut client, &mut rng)
             .await
-            .unwrap();
+            .unwrap()
+            .selected_move;
         if budget <= 1 {
             assert_eq!(chosen, Loc::PASS);
         }
@@ -295,7 +296,7 @@ async fn zero_budget_with_all_policy_mass_pruned_returns_an_error() {
     let mut client = inference_client_with_policy(false, logits);
     let mut rng = SmallRng::seed_from_u64(123);
     assert!(matches!(
-        worker.choose_move(&state, 0, &mut client, &mut rng).await,
+        worker.search(&state, 0, &mut client, &mut rng).await,
         Err(SearchError::NoSelectableMove)
     ));
 }

@@ -102,6 +102,23 @@ struct PlayoutStep {
     player: Player,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct SearchResult {
+    pub(super) selected_move: Loc,
+    pub(super) policy_target: [f32; crate::inference::policy::POLICY_SIZE],
+    pub(super) value_target: SearchValueTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct SearchValueTarget {
+    /// Probability that the player to move wins.
+    pub(super) win_probability: f32,
+    /// Expected final score from the player-to-move perspective, in points.
+    pub(super) score_mean: f32,
+    /// Standard deviation of the final score; unchanged by perspective.
+    pub(super) score_stdev: f32,
+}
+
 struct SearchWorker<N: NodeStore> {
     // The worker reuses its graph storage and scratch buffers across moves.
     search_graph: SearchGraph<N>,
@@ -193,7 +210,7 @@ impl<N: NodeStore> SearchWorker<N> {
         self.visited_nodes.clear();
         Ok(())
     }
-    async fn search(
+    async fn run_playouts(
         &mut self,
         budget: usize,
         inference_client: &mut InferenceClient,
@@ -204,19 +221,19 @@ impl<N: NodeStore> SearchWorker<N> {
         }
         Ok(())
     }
-    async fn choose_move<R: Rng + ?Sized>(
+    async fn search<R: Rng + ?Sized>(
         &mut self,
         game_state: &GameState,
         budget: usize,
         inference_client: &mut InferenceClient,
         rng: &mut R,
-    ) -> Result<Loc, SearchError> {
-        // choose move for self play, without retaining subgraph between moves
+    ) -> Result<SearchResult, SearchError> {
+        // Run a complete self-play search without retaining the graph between moves.
         self.reset_graph(game_state, inference_client).await?;
         self.apply_root_policy_temperature_and_noise(game_state, rng);
-        self.search(budget, inference_client).await?;
+        self.run_playouts(budget, inference_client).await?;
 
-        self.select_root_move(game_state, rng)
+        self.build_search_result(rng)
     }
 
     async fn playout(&mut self, inference_client: &mut InferenceClient) -> Result<(), SearchError> {

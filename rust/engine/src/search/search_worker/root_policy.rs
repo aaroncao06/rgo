@@ -2,7 +2,7 @@
 //! reduced-weight/LCB adjustments, and temperature sampling.
 
 use super::{
-    SearchError, SearchWorker,
+    SearchError, SearchResult, SearchValueTarget, SearchWorker,
     selection_policy::{exploration_scaling, selection_value},
 };
 use crate::{
@@ -11,30 +11,63 @@ use crate::{
         game_state::GameState,
     },
     inference::policy::{loc_to_policy, policy_to_loc},
-    search::{move_selection, node_store::NodeStore, root_policy},
+    search::{move_selection, node::SearchNode, node_store::NodeStore, root_policy},
 };
 use rand::Rng;
 
 impl<N: NodeStore> SearchWorker<N> {
-    pub(super) fn select_root_move<R: Rng + ?Sized>(
+    pub(super) fn build_search_result<R: Rng + ?Sized>(
         &self,
-        game_state: &GameState,
         rng: &mut R,
-    ) -> Result<Loc, SearchError> {
-        let (moves, weights) = self.root_selection_weights()?;
+    ) -> Result<SearchResult, SearchError> {
+        // KataGo's self-play path includes LCB in the recorded policy target,
+        // but disables it while sampling the move that will actually be played.
+        let (moves, policy_weights) = self.root_selection_weights()?;
+        let move_weights = if self.params.use_lcb_for_selection {
+            self.root_selection_weights_with_lcb(false)?.1
+        } else {
+            policy_weights.clone()
+        };
+        let turn_number = self
+            .search_graph
+            .root
+            .as_ref()
+            .expect("search result requires an active game")
+            .game_state
+            .turn_number();
         let temperature = move_selection::temperature(
-            game_state.turn_number(),
+            turn_number,
             BOARD_SIZE,
             self.params.chosen_move_temperature_early,
             self.params.chosen_move_temperature,
             self.params.chosen_move_temperature_halflife,
         );
-        Ok(moves[move_selection::sample_index(&weights, temperature, rng)])
+        let selected_move = moves[move_selection::sample_index(&move_weights, temperature, rng)];
+        let policy_target = normalized_policy_target(&moves, &policy_weights);
+        let root = self
+            .search_graph
+            .root
+            .as_ref()
+            .expect("search result requires an active game");
+        let value_target = search_value_target(&root.node, root.game_state.next_player());
+        Ok(SearchResult {
+            selected_move,
+            policy_target,
+            value_target,
+        })
     }
 
-    // Final play-selection weights, not raw visits or a training-policy target.
+    // Final play-selection weights before move temperature or normalization.
+    // These are also the source weights for the self-play policy target.
     // This reads the graph without changing its statistics or stored policy.
     pub(super) fn root_selection_weights(&self) -> Result<(Vec<Loc>, Vec<f64>), SearchError> {
+        self.root_selection_weights_with_lcb(self.params.use_lcb_for_selection)
+    }
+
+    fn root_selection_weights_with_lcb(
+        &self,
+        use_lcb: bool,
+    ) -> Result<(Vec<Loc>, Vec<f64>), SearchError> {
         let root = self
             .search_graph
             .root
@@ -107,7 +140,7 @@ impl<N: NodeStore> SearchWorker<N> {
                     );
                 }
             }
-            if self.params.use_lcb_for_selection {
+            if use_lcb {
                 self.adjust_root_weights_by_lcb(&mut weights, reference_weight);
             }
         } else {
@@ -226,5 +259,35 @@ impl<N: NodeStore> SearchWorker<N> {
             reference_weight,
             self.params.min_visit_prop_for_lcb,
         );
+    }
+}
+
+fn normalized_policy_target(
+    moves: &[Loc],
+    weights: &[f64],
+) -> [f32; crate::inference::policy::POLICY_SIZE] {
+    debug_assert_eq!(moves.len(), weights.len());
+    let weight_sum: f64 = weights.iter().sum();
+    debug_assert!(weight_sum > 0.0);
+    let mut target = [0.0; crate::inference::policy::POLICY_SIZE];
+    for (&move_loc, &weight) in moves.iter().zip(weights) {
+        target[loc_to_policy(move_loc)] = (weight / weight_sum) as f32;
+    }
+    target
+}
+
+fn search_value_target(node: &SearchNode, player: Player) -> SearchValueTarget {
+    let white_win_probability = node.white_win_rate();
+    let white_score_mean = node.white_score_mean();
+    let score_variance =
+        (node.white_score_mean_sq() - white_score_mean * white_score_mean).max(0.0);
+    let (win_probability, score_mean) = match player {
+        Player::White => (white_win_probability, white_score_mean),
+        Player::Black => (1.0 - white_win_probability, -white_score_mean),
+    };
+    SearchValueTarget {
+        win_probability: win_probability as f32,
+        score_mean: score_mean as f32,
+        score_stdev: score_variance.sqrt() as f32,
     }
 }
