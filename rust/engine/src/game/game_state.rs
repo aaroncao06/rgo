@@ -13,6 +13,9 @@ pub(crate) struct GameState {
     next_player: Player,
     turn_number: usize,
     consecutive_ending_passes: u8,
+    // Each player's consecutive passes on their own turns, capped at four.
+    // Root pruning needs this, not just consecutive passes by either player.
+    passes_by_player: [u8; 2],
     superko_banned: [bool; ARRAY_LEN],
     seen_position_hashes: HashSet<Hash128>,
 }
@@ -29,6 +32,7 @@ impl GameState {
             next_player: Player::Black,
             turn_number: 0,
             consecutive_ending_passes: 0,
+            passes_by_player: [0; 2],
             superko_banned,
             seen_position_hashes,
         }
@@ -45,6 +49,7 @@ impl GameState {
         self.next_player = source.next_player;
         self.turn_number = source.turn_number;
         self.consecutive_ending_passes = source.consecutive_ending_passes;
+        self.passes_by_player = source.passes_by_player;
         self.superko_banned = source.superko_banned;
 
         self.seen_position_hashes.clear();
@@ -77,6 +82,13 @@ impl GameState {
     }
     pub(crate) fn consecutive_ending_passes(&self) -> u8 {
         self.consecutive_ending_passes
+    }
+    pub(crate) fn opponent_passed_last_four_turns(&self) -> bool {
+        let opponent_index = match self.next_player {
+            Player::Black => 1,
+            Player::White => 0,
+        };
+        self.passes_by_player[opponent_index] >= 4
     }
     pub(crate) fn is_superko_banned(&self, loc: Loc) -> bool {
         debug_assert!(loc.is_on_board());
@@ -114,6 +126,15 @@ impl GameState {
             return false;
         }
         self.board.play_move_assume_legal(loc, self.next_player);
+        let player_index = match self.next_player {
+            Player::Black => 0,
+            Player::White => 1,
+        };
+        self.passes_by_player[player_index] = if loc == Loc::PASS {
+            (self.passes_by_player[player_index] + 1).min(4)
+        } else {
+            0
+        };
         if loc == Loc::PASS {
             self.consecutive_ending_passes += 1;
         } else {
@@ -214,6 +235,29 @@ mod tests {
         assert_eq!(state.turn_number(), 2);
         cloned.reset_from(&GameState::new(rules()));
         assert_eq!(cloned.turn_number(), 0);
+    }
+
+    #[test]
+    fn opponent_pass_streak_tracks_own_turns_and_survives_reset() {
+        let mut state = GameState::new(rules());
+        for x in 0..4 {
+            assert!(state.play(loc(x, 0)));
+            assert!(state.play(Loc::PASS));
+            assert_eq!(state.opponent_passed_last_four_turns(), x == 3);
+            assert_eq!(state.consecutive_ending_passes(), 1);
+        }
+        let mut scratch = GameState::new(rules());
+        scratch.reset_from(&state);
+        assert!(scratch.opponent_passed_last_four_turns());
+        assert!(state.clone().opponent_passed_last_four_turns());
+        assert!(!scratch.play(loc(0, 0))); // Illegal moves do not reset the streak.
+        assert!(scratch.opponent_passed_last_four_turns());
+        assert!(scratch.play(loc(4, 0)));
+        assert!(!scratch.opponent_passed_last_four_turns()); // White sees Black's streak.
+        assert!(scratch.play(loc(8, 8))); // White stops passing.
+        assert!(!scratch.opponent_passed_last_four_turns());
+        scratch.reset_from(&GameState::new(rules()));
+        assert!(!scratch.opponent_passed_last_four_turns());
     }
 
     #[test]

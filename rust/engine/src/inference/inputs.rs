@@ -7,6 +7,8 @@ const NUM_GLOBAL_FEATURES: usize = 2; // komi, passes
 
 // takes in current board,
 pub(crate) struct NNInput {
+    /// Request metadata, NOT a model feature. Only roots need ownership output.
+    pub(crate) include_ownership: bool,
     pub(crate) spatial: [f32; NUM_SPATIAL_FEATURES * BOARD_POLICY_SIZE],
     pub(crate) global: [f32; NUM_GLOBAL_FEATURES],
 }
@@ -40,7 +42,11 @@ impl NNInput {
                 spatial[2 * BOARD_POLICY_SIZE + policy_idx] = 1_f32;
             }
         }
-        Self { spatial, global }
+        Self {
+            spatial,
+            global,
+            include_ownership: false,
+        }
     }
 }
 

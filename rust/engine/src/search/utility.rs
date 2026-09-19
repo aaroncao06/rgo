@@ -46,6 +46,39 @@ pub(crate) fn recent_score_center(expected_score: f64, params: SearchParams) -> 
     center
 }
 
+/// Shift the score mean without changing its uncertainty. Root ending bonuses
+/// are selection-only adjustments, not additional samples or training targets.
+pub(crate) fn score_utility_diff(
+    mean: f64,
+    mean_sq: f64,
+    delta: f64,
+    center: f64,
+    params: SearchParams,
+) -> f64 {
+    if delta == 0.0 {
+        return 0.0;
+    }
+    let stdev = score_stdev(mean, mean_sq);
+    let size = BOARD_SIZE as f64;
+    let static_diff = expected_white_score_value(mean + delta, stdev, 0.0, 2.0, size)
+        - expected_white_score_value(mean, stdev, 0.0, 2.0, size);
+    let dynamic_diff = expected_white_score_value(
+        mean + delta,
+        stdev,
+        center,
+        params.dynamic_score_center_scale,
+        size,
+    ) - expected_white_score_value(
+        mean,
+        stdev,
+        center,
+        params.dynamic_score_center_scale,
+        size,
+    );
+    static_diff * params.static_score_utility_factor
+        + dynamic_diff * params.dynamic_score_utility_factor
+}
+
 fn score_stdev(score_mean: f64, score_mean_sq: f64) -> f64 {
     (score_mean_sq - score_mean * score_mean).max(0.0).sqrt()
 }
@@ -88,6 +121,31 @@ fn expected_white_score_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ending_score_shift_preserves_predicted_variance() {
+        let params = SearchParams::KATAGO_SELFPLAY8_MAIN_B18;
+        let mean = 3.0;
+        let variance = 16.0;
+        let delta = 0.5;
+        let center = 2.0;
+        let expected = white_utility(
+            0.6,
+            mean + delta,
+            (mean + delta) * (mean + delta) + variance,
+            center,
+            params,
+        ) - white_utility(0.6, mean, mean * mean + variance, center, params);
+        assert!(
+            (score_utility_diff(mean, mean * mean + variance, delta, center, params) - expected)
+                .abs()
+                < 1e-14
+        );
+        assert_eq!(
+            score_utility_diff(mean, mean * mean + variance, 0.0, center, params),
+            0.0
+        );
+    }
 
     fn assert_close(actual: f64, expected: f64) {
         assert!(

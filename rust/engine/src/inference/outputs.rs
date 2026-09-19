@@ -24,6 +24,8 @@ pub(crate) struct NNOutput {
     score_mean: f32,            // score mean -> white score mean
     score_aux: f32,             // stdev logit -> white score mean sq
     processed: bool,            //just to be safe now that we are modifying in place
+    // Optional logits -> signed white ownership; no inline map on ordinary evaluations.
+    ownership: Option<Box<[f32; BOARD_POLICY_SIZE]>>,
 }
 
 fn masked_softmax_in_place(policy: &mut [f32; POLICY_SIZE], legal_mask: &[bool; POLICY_SIZE]) {
@@ -105,7 +107,24 @@ impl NNOutput {
             score_mean: raw_score_mean,
             score_aux: raw_score_stdev_logit,
             processed: false,
+            ownership: None,
         }
+    }
+    pub(crate) fn with_ownership_logits(mut self, logits: [f32; BOARD_POLICY_SIZE]) -> Self {
+        debug_assert!(!self.processed);
+        assert!(
+            logits.iter().all(|v| v.is_finite()),
+            "nonfinite ownership output"
+        );
+        self.ownership = Some(Box::new(logits));
+        self
+    }
+    pub(crate) fn has_ownership(&self) -> bool {
+        self.ownership.is_some()
+    }
+    pub(crate) fn white_ownership(&self) -> Option<&[f32; BOARD_POLICY_SIZE]> {
+        debug_assert!(self.processed);
+        self.ownership.as_deref()
     }
     pub(crate) fn process_in_place(
         &mut self,
@@ -123,7 +142,33 @@ impl NNOutput {
         self.win = win_prob_to_white(current_win_prob, next_player);
         self.score_mean = signed_value_to_white(score_mean, next_player);
         self.score_aux = score_mean_sq(score_mean, score_stdev);
+        self.process_ownership_in_place(next_player);
         self.processed = true;
+    }
+
+    /// Upgrade using this fresh allocation and ownership map, without mutating
+    /// the shared cached output or postprocessing policy/value a second time.
+    pub(crate) fn process_with_cached_values_in_place(
+        &mut self,
+        next_player: Player,
+        cached: &Self,
+    ) {
+        debug_assert!(!self.processed && cached.processed);
+        debug_assert!(self.has_ownership() && !cached.has_ownership());
+        self.policy = cached.policy;
+        self.win = cached.win;
+        self.score_mean = cached.score_mean;
+        self.score_aux = cached.score_aux;
+        self.process_ownership_in_place(next_player);
+        self.processed = true;
+    }
+
+    fn process_ownership_in_place(&mut self, next_player: Player) {
+        if let Some(ownership) = self.ownership.as_mut() {
+            for value in ownership.iter_mut() {
+                *value = signed_value_to_white(value.tanh(), next_player);
+            }
+        }
     }
     pub(crate) fn policy_probs(&self) -> &[f32; POLICY_SIZE] {
         debug_assert!(self.processed);
@@ -158,6 +203,58 @@ impl NNOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ownership_upgrade_reuses_fresh_map_and_preserves_processed_predictions() {
+        for player in [Player::Black, Player::White] {
+            let mut logits = [0.0; POLICY_SIZE];
+            logits[1] = 2.0;
+            let mut legal = [true; POLICY_SIZE];
+            legal[0] = false;
+            let mut cached = NNOutput::from_raw(logits, 1.0, 2.0, -1.0);
+            cached.process_in_place(player, &legal);
+            let mut fresh = NNOutput::from_raw([5.0; POLICY_SIZE], -2.0, -3.0, 2.0)
+                .with_ownership_logits([1.0; BOARD_POLICY_SIZE]);
+            let map_address = fresh.ownership.as_ref().unwrap().as_ptr();
+            fresh.process_with_cached_values_in_place(player, &cached);
+            assert_eq!(fresh.white_ownership().unwrap().as_ptr(), map_address);
+            assert_eq!(fresh.policy_probs(), cached.policy_probs());
+            assert_eq!(fresh.policy_probs()[0], 0.0);
+            assert_eq!(fresh.white_win_prob(), cached.white_win_prob());
+            assert_eq!(fresh.white_score_mean(), cached.white_score_mean());
+            assert_eq!(fresh.white_score_mean_sq(), cached.white_score_mean_sq());
+            assert_eq!(
+                fresh.white_ownership().unwrap(),
+                &[signed_value_to_white(1.0_f32.tanh(), player); BOARD_POLICY_SIZE]
+            );
+            assert!(!cached.has_ownership());
+        }
+    }
+
+    #[test]
+    fn ownership_is_optional_and_converted_from_logits_to_white() {
+        for player in [Player::Black, Player::White] {
+            let mut output = NNOutput::from_raw([0.0; POLICY_SIZE], 0.0, 0.0, 0.0)
+                .with_ownership_logits([1.0; BOARD_POLICY_SIZE]);
+            output.process_in_place(player, &[true; POLICY_SIZE]);
+            let expected = if player == Player::White {
+                1.0_f32.tanh()
+            } else {
+                -1.0_f32.tanh()
+            };
+            assert_eq!(
+                output.white_ownership().unwrap(),
+                &[expected; BOARD_POLICY_SIZE]
+            );
+            let mut cloned = output.clone();
+            cloned.policy_probs_mut()[0] = 0.0;
+            assert_eq!(cloned.white_ownership(), output.white_ownership());
+            assert_ne!(cloned.policy_probs()[0], output.policy_probs()[0]);
+        }
+        let mut output = NNOutput::from_raw([0.0; POLICY_SIZE], 0.0, 0.0, 0.0);
+        output.process_in_place(Player::Black, &[true; POLICY_SIZE]);
+        assert!(output.white_ownership().is_none());
+    }
 
     fn assert_close(actual: f32, expected: f32) {
         let tolerance = 1e-5 * expected.abs().max(1.0);

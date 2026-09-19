@@ -23,6 +23,8 @@ pub(crate) trait InferenceBackend {
     /// other strong or weak Arc references or share one output between rows.
     /// The client uses Arc::get_mut to apply legal masking and perspective/score
     /// transformations before sharing the result with the model cache and search.
+    /// When input.include_ownership is true, attach current-player ownership
+    /// logits via with_ownership_logits. Other requests may omit that output.
     fn evaluate_batch(
         &mut self,
         inputs: &[NNInput],
@@ -45,13 +47,13 @@ impl InferenceBackend for DummyInferenceBackend {
     ) -> Result<(), InferenceError> {
         debug_assert!(outputs.is_empty()); // up to the executor to clear before calling
         // outputs.reserve(inputs.len()); //should be noop if you are keeping consistent batch sizes, safeguard
-        for _input in inputs {
-            outputs.push(Arc::new(NNOutput::from_raw(
-                [0.0; POLICY_SIZE],
-                0.0,
-                0.0,
-                0.0,
-            )));
+        for input in inputs {
+            let mut output = NNOutput::from_raw([0.0; POLICY_SIZE], 0.0, 0.0, 0.0);
+            if input.include_ownership {
+                output = output
+                    .with_ownership_logits([0.0; crate::inference::policy::BOARD_POLICY_SIZE]);
+            }
+            outputs.push(Arc::new(output));
         }
         self.batch_sizes.push(inputs.len());
         if inputs.len() != outputs.len() {

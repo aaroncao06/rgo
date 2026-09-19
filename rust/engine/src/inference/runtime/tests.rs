@@ -22,6 +22,81 @@ struct TestBackend {
     fail: bool,
 }
 
+struct OwnershipBackend(Arc<Mutex<Vec<bool>>>);
+
+impl InferenceBackend for OwnershipBackend {
+    fn evaluate_batch(
+        &mut self,
+        inputs: &[NNInput],
+        outputs: &mut Vec<Arc<NNOutput>>,
+    ) -> Result<(), InferenceError> {
+        for input in inputs {
+            self.0.lock().unwrap().push(input.include_ownership);
+            let mut output = NNOutput::from_raw([0.0; POLICY_SIZE], 0.0, 0.0, 0.0);
+            if input.include_ownership {
+                // Deliberately different predictions, as randomized inference
+                // could produce. An ownership upgrade must preserve the old ones.
+                let mut policy = [0.0; POLICY_SIZE];
+                policy[0] = 5.0;
+                output = NNOutput::from_raw(policy, 2.0, 3.0, 1.0)
+                    .with_ownership_logits([1.0; crate::inference::policy::BOARD_POLICY_SIZE]);
+            }
+            outputs.push(Arc::new(output));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn root_requests_upgrade_cached_outputs_without_mutating_interior_outputs() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let handle = ModelRuntime::start(vec![OwnershipBackend(requests.clone())], 1, 1, 16, 1);
+    let mut client = InferenceClient::new(handle);
+    let state = GameState::new(Rules::TROMP_TAYLORISH);
+    let interior = client.evaluate(&state, false).await.unwrap();
+    assert!(!interior.has_ownership());
+    let root = client.evaluate(&state, true).await.unwrap();
+    assert!(
+        root.white_ownership()
+            .unwrap()
+            .iter()
+            .all(|&v| v == -1.0_f32.tanh())
+    );
+    assert!(!interior.has_ownership());
+    assert!(!Arc::ptr_eq(&interior, &root));
+    assert_eq!(root.policy_probs(), interior.policy_probs());
+    assert_eq!(root.white_win_prob(), interior.white_win_prob());
+    assert_eq!(root.white_score_mean(), interior.white_score_mean());
+    assert_eq!(root.white_score_mean_sq(), interior.white_score_mean_sq());
+    assert!(Arc::ptr_eq(
+        &root,
+        &client.evaluate(&state, true).await.unwrap()
+    ));
+    assert!(Arc::ptr_eq(
+        &root,
+        &client.evaluate(&state, false).await.unwrap()
+    ));
+    assert_eq!(*requests.lock().unwrap(), [false, true]);
+}
+
+#[tokio::test]
+#[should_panic(expected = "backend omitted requested ownership output")]
+async fn missing_requested_ownership_violates_backend_contract() {
+    let handle = ModelRuntime::start(
+        vec![TestBackend {
+            batch_sizes: Arc::new(Mutex::new(Vec::new())),
+            fail: false,
+        }],
+        1,
+        1,
+        16,
+        1,
+    );
+    let mut client = InferenceClient::new(handle);
+    let state = GameState::new(Rules::TROMP_TAYLORISH);
+    let _ = client.evaluate(&state, true).await;
+}
+
 impl InferenceBackend for TestBackend {
     fn evaluate_batch(
         &mut self,
@@ -112,7 +187,7 @@ async fn model_runtime_evaluates_through_a_client() {
     let mut client = InferenceClient::new(model_handle);
 
     let game_state = GameState::new(Rules::TROMP_TAYLORISH);
-    let output = client.evaluate(&game_state).await.unwrap();
+    let output = client.evaluate(&game_state, false).await.unwrap();
 
     assert!(output.is_processed());
     assert_eq!(*batch_sizes.lock().unwrap(), [1]);
@@ -132,8 +207,8 @@ async fn repeated_evaluation_uses_the_model_cache() {
     let mut client = InferenceClient::new(model_handle);
     let game_state = GameState::new(Rules::TROMP_TAYLORISH);
 
-    let first = client.evaluate(&game_state).await.unwrap();
-    let second = client.evaluate(&game_state).await.unwrap();
+    let first = client.evaluate(&game_state, false).await.unwrap();
+    let second = client.evaluate(&game_state, false).await.unwrap();
 
     assert!(Arc::ptr_eq(&first, &second));
     assert_eq!(*batch_sizes.lock().unwrap(), [1]);
@@ -171,8 +246,8 @@ async fn multiple_clients_share_one_model_runtime() {
     assert!(second_game.play(loc(4, 4)));
 
     let (first_result, second_result) = tokio::join!(
-        first_client.evaluate(&first_game),
-        second_client.evaluate(&second_game)
+        first_client.evaluate(&first_game, false),
+        second_client.evaluate(&second_game, false)
     );
 
     assert!(first_result.unwrap().is_processed());

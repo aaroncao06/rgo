@@ -7,6 +7,48 @@ const MAX_REGIONS: usize = (BOARD_SIZE * BOARD_SIZE + 1) / 2 + 1;
 const VITAL_FOR_CHAIN_HEADS_MAX_LEN: usize = MAX_REGIONS * 4; // max number of (region, chain-head) vital relations for a player
 
 impl Board {
+    /// Strictly pass-alive stones and territory, without scoring's extra fills.
+    pub(crate) fn calculate_pass_alive_area(
+        &self,
+        multi_stone_suicide_legal: bool,
+    ) -> [Color; ARRAY_LEN] {
+        let mut result = [Color::Empty; ARRAY_LEN];
+        for player in [Player::Black, Player::White] {
+            self.calculate_area_for_player(
+                player,
+                false,
+                false,
+                multi_stone_suicide_legal,
+                &mut result,
+            );
+        }
+        result
+    }
+
+    /// KataGo's isNonPassAliveSelfConnection: at least one adjacent group
+    /// must be unsettled, and a second adjacent group must be distinct.
+    pub(crate) fn is_non_pass_alive_self_connection(
+        &self,
+        loc: Loc,
+        player: Player,
+        area: &[Color; ARRAY_LEN],
+    ) -> bool {
+        let color = Color::from(player);
+        if self.colors[loc.index()] != Color::Empty || area[loc.index()] == color {
+            return false;
+        }
+        let head = Loc::adjacent_indices(loc.index())
+            .into_iter()
+            .find_map(|i| {
+                (self.colors[i] == color && area[i] == Color::Empty).then_some(self.chain_head[i])
+            });
+        head.is_some_and(|head| {
+            Loc::adjacent_indices(loc.index())
+                .into_iter()
+                .any(|i| self.colors[i] == color && self.chain_head[i] != head)
+        })
+    }
+
     pub(crate) fn calculate_area(&self, multi_stone_suicide_legal: bool) -> [Color; ARRAY_LEN] {
         let mut result = [Color::Empty; ARRAY_LEN];
         self.calculate_area_for_player(

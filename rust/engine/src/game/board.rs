@@ -137,6 +137,20 @@ impl Board {
     pub(crate) fn color_at(&self, loc: Loc) -> Color {
         self.colors[loc.index()]
     }
+    pub(crate) fn simple_ko(&self) -> Option<Loc> {
+        self.simple_ko
+    }
+    pub(crate) fn is_adjacent_to_player(&self, loc: Loc, player: Player) -> bool {
+        Loc::adjacent_indices(loc.index())
+            .into_iter()
+            .any(|i| self.colors[i] == Color::from(player))
+    }
+    pub(crate) fn would_capture(&self, loc: Loc, player: Player) -> bool {
+        Loc::adjacent_indices(loc.index()).into_iter().any(|i| {
+            self.colors[i] == Color::from(player.opponent())
+                && self.get_num_liberties(Loc::from_index(i)) == 1
+        })
+    }
     fn is_empty(&self) -> bool {
         self.colors
             .iter()

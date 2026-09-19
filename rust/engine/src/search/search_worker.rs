@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     game::{
-        board::{BOARD_SIZE, Loc, Player},
+        board::{ARRAY_LEN, BOARD_SIZE, Color, Loc, Player},
         game_state::GameState,
     },
     inference::{
@@ -23,14 +23,17 @@ use crate::{
         node_store::{InsertError, NodeStore},
         root_policy,
         search_params::SearchParams,
-        utility::{recent_score_center, white_utility},
+        utility::{recent_score_center, score_utility_diff, white_utility},
     },
 };
+
+mod root_endgame;
 
 struct SearchRoot {
     game_state: GameState, // playouts will start from this
     key: GraphKey,
     node: Box<SearchNode>, // owned separately from the rest of the nodestore
+    safe_area: [Color; ARRAY_LEN],
 }
 
 /// Owns the root position and stored graph nodes. Self-play resets the graph
@@ -56,18 +59,23 @@ impl<N: NodeStore> SearchGraph<N> {
         self.node_store.clear();
         let key = GraphKey::new(root_game_state);
         let node = Self::initialized_root(root_output, root_utility);
+        let safe_area = root_game_state
+            .board()
+            .calculate_pass_alive_area(root_game_state.rules().multi_stone_suicide_legal);
         match self.root.as_mut() {
             Some(root) => {
                 // Retain the root state's history allocation between moves.
                 root.game_state.reset_from(root_game_state);
                 root.key = key;
                 root.node = node;
+                root.safe_area = safe_area;
             }
             None => {
                 self.root = Some(SearchRoot {
                     game_state: root_game_state.clone(),
                     key,
                     node,
+                    safe_area,
                 });
             }
         }
@@ -121,6 +129,7 @@ struct SearchWorker<N: NodeStore> {
 pub(crate) enum SearchError {
     NodeStore(InsertError),
     InferenceError(InferenceError),
+    NoSelectableMove,
 }
 
 impl From<InferenceError> for SearchError {
@@ -172,7 +181,9 @@ impl<N: NodeStore> SearchWorker<N> {
     ) -> Result<(), SearchError> {
         // full reset, in the future can have a version where you retain subgraph between moves
         debug_assert!(!root_game_state.is_finished());
-        let root_output = inference_client.evaluate(root_game_state).await?;
+        let root_output = inference_client
+            .evaluate(root_game_state, self.params.root_ending_bonus_points != 0.0)
+            .await?;
         let score_center =
             recent_score_center(f64::from(root_output.white_score_mean()), self.params);
         let root_utility = white_utility(
@@ -217,7 +228,7 @@ impl<N: NodeStore> SearchWorker<N> {
         self.apply_root_policy_temperature_and_noise(game_state, rng);
         self.search(budget, inference_client).await?;
 
-        let (moves, weights) = self.root_selection_weights();
+        let (moves, weights) = self.root_selection_weights()?;
         let temperature = move_selection::temperature(
             game_state.turn_number(),
             BOARD_SIZE,
@@ -263,7 +274,7 @@ impl<N: NodeStore> SearchWorker<N> {
 
     // Final play-selection weights, not raw visits or a training-policy target.
     // This reads the graph without changing its statistics or stored policy.
-    fn root_selection_weights(&self) -> (Vec<Loc>, Vec<f64>) {
+    fn root_selection_weights(&self) -> Result<(Vec<Loc>, Vec<f64>), SearchError> {
         let root = self
             .search_graph
             .root
@@ -281,7 +292,8 @@ impl<N: NodeStore> SearchWorker<N> {
             let weight = unsafe { edge.child_weight() };
             total_child_weight += weight;
             let loc = edge.move_loc();
-            let weight = if root.game_state.is_legal(loc) {
+            let weight = if root.game_state.is_legal(loc) && root.is_allowed_move(loc, self.params)
+            {
                 weight
             } else {
                 0.0
@@ -306,7 +318,8 @@ impl<N: NodeStore> SearchWorker<N> {
             // SAFETY: all node pointers remain live and there are no mutable borrows.
             let best_child = unsafe { best_edge.child().as_ref() };
             let best_selection = selection_value(
-                best_child.white_utility(),
+                best_child.white_utility()
+                    + self.root_ending_utility_bonus(best_child, best_edge.move_loc()),
                 player,
                 f64::from(policy[loc_to_policy(best_edge.move_loc())]),
                 reference_weight,
@@ -315,11 +328,16 @@ impl<N: NodeStore> SearchWorker<N> {
             for (i, edge) in root.node.edges().enumerate() {
                 // SAFETY: same graph-lifetime and shared-borrow guarantee as above.
                 let child = unsafe { edge.child().as_ref() };
+                let utility =
+                    child.white_utility() + self.root_ending_utility_bonus(child, edge.move_loc());
                 let self_utility = match player {
-                    Player::White => child.white_utility(),
-                    Player::Black => -child.white_utility(),
+                    Player::White => utility,
+                    Player::Black => -utility,
                 };
-                if i != best_index && root.game_state.is_legal(edge.move_loc()) {
+                if i != best_index
+                    && root.game_state.is_legal(edge.move_loc())
+                    && root.is_allowed_move(edge.move_loc(), self.params)
+                {
                     weights[i] = move_selection::reduced_weight(
                         weights[i],
                         self_utility,
@@ -336,7 +354,7 @@ impl<N: NodeStore> SearchWorker<N> {
             // Zero-budget search still has a root evaluation: use its legal policy.
             for (i, &probability) in policy.iter().enumerate() {
                 let loc = policy_to_loc(i);
-                if root.game_state.is_legal(loc) {
+                if root.game_state.is_legal(loc) && root.is_allowed_move(loc, self.params) {
                     moves.push(loc);
                     weights.push(f64::from(probability));
                 }
@@ -344,11 +362,17 @@ impl<N: NodeStore> SearchWorker<N> {
         }
         if weights.iter().copied().fold(0.0, f64::max) <= 1e-50 {
             for (loc, weight) in moves.iter().zip(&mut weights) {
-                *weight = if root.game_state.is_legal(*loc) {
-                    f64::from(policy[loc_to_policy(*loc)])
-                } else {
-                    0.0
-                };
+                *weight =
+                    if root.game_state.is_legal(*loc) && root.is_allowed_move(*loc, self.params) {
+                        f64::from(policy[loc_to_policy(*loc)])
+                    } else {
+                        0.0
+                    };
+            }
+            // Root move filtering can remove all positive policy mass. Like
+            // KataGo, report failure if even the policy fallback is weightless.
+            if weights.iter().copied().fold(0.0, f64::max) <= 1e-50 {
+                return Err(SearchError::NoSelectableMove);
             }
         }
         move_selection::prune_weights(
@@ -356,7 +380,7 @@ impl<N: NodeStore> SearchWorker<N> {
             self.params.chosen_move_subtract,
             self.params.chosen_move_prune,
         );
-        (moves, weights)
+        Ok((moves, weights))
     }
     /// Apply LCB after exploration-weight reduction, using the reference weight
     /// saved before reduction. Weights follow root edge iteration order.
@@ -382,14 +406,23 @@ impl<N: NodeStore> SearchWorker<N> {
             // LCB matches KataGo's getChildWeightSq: LINEAR edge fraction.
             // This estimates edge sample count, unlike the squared scaling
             // used when combining weighted child samples during backup.
-            lcbs.push(move_selection::lcb_and_radius(
+            let (mut lcb, radius) = move_selection::lcb_and_radius(
                 self_utility,
                 child.white_utility_mean_sq(),
                 child.weight_sum() * fraction,
                 child.weight_sq_sum() * fraction,
                 utility_radius,
                 self.params.lcb_stdevs,
-            ));
+            );
+            // Shift the LCB mean, not its variance: the bonus is deterministic.
+            if child.weight_sum() * fraction > 0.0 && child.weight_sq_sum() * fraction > 0.0 {
+                let bonus = self.root_ending_utility_bonus(child, edge.move_loc());
+                lcb += match player {
+                    Player::White => bonus,
+                    Player::Black => -bonus,
+                };
+            }
+            lcbs.push((lcb, radius));
         }
         // The selected config enables useNonBuggyLcb, so index zero is
         // eligible for the same bonus as every other child.
@@ -507,7 +540,11 @@ impl<N: NodeStore> SearchWorker<N> {
                     let output = if is_finished {
                         None
                     } else {
-                        Some(inference_client.evaluate(self.scratch_game_state()).await?)
+                        Some(
+                            inference_client
+                                .evaluate(self.scratch_game_state(), false)
+                                .await?,
+                        )
                     };
                     let mut child = self.search_graph.node_store.insert(current_key)?;
 
@@ -592,6 +629,12 @@ impl<N: NodeStore> SearchWorker<N> {
         game_state: &GameState,
         is_root: bool,
     ) -> (Loc, Option<EdgeIndex>) {
+        let root = is_root.then(|| {
+            self.search_graph
+                .root
+                .as_ref()
+                .expect("root selection requires a graph")
+        });
         // KataGo increases exploration slowly as the node accumulates visits.
         // SAFETY: selection runs while all graph nodes are live and none of the
         // children are mutably borrowed. The store cannot be cleared during it.
@@ -637,7 +680,9 @@ impl<N: NodeStore> SearchWorker<N> {
             let move_loc = edge.move_loc();
             let policy_index = loc_to_policy(move_loc);
             expanded[policy_index] = true;
-            if !game_state.is_legal(move_loc) {
+            if !game_state.is_legal(move_loc)
+                || root.is_some_and(|root| !root.is_allowed_move(move_loc, self.params))
+            {
                 continue;
             }
 
@@ -657,7 +702,12 @@ impl<N: NodeStore> SearchWorker<N> {
                 1e20 // KataGo's forced-visit selection value.
             } else {
                 selection_value(
-                    child.white_utility(),
+                    child.white_utility()
+                        + if is_root {
+                            self.root_ending_utility_bonus(child, move_loc)
+                        } else {
+                            0.0
+                        },
                     game_state.next_player(),
                     policy_probability,
                     child_weight,
@@ -681,7 +731,10 @@ impl<N: NodeStore> SearchWorker<N> {
                 continue;
             }
             let move_loc = policy_to_loc(policy_index);
-            if game_state.is_legal(move_loc) && probability > best_new_policy {
+            if game_state.is_legal(move_loc)
+                && probability > best_new_policy
+                && root.is_none_or(|root| root.is_allowed_move(move_loc, self.params))
+            {
                 best_new_move = move_loc;
                 best_new_policy = probability;
             }

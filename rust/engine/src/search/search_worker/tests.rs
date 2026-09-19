@@ -8,6 +8,8 @@ use crate::{
 };
 use rand::{SeedableRng, rngs::SmallRng};
 
+mod endgame;
+
 struct TestBackend {
     fail: bool,
     policy_logits: [f32; POLICY_SIZE],
@@ -22,13 +24,13 @@ impl InferenceBackend for TestBackend {
         if self.fail {
             return Err(InferenceError::ExecutionFailed);
         }
-        for _ in inputs {
-            outputs.push(Arc::new(NNOutput::from_raw(
-                self.policy_logits,
-                0.0,
-                0.0,
-                0.0,
-            )));
+        for input in inputs {
+            let mut output = NNOutput::from_raw(self.policy_logits, 0.0, 0.0, 0.0);
+            if input.include_ownership {
+                output = output
+                    .with_ownership_logits([0.0; crate::inference::policy::BOARD_POLICY_SIZE]);
+            }
+            outputs.push(Arc::new(output));
         }
         Ok(())
     }
@@ -68,12 +70,10 @@ impl InferenceBackend for OneShotBackend {
         }
         self.evaluated = true;
         for _ in inputs {
-            outputs.push(Arc::new(NNOutput::from_raw(
-                self.policy_logits,
-                0.0,
-                0.0,
-                0.0,
-            )));
+            // This fixture also supports cache-first tests that later request a root.
+            let output = NNOutput::from_raw(self.policy_logits, 0.0, 0.0, 0.0)
+                .with_ownership_logits([0.0; crate::inference::policy::BOARD_POLICY_SIZE]);
+            outputs.push(Arc::new(output));
         }
         Ok(())
     }
@@ -190,7 +190,7 @@ async fn root_preprocessing_preserves_shared_cached_output() {
     // A second backend evaluation would fail, so the final evaluation must
     // retrieve the original shared output from the cache.
     let mut client = one_shot_inference_client(focused_policy());
-    let cached = client.evaluate(&state).await.unwrap();
+    let cached = client.evaluate(&state, false).await.unwrap();
     let original_policy = *cached.policy_probs();
     let mut worker = worker();
     let mut rng = SmallRng::seed_from_u64(17);
@@ -212,7 +212,7 @@ async fn root_preprocessing_preserves_shared_cached_output() {
         root.nn_output().white_score_mean_sq(),
         cached.white_score_mean_sq()
     );
-    let cached_again = client.evaluate(&state).await.unwrap();
+    let cached_again = client.evaluate(&state, false).await.unwrap();
     assert!(Arc::ptr_eq(&cached, &cached_again));
     assert_eq!(cached_again.policy_probs(), &original_policy);
 }
@@ -252,7 +252,7 @@ async fn choose_move_runs_the_budget_and_preserves_the_callers_position() {
             1
         );
         let before = graph_snapshot(&worker);
-        let (_, weights) = worker.root_selection_weights();
+        let (_, weights) = worker.root_selection_weights().unwrap();
         assert!(weights.iter().any(|&weight| weight > 0.0));
         assert_eq!(graph_snapshot(&worker), before);
     }
@@ -315,7 +315,7 @@ async fn final_lcb_weights_use_edge_sample_size_for_transpositions() {
         }
     }
     let before = graph_snapshot(&worker);
-    let (_, weights) = worker.root_selection_weights();
+    let (_, weights) = worker.root_selection_weights().unwrap();
     // Native KataGo fixture: radius=.632893836585088, LCB gap=.4.
     // The second child is better for Black, despite equal edge weights.
     assert_eq!(weights[0], 25.0);
@@ -362,7 +362,7 @@ async fn final_weights_reduce_overexploration_without_changing_graph_stats() {
         }
     }
     let before = graph_snapshot(&worker);
-    let (moves, weights) = worker.root_selection_weights();
+    let (moves, weights) = worker.root_selection_weights().unwrap();
     assert_eq!(moves, vec![first_move, second_move]);
     // Black prefers the first child. Inverting its PUCT score for the
     // second gives ~3.62 visits; KataGo rounds that reduced weight UP.
@@ -382,12 +382,13 @@ fn new_worker_has_no_active_graph_or_scratch_state() {
 
 #[test]
 fn selection_chooses_the_highest_policy_unexpanded_move() {
-    let worker = worker();
+    let mut worker = worker();
     let game_state = GameState::new(Rules::TROMP_TAYLORISH);
     let expected_move = Loc::new(4, 4).unwrap();
     let mut logits = [0.0; POLICY_SIZE];
     logits[crate::inference::policy::loc_to_policy(expected_move)] = 5.0;
     let output = processed_output(logits, 0.0);
+    worker.search_graph.reset(&game_state, output.clone(), 0.0);
     let node = initialized_node(output, 0.0);
 
     assert_eq!(
@@ -398,10 +399,13 @@ fn selection_chooses_the_highest_policy_unexpanded_move() {
 
 #[test]
 fn selection_orients_child_utility_for_the_player_to_move() {
-    let worker = worker();
+    let mut worker = worker();
     let game_state = GameState::new(Rules::TROMP_TAYLORISH);
     assert_eq!(game_state.next_player(), Player::Black);
     let parent_output = processed_output([0.0; POLICY_SIZE], 0.0);
+    worker
+        .search_graph
+        .reset(&game_state, parent_output.clone(), 0.0);
     let mut parent = initialized_node(parent_output, 0.0);
 
     let white_favored_move = Loc::new(3, 3).unwrap();
@@ -431,7 +435,7 @@ fn selection_orients_child_utility_for_the_player_to_move() {
 
 #[test]
 fn root_selection_forces_an_existing_child_below_its_desired_visits() {
-    let worker = worker();
+    let mut worker = worker();
     let game_state = GameState::new(Rules::TROMP_TAYLORISH);
     let forced_move = Loc::new(3, 3).unwrap();
     let otherwise_best_move = Loc::new(4, 4).unwrap();
@@ -439,6 +443,9 @@ fn root_selection_forces_an_existing_child_below_its_desired_visits() {
     logits[loc_to_policy(forced_move)] = 4.0;
     logits[loc_to_policy(otherwise_best_move)] = 0.0;
     let parent_output = processed_output(logits, 0.0);
+    worker
+        .search_graph
+        .reset(&game_state, parent_output.clone(), 0.0);
     let mut parent = initialized_node(parent_output, 0.0);
     let mut forced_child =
         initialized_node(processed_output([0.0; POLICY_SIZE], 9.0_f32.ln()), 1.0);
@@ -475,7 +482,7 @@ fn root_selection_forces_an_existing_child_below_its_desired_visits() {
 
 #[test]
 fn forced_root_visit_ties_follow_child_insertion_order() {
-    let worker = worker();
+    let mut worker = worker();
     let game_state = GameState::new(Rules::TROMP_TAYLORISH);
     let first_move = Loc::new(4, 4).unwrap();
     let second_move = Loc::new(3, 3).unwrap();
@@ -484,6 +491,9 @@ fn forced_root_visit_ties_follow_child_insertion_order() {
     logits[loc_to_policy(first_move)] = 0.0;
     logits[loc_to_policy(second_move)] = 0.0;
     let mut parent = initialized_node(processed_output(logits, 0.0), 0.0);
+    worker
+        .search_graph
+        .reset(&game_state, processed_output(logits, 0.0), 0.0);
     let mut first_child = initialized_node(processed_output(logits, 0.0), 0.0);
     let mut second_child = initialized_node(processed_output(logits, 0.0), 0.0);
     let first_edge = parent.add_child(first_move, 0.5, NonNull::from(first_child.as_mut()));

@@ -58,6 +58,7 @@ impl InferenceClient {
         }
     }
     /// Return a cached processed output or submit and await a raw evaluation.
+    /// A cached output without ownership cannot satisfy a request that includes it.
     ///
     /// This operation is not cancellation-safe for client reuse once submitted:
     /// dropping the future does not cancel the queued/running request or reset
@@ -66,14 +67,17 @@ impl InferenceClient {
     pub(crate) async fn evaluate(
         &mut self,
         game_state: &GameState,
+        include_ownership: bool,
     ) -> Result<Arc<NNOutput>, InferenceError> {
         //first check cache
         let key = EvaluationKey::new(game_state);
-        if let Some(output) = self.model_handle.lookup(key) {
-            return Ok(output);
-        }
+        let cached = match self.model_handle.lookup(key) {
+            Some(output) if !include_ownership || output.has_ownership() => return Ok(output),
+            cached => cached,
+        };
 
-        let input = NNInput::encode(game_state);
+        let mut input = NNInput::encode(game_state);
+        input.include_ownership = include_ownership;
         let next_player = game_state.next_player();
         let legal_mask = legal_mask(game_state);
 
@@ -86,9 +90,18 @@ impl InferenceClient {
 
         // executor moves its Arc<NNOutput> into the slot so it doesnt retain a copy, cache gets its copy after the mutation
         let mut output = self.slot.wait_for_result().await?;
-        Arc::get_mut(&mut output)
-            .expect("raw NN output must be exclusively owned")
-            .process_in_place(next_player, &legal_mask);
+        assert!(
+            !include_ownership || output.has_ownership(),
+            "backend omitted requested ownership output"
+        );
+        let fresh = Arc::get_mut(&mut output).expect("raw NN output must be exclusively owned");
+        if let Some(cached) = cached {
+            // Preserve the original predictions when only ownership was missing.
+            // Future randomized symmetries may produce different policy/value outputs.
+            fresh.process_with_cached_values_in_place(next_player, &cached);
+        } else {
+            fresh.process_in_place(next_player, &legal_mask);
+        }
 
         self.model_handle.insert(key, output.clone());
 
