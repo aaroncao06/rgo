@@ -51,7 +51,7 @@ fn inference_client_with_policy(fail: bool, policy_logits: [f32; POLICY_SIZE]) -
         16,
         1,
     );
-    InferenceClient::new(model_handle)
+    InferenceClient::new(model_handle, false)
 }
 
 struct OneShotBackend {
@@ -90,7 +90,7 @@ fn one_shot_inference_client(policy_logits: [f32; POLICY_SIZE]) -> InferenceClie
         16,
         1,
     );
-    InferenceClient::new(model_handle)
+    InferenceClient::new(model_handle, false)
 }
 
 fn worker() -> SearchWorker<FixedArenaNodeStore> {

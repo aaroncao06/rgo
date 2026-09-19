@@ -3,3 +3,4 @@ pub(crate) mod inputs;
 pub(crate) mod outputs;
 pub(crate) mod policy;
 pub(crate) mod runtime;
+mod symmetry;

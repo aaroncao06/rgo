@@ -1,4 +1,5 @@
 use super::policy::{BOARD_POLICY_SIZE, loc_to_policy};
+use super::symmetry::Symmetry;
 use crate::game::board::{Color, Loc};
 use crate::game::game_state::GameState;
 
@@ -47,6 +48,10 @@ impl NNInput {
             global,
             include_ownership: false,
         }
+    }
+
+    pub(super) fn apply_symmetry_in_place(&mut self, symmetry: Symmetry) {
+        symmetry.transform_planes(&mut self.spatial);
     }
 }
 

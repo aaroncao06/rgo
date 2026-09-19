@@ -7,7 +7,9 @@ use crate::inference::{
     inputs::NNInput,
     outputs::NNOutput,
     policy::legal_mask,
+    symmetry::Symmetry,
 };
+use rand::{RngExt, SeedableRng, rngs::SmallRng, rngs::SysRng};
 use std::{sync::Arc, thread::JoinHandle};
 
 mod cache;
@@ -31,6 +33,7 @@ pub(crate) struct ModelHandle(Arc<ModelRuntime>);
 pub(crate) struct InferenceClient {
     model_handle: ModelHandle,
     slot: Arc<EvalSlot>,
+    symmetry_rng: Option<SmallRng>,
 }
 
 // pulls from the queue
@@ -51,11 +54,29 @@ impl ModelHandle {
     }
 }
 impl InferenceClient {
-    pub(crate) fn new(model_handle: ModelHandle) -> Self {
+    pub(crate) fn new(model_handle: ModelHandle, randomize_symmetry: bool) -> Self {
+        let symmetry_rng = randomize_symmetry.then(|| {
+            SmallRng::try_from_rng(&mut SysRng)
+                .expect("system RNG unavailable for inference symmetry")
+        });
         Self {
             model_handle,
             slot: Arc::new(EvalSlot::new()),
+            symmetry_rng,
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn with_symmetry_seed(model_handle: ModelHandle, symmetry_seed: u64) -> Self {
+        Self {
+            model_handle,
+            slot: Arc::new(EvalSlot::new()),
+            symmetry_rng: Some(SmallRng::seed_from_u64(symmetry_seed)),
+        }
+    }
+    fn next_symmetry(&mut self) -> Option<Symmetry> {
+        self.symmetry_rng
+            .as_mut()
+            .map(|rng| Symmetry::from_index(rng.random_range(0..Symmetry::ALL.len())))
     }
     /// Return a cached processed output or submit and await a raw evaluation.
     /// A cached output without ownership cannot satisfy a request that includes it.
@@ -69,14 +90,23 @@ impl InferenceClient {
         game_state: &GameState,
         include_ownership: bool,
     ) -> Result<Arc<NNOutput>, InferenceError> {
-        //first check cache
+        // Randomized and non-randomized clients intentionally share this cache.
+        // Every entry is restored to canonical coordinates before insertion, so
+        // either kind of evaluation is a valid prediction for the same position;
+        // sharing avoids splitting the cache merely for exact reproducibility.
         let key = EvaluationKey::new(game_state);
         let cached = match self.model_handle.lookup(key) {
             Some(output) if !include_ownership || output.has_ownership() => return Ok(output),
             cached => cached,
         };
 
+        // Match KataGo's cache boundary: randomize only cache misses, restore
+        // outputs to canonical coordinates, then cache under the original state.
+        let symmetry = self.next_symmetry();
         let mut input = NNInput::encode(game_state);
+        if let Some(symmetry) = symmetry {
+            input.apply_symmetry_in_place(symmetry);
+        }
         input.include_ownership = include_ownership;
         let next_player = game_state.next_player();
         let legal_mask = legal_mask(game_state);
@@ -95,6 +125,9 @@ impl InferenceClient {
             "backend omitted requested ownership output"
         );
         let fresh = Arc::get_mut(&mut output).expect("raw NN output must be exclusively owned");
+        if let Some(symmetry) = symmetry {
+            fresh.restore_symmetry_in_place(symmetry);
+        }
         if let Some(cached) = cached {
             // Preserve the original predictions when only ownership was missing.
             // Future randomized symmetries may produce different policy/value outputs.

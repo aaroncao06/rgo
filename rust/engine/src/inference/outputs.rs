@@ -1,5 +1,6 @@
 use crate::game::board::Player;
 use crate::inference::policy::{BOARD_POLICY_SIZE, POLICY_SIZE};
+use crate::inference::symmetry::Symmetry;
 
 const SCORE_MULTIPLIER: f32 = 20.0;
 
@@ -118,6 +119,17 @@ impl NNOutput {
         );
         self.ownership = Some(Box::new(logits));
         self
+    }
+    pub(super) fn restore_symmetry_in_place(&mut self, symmetry: Symmetry) {
+        debug_assert!(!self.processed);
+        let spatial_policy = self
+            .policy
+            .first_chunk_mut::<BOARD_POLICY_SIZE>()
+            .expect("policy contains a full board plane");
+        symmetry.restore_output(spatial_policy);
+        if let Some(ownership) = self.ownership.as_mut() {
+            symmetry.restore_output(ownership);
+        }
     }
     pub(crate) fn has_ownership(&self) -> bool {
         self.ownership.is_some()
