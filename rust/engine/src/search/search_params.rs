@@ -30,6 +30,20 @@ pub(super) struct SearchParams {
     pub(super) min_visit_prop_for_lcb: f64,
 }
 
+// KataGo's canonical config also averages four root symmetries. We defer that
+// deliberately: randomized inference already samples orientations across
+// self-play, while root averaging bypasses the cache and costs three extra root
+// evaluations per move. Revisit it after measuring orientation bias and
+// end-to-end inference throughput rather than assuming the tradeoff is useful.
+
+// KataGo's canonical config also applies subtree-value bias. We defer it
+// deliberately: it transfers search-discovered value errors between nodes
+// using a handcrafted, transition-based 5x5 Go pattern. Matching local
+// patterns need not have matching errors in different global positions, and
+// graph transpositions make the first incoming transition arbitrarily choose
+// the shared node's correction context. Revisit it only after measuring an
+// isolated benefit that justifies this complexity and path dependence.
+
 impl SearchParams {
     /// Values from KataGo's shipped `selfplay8mainb18.cfg`, including defaults
     /// from `Setup::loadParams` for fields omitted by that file.
