@@ -2,6 +2,7 @@
 //! Neither heuristic changes game legality, neural policy, or backed-up values.
 
 use super::*;
+use crate::search::utility::score_utility_diff;
 
 impl SearchRoot {
     pub(super) fn is_allowed_move(&self, loc: Loc, params: SearchParams) -> bool {

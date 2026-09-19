@@ -8,7 +8,7 @@ const REPETITION_BOUND: usize = 11;
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct GraphKey(Hash128);
+pub(super) struct GraphKey(Hash128);
 
 fn mix(previous: Hash128, state: Hash128) -> Hash128 {
     let prev0 = previous as u64;
@@ -26,10 +26,10 @@ fn mix(previous: Hash128, state: Hash128) -> Hash128 {
 }
 
 impl GraphKey {
-    pub(crate) fn new(game_state: &GameState) -> Self {
+    pub(super) fn new(game_state: &GameState) -> Self {
         Self(game_state.current_state_hash())
     }
-    pub(crate) fn advance(&mut self, game_state: &GameState, last_move: Loc) {
+    pub(super) fn advance(&mut self, game_state: &GameState, last_move: Loc) {
         let state_key = game_state.current_state_hash();
         self.0 = if last_move != Loc::NULL
             && game_state
@@ -41,12 +41,12 @@ impl GraphKey {
             state_key
         };
     }
-    pub(crate) fn raw(&self) -> Hash128 {
+    pub(super) fn raw(&self) -> Hash128 {
         self.0
     }
 
     #[cfg(test)]
-    pub(crate) const fn from_raw(raw: Hash128) -> Self {
+    pub(super) const fn from_raw(raw: Hash128) -> Self {
         Self(raw)
     }
 }

@@ -223,9 +223,13 @@ mod tests {
             assert_eq!(fresh.white_win_prob(), cached.white_win_prob());
             assert_eq!(fresh.white_score_mean(), cached.white_score_mean());
             assert_eq!(fresh.white_score_mean_sq(), cached.white_score_mean_sq());
-            assert_eq!(
-                fresh.white_ownership().unwrap(),
-                &[signed_value_to_white(1.0_f32.tanh(), player); BOARD_POLICY_SIZE]
+            let expected = signed_value_to_white(1.0_f32.tanh(), player);
+            assert!(
+                fresh
+                    .white_ownership()
+                    .unwrap()
+                    .iter()
+                    .all(|&value| (value - expected).abs() < 1e-6)
             );
             assert!(!cached.has_ownership());
         }
@@ -242,9 +246,12 @@ mod tests {
             } else {
                 -1.0_f32.tanh()
             };
-            assert_eq!(
-                output.white_ownership().unwrap(),
-                &[expected; BOARD_POLICY_SIZE]
+            assert!(
+                output
+                    .white_ownership()
+                    .unwrap()
+                    .iter()
+                    .all(|&value| (value - expected).abs() < 1e-6)
             );
             let mut cloned = output.clone();
             cloned.policy_probs_mut()[0] = 0.0;

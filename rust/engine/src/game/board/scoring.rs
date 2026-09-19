@@ -49,7 +49,10 @@ impl Board {
         })
     }
 
-    pub(crate) fn calculate_area(&self, multi_stone_suicide_legal: bool) -> [Color; ARRAY_LEN] {
+    pub(in crate::game) fn calculate_area(
+        &self,
+        multi_stone_suicide_legal: bool,
+    ) -> [Color; ARRAY_LEN] {
         let mut result = [Color::Empty; ARRAY_LEN];
         self.calculate_area_for_player(
             Player::Black,

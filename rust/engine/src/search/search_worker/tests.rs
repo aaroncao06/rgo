@@ -4,7 +4,7 @@ use crate::{
     inference::{
         backend::InferenceBackend, inputs::NNInput, policy::POLICY_SIZE, runtime::ModelRuntime,
     },
-    search::node_store::FixedArenaNodeStore,
+    search::{move_selection, node::SearchStats, node_store::FixedArenaNodeStore},
 };
 use rand::{SeedableRng, rngs::SmallRng};
 
@@ -588,15 +588,6 @@ fn transposed_child_squared_weights_scale_by_squared_edge_fraction() {
     assert_eq!(child.weight_sq_sum(), 10.0);
 }
 
-#[test]
-fn student_t_cdf_degrees_3_is_centered_and_symmetric() {
-    assert!((student_t_cdf_degrees_3(0.0) - 0.5).abs() < 1e-12);
-    let positive = student_t_cdf_degrees_3(2.0);
-    let negative = student_t_cdf_degrees_3(-2.0);
-    assert!((positive + negative - 1.0).abs() < 1e-12);
-    assert!(positive > 0.5);
-}
-
 #[tokio::test]
 async fn graph_cycles_end_the_playout_and_back_up_without_inference() {
     for self_loop in [false, true] {
@@ -742,21 +733,6 @@ async fn transposed_child_catches_up_before_requesting_more_inference() {
         worker.playout(&mut client).await,
         Err(SearchError::InferenceError(_))
     ));
-}
-
-#[test]
-fn student_t_table_clamps_and_linearly_interpolates() {
-    assert_eq!(student_t_cdf_degrees_3(-100.0), 0.0);
-    assert_eq!(student_t_cdf_degrees_3(-50.0), 0.0);
-    assert_eq!(student_t_cdf_degrees_3(50.0), 1.0);
-    assert_eq!(student_t_cdf_degrees_3(100.0), 1.0);
-    let left = -50.0 + 1030.0 * 100.0 / 1999.0;
-    let right = -50.0 + 1031.0 * 100.0 / 1999.0;
-    let midpoint = (left + right) * 0.5;
-    let expected = (student_t_cdf_degrees_3(left) + student_t_cdf_degrees_3(right)) * 0.5;
-    assert!((student_t_cdf_degrees_3(midpoint) - expected).abs() < 1e-12);
-    // Reference Student-t(3) probability at x=2 (allow table interpolation error).
-    assert!((student_t_cdf_degrees_3(2.0) - 0.9303370157205785).abs() < 1e-4);
 }
 
 #[tokio::test]

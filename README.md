@@ -38,6 +38,20 @@ initialization; there is no separate Miri table-generation path.
 | `rust/engine/src/inference/runtime.rs` | Model lifetime, client evaluation, and executor loop |
 | `rust/engine/src/inference/runtime/{cache,queue}.rs` | Model cache and request/batch synchronization |
 | `rust/engine/src/search/` | Worker, graph identity/storage, search statistics, utility, and selection formulas |
+| `rust/engine/src/search/search_worker.rs` | Graph lifecycle, playout execution, and reverse backup walk |
+| `rust/engine/src/search/search_worker/selection_policy.rs` | Complete descent policy: child scanning, PUCT, FPU, exploration scaling, and forced visits |
+| `rust/engine/src/search/search_worker/backup_policy.rs` | Complete parent-estimate policy: transposition contributions, value weighting, and moment aggregation |
+| `rust/engine/src/search/search_worker/root_policy.rs` | Root preprocessing and final selection: weights, reduced-weight/LCB adjustments, fallback, and temperature sampling |
+| `rust/engine/src/search/search_worker/root_endgame.rs` | Root ending-score bonus and useless-move pruning |
+
+The worker executes searches; private policy modules decide which child to
+explore, how to estimate a parent's value, and which move to play. Each policy
+keeps its implementation together, including its loops and bookkeeping. The
+reverse path walk stays in the worker and delegates parent recomputation to the
+backup policy. Modules use the existing worker and scratch storage, with no new
+runtime objects or dynamic dispatch. Shared numerical helpers stay in
+`search/{move_selection,root_policy,utility}.rs`. More fundamental algorithm
+changes may still require changes to the core mechanics.
 
 Large test suites live in child `tests.rs` modules; shorter suites remain inline.
 Python model/trainer directories are placeholders with no implementation yet.

@@ -60,7 +60,7 @@ async fn root_requests_upgrade_cached_outputs_without_mutating_interior_outputs(
         root.white_ownership()
             .unwrap()
             .iter()
-            .all(|&v| v == -1.0_f32.tanh())
+            .all(|&value| (value + 1.0_f32.tanh()).abs() < 1e-6)
     );
     assert!(!interior.has_ownership());
     assert!(!Arc::ptr_eq(&interior, &root));

@@ -12,7 +12,7 @@ use crate::{game::board::BOARD_SIZE, search::search_params::SearchParams};
 
 static EXPECTED_SCORE_VALUE_TABLE: OnceLock<Box<[f64]>> = OnceLock::new();
 
-pub(crate) fn white_utility(
+pub(super) fn white_utility(
     white_win_probability: f64,
     white_score_mean: f64,
     white_score_mean_sq: f64,
@@ -39,7 +39,7 @@ pub(crate) fn white_utility(
         + dynamic_score_value * params.dynamic_score_utility_factor
 }
 
-pub(crate) fn recent_score_center(expected_score: f64, params: SearchParams) -> f64 {
+pub(super) fn recent_score_center(expected_score: f64, params: SearchParams) -> f64 {
     let mut center = expected_score * (1.0 - params.dynamic_score_center_zero_weight);
     let cap = BOARD_SIZE as f64 * params.dynamic_score_center_scale;
     center = center.clamp(expected_score - cap, expected_score + cap);
@@ -48,7 +48,7 @@ pub(crate) fn recent_score_center(expected_score: f64, params: SearchParams) -> 
 
 /// Shift the score mean without changing its uncertainty. Root ending bonuses
 /// are selection-only adjustments, not additional samples or training targets.
-pub(crate) fn score_utility_diff(
+pub(super) fn score_utility_diff(
     mean: f64,
     mean_sq: f64,
     delta: f64,

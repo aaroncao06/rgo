@@ -94,15 +94,15 @@ impl Zobrist {
     }
 }
 
-pub(crate) fn stone_hash(loc: Loc, color: Color) -> Hash128 {
+pub(super) fn stone_hash(loc: Loc, color: Color) -> Hash128 {
     ZOBRIST.stone_hashes[loc.index()][color as usize]
 }
 
-pub(crate) fn player_hash(player: Player) -> Hash128 {
+pub(super) fn player_hash(player: Player) -> Hash128 {
     ZOBRIST.player_hashes[player as usize]
 }
 
-pub(crate) fn superko_hash(loc: Loc) -> Hash128 {
+pub(super) fn superko_hash(loc: Loc) -> Hash128 {
     ZOBRIST.superko_hashes[loc.index()]
 }
 
@@ -119,6 +119,6 @@ pub(crate) fn komi_hash(komi: f32) -> Hash128 {
     scalar_hash(KOMI_HASH_SEED, komi.to_bits() as u64)
 }
 
-pub(crate) fn pass_hash(count: u8) -> Hash128 {
+pub(super) fn pass_hash(count: u8) -> Hash128 {
     scalar_hash(PASS_HASH_SEED, count as u64)
 }

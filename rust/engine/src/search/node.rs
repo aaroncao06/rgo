@@ -1,6 +1,6 @@
 use crate::{game::board::Loc, inference::outputs::NNOutput};
 use std::{ptr::NonNull, sync::Arc};
-pub(crate) struct SearchNode {
+pub(super) struct SearchNode {
     nn_output: Option<Arc<NNOutput>>,
     stats: SearchStats,
     children: ChildStorage,
@@ -8,15 +8,15 @@ pub(crate) struct SearchNode {
 
 /// Accumulated weighted values and visit counts for a search node.
 #[derive(Debug, Default)]
-pub(crate) struct SearchStats {
-    pub(crate) visits: i32,
-    pub(crate) white_win_sum: f64, //higher precision
-    pub(crate) white_score_sum: f64,
-    pub(crate) white_score_mean_sq_sum: f64,
-    pub(crate) white_utility_sum: f64,
-    pub(crate) white_utility_sq_sum: f64,
-    pub(crate) weight_sum: f64,
-    pub(crate) weight_sq_sum: f64,
+pub(super) struct SearchStats {
+    pub(super) visits: i32,
+    pub(super) white_win_sum: f64, //higher precision
+    pub(super) white_score_sum: f64,
+    pub(super) white_score_mean_sq_sum: f64,
+    pub(super) white_utility_sum: f64,
+    pub(super) white_utility_sq_sum: f64,
+    pub(super) weight_sum: f64,
+    pub(super) weight_sq_sum: f64,
 }
 
 struct ChildStorage(Vec<Edge>); //naive first version, postpone staged storage opt
@@ -25,9 +25,9 @@ struct ChildStorage(Vec<Edge>); //naive first version, postpone staged storage o
 /// ChildStorage change from a flat Vec to staged or split storage without
 /// exposing that representation to traversal and backup code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct EdgeIndex(usize);
+pub(super) struct EdgeIndex(usize);
 
-pub(crate) struct Edge {
+pub(super) struct Edge {
     move_loc: Loc,
     visits: i32,       // used for graph search
     policy_prior: f32, //initial policy prob
@@ -35,45 +35,45 @@ pub(crate) struct Edge {
 }
 
 impl Edge {
-    pub(crate) fn move_loc(&self) -> Loc {
+    pub(super) fn move_loc(&self) -> Loc {
         self.move_loc
     }
-    pub(crate) fn visits(&self) -> i32 {
+    pub(super) fn visits(&self) -> i32 {
         self.visits
     }
-    pub(crate) fn policy_prior(&self) -> f32 {
+    pub(super) fn policy_prior(&self) -> f32 {
         self.policy_prior
     }
-    pub(crate) fn child(&self) -> NonNull<SearchNode> {
+    pub(super) fn child(&self) -> NonNull<SearchNode> {
         self.child
     }
     /// # Safety
     /// The child pointer must reference a live, initialized node that is not
     /// mutably borrowed for the duration of this call.
-    pub(crate) unsafe fn child_weight(&self) -> f64 {
+    pub(super) unsafe fn child_weight(&self) -> f64 {
         // how much of the child's weight belongs to this edge
         let child = unsafe { self.child.as_ref() };
         child.weight_sum() * f64::from(self.visits) / f64::from(child.visits().max(1))
     }
-    pub(crate) fn record_visit(&mut self) {
+    pub(super) fn record_visit(&mut self) {
         self.visits += 1;
     }
 }
 
 impl SearchNode {
-    pub(crate) fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             nn_output: None,
             stats: SearchStats::default(),
             children: ChildStorage::new(),
         }
     }
-    pub(crate) fn attach_nn_output(&mut self, output: Arc<NNOutput>) {
+    pub(super) fn attach_nn_output(&mut self, output: Arc<NNOutput>) {
         debug_assert!(self.nn_output.is_none(), "only populate empty nodes");
         debug_assert!(output.is_processed());
         self.nn_output = Some(output);
     }
-    pub(crate) fn record_visit(
+    pub(super) fn record_visit(
         &mut self,
         white_win: f64,
         white_score: f64,
@@ -89,14 +89,14 @@ impl SearchNode {
         self.stats.weight_sum += 1.0;
         self.stats.weight_sq_sum += 1.0;
     }
-    pub(crate) fn repeat_visit(&mut self) {
+    pub(super) fn repeat_visit(&mut self) {
         let white_win = self.white_win_rate();
         let white_score = self.white_score_mean();
         let white_score_mean_sq = self.white_score_mean_sq();
         let white_utility = self.white_utility();
         self.record_visit(white_win, white_score, white_score_mean_sq, white_utility);
     }
-    pub(crate) fn policy_probs(&self) -> &[f32; crate::inference::policy::POLICY_SIZE] {
+    pub(super) fn policy_probs(&self) -> &[f32; crate::inference::policy::POLICY_SIZE] {
         self.nn_output
             .as_ref()
             .expect("search nodes must be evaluated before traversal")
@@ -105,7 +105,7 @@ impl SearchNode {
     /// Prepare the root policy before creating children. Clones the inference
     /// output if it is shared, so cached outputs remain unchanged. Existing
     /// edges retain their own priors and would not reflect later policy edits.
-    pub(crate) fn policy_probs_mut(&mut self) -> &mut [f32; crate::inference::policy::POLICY_SIZE] {
+    pub(super) fn policy_probs_mut(&mut self) -> &mut [f32; crate::inference::policy::POLICY_SIZE] {
         std::sync::Arc::make_mut(
             self.nn_output
                 .as_mut()
@@ -113,78 +113,78 @@ impl SearchNode {
         )
         .policy_probs_mut()
     }
-    pub(crate) fn nn_output(&self) -> &NNOutput {
+    pub(super) fn nn_output(&self) -> &NNOutput {
         self.nn_output
             .as_deref()
             .expect("search nodes must be evaluated before traversal")
     }
-    pub(crate) fn edge_visit_sum(&self) -> i32 {
+    pub(super) fn edge_visit_sum(&self) -> i32 {
         self.children.iter().map(|edge| edge.visits).sum()
     }
     /// # Safety
     /// Every child must satisfy `Edge::child_weight`'s safety requirements.
-    pub(crate) unsafe fn child_weight_sum(&self) -> f64 {
+    pub(super) unsafe fn child_weight_sum(&self) -> f64 {
         self.children
             .iter()
             .map(|edge| unsafe { edge.child_weight() })
             .sum()
     }
-    pub(crate) fn edges(&self) -> impl Iterator<Item = &Edge> {
+    pub(super) fn edges(&self) -> impl Iterator<Item = &Edge> {
         self.children.iter()
     }
-    pub(crate) fn indexed_edges(&self) -> impl Iterator<Item = (EdgeIndex, &Edge)> {
+    pub(super) fn indexed_edges(&self) -> impl Iterator<Item = (EdgeIndex, &Edge)> {
         self.children.indexed_iter()
     }
-    pub(crate) fn edge(&self, edge_index: EdgeIndex) -> &Edge {
+    pub(super) fn edge(&self, edge_index: EdgeIndex) -> &Edge {
         self.children.get(edge_index)
     }
-    pub(crate) fn visited_policy_mass(&self) -> f64 {
+    pub(super) fn visited_policy_mass(&self) -> f64 {
         self.children
             .iter()
             .map(|edge| f64::from(edge.policy_prior))
             .sum()
     }
-    pub(crate) fn edge_for_move(&self, move_loc: Loc) -> Option<(EdgeIndex, &Edge)> {
+    pub(super) fn edge_for_move(&self, move_loc: Loc) -> Option<(EdgeIndex, &Edge)> {
         self.children.edge_for_move(move_loc)
     }
-    pub(crate) fn edge_mut(&mut self, edge_index: EdgeIndex) -> &mut Edge {
+    pub(super) fn edge_mut(&mut self, edge_index: EdgeIndex) -> &mut Edge {
         self.children.get_mut(edge_index)
     }
-    pub(crate) fn visits(&self) -> i32 {
+    pub(super) fn visits(&self) -> i32 {
         self.stats.visits
     }
-    pub(crate) fn white_win_rate(&self) -> f64 {
+    pub(super) fn white_win_rate(&self) -> f64 {
         debug_assert!(self.stats.weight_sum > 0.0);
         self.stats.white_win_sum / self.stats.weight_sum
     }
-    pub(crate) fn white_score_mean(&self) -> f64 {
+    pub(super) fn white_score_mean(&self) -> f64 {
         debug_assert!(self.stats.weight_sum > 0.0);
         self.stats.white_score_sum / self.stats.weight_sum
     }
-    pub(crate) fn white_score_mean_sq(&self) -> f64 {
+    pub(super) fn white_score_mean_sq(&self) -> f64 {
         debug_assert!(self.stats.weight_sum > 0.0);
         self.stats.white_score_mean_sq_sum / self.stats.weight_sum
     }
-    pub(crate) fn white_utility(&self) -> f64 {
+    pub(super) fn white_utility(&self) -> f64 {
         debug_assert!(self.stats.weight_sum > 0.0);
         self.stats.white_utility_sum / self.stats.weight_sum
     }
-    pub(crate) fn white_utility_mean_sq(&self) -> f64 {
+    pub(super) fn white_utility_mean_sq(&self) -> f64 {
         debug_assert!(self.stats.weight_sum > 0.0);
         self.stats.white_utility_sq_sum / self.stats.weight_sum
     }
-    pub(crate) fn weight_sum(&self) -> f64 {
+    pub(super) fn weight_sum(&self) -> f64 {
         self.stats.weight_sum
     }
-    pub(crate) fn weight_sq_sum(&self) -> f64 {
+    pub(super) fn weight_sq_sum(&self) -> f64 {
         self.stats.weight_sq_sum
     }
-    pub(crate) fn replace_stats(&mut self, stats: SearchStats) {
+    pub(super) fn replace_stats(&mut self, stats: SearchStats) {
         debug_assert!(stats.visits > 0);
         debug_assert!(stats.weight_sum > 0.0);
         self.stats = stats;
     }
-    pub(crate) fn add_child(
+    pub(super) fn add_child(
         &mut self,
         move_loc: Loc,
         policy_prior: f32,
