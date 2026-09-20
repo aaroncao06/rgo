@@ -10,7 +10,7 @@ use crate::{
     search::{
         node::{EdgeIndex, SearchNode},
         node_store::NodeStore,
-        search_params::SearchParams,
+        params::SearchParams,
         utility::white_utility,
     },
 };

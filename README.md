@@ -38,11 +38,11 @@ initialization; there is no separate Miri table-generation path.
 | `rust/engine/src/inference/runtime.rs` | Model lifetime, client evaluation, and executor loop |
 | `rust/engine/src/inference/runtime/{cache,queue}.rs` | Model cache and request/batch synchronization |
 | `rust/engine/src/search/` | Worker, graph identity/storage, search statistics, utility, and selection formulas |
-| `rust/engine/src/search/search_worker.rs` | Graph lifecycle, playout execution, and reverse backup walk |
-| `rust/engine/src/search/search_worker/selection_policy.rs` | Complete descent policy: child scanning, PUCT, FPU, exploration scaling, and forced visits |
-| `rust/engine/src/search/search_worker/backup_policy.rs` | Complete parent-estimate policy: transposition contributions, value weighting, and moment aggregation |
-| `rust/engine/src/search/search_worker/root_policy.rs` | Root preprocessing and final selection: weights, reduced-weight/LCB adjustments, fallback, and temperature sampling |
-| `rust/engine/src/search/search_worker/root_endgame.rs` | Root ending-score bonus and useless-move pruning |
+| `rust/engine/src/search/worker.rs` | Graph lifecycle, playout execution, and reverse backup walk |
+| `rust/engine/src/search/worker/selection_policy.rs` | Complete descent policy: child scanning, PUCT, FPU, exploration scaling, and forced visits |
+| `rust/engine/src/search/worker/backup_policy.rs` | Complete parent-estimate policy: transposition contributions, value weighting, and moment aggregation |
+| `rust/engine/src/search/worker/root_policy.rs` | Root preprocessing and final selection: weights, reduced-weight/LCB adjustments, fallback, and temperature sampling |
+| `rust/engine/src/search/worker/root_endgame.rs` | Root ending-score bonus and useless-move pruning |
 
 The worker executes searches; private policy modules decide which child to
 explore, how to estimate a parent's value, and which move to play. Each policy

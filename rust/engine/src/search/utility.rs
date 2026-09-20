@@ -8,7 +8,7 @@ use score_value_table::{
     TABLE_ASSUMED_BOARD_SIZE, TABLE_MEAN_LEN, TABLE_MEAN_RADIUS, TABLE_STDEV_LEN,
 };
 
-use crate::{game::board::BOARD_SIZE, search::search_params::SearchParams};
+use crate::{game::board::BOARD_SIZE, search::params::SearchParams};
 
 static EXPECTED_SCORE_VALUE_TABLE: OnceLock<Box<[f64]>> = OnceLock::new();
 

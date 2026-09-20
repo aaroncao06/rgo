@@ -16,7 +16,7 @@ use crate::{
         graph_key::GraphKey,
         node::{EdgeIndex, SearchNode},
         node_store::{InsertError, NodeStore},
-        search_params::SearchParams,
+        params::SearchParams,
         utility::{recent_score_center, white_utility},
     },
 };
@@ -103,23 +103,23 @@ struct PlayoutStep {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct SearchResult {
-    pub(super) selected_move: Loc,
-    pub(super) policy_target: [f32; crate::inference::policy::POLICY_SIZE],
-    pub(super) value_target: SearchValueTarget,
+pub(crate) struct SearchResult {
+    pub(crate) selected_move: Loc,
+    pub(crate) policy_target: [f32; crate::inference::policy::POLICY_SIZE],
+    pub(crate) value_target: SearchValueTarget,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct SearchValueTarget {
+pub(crate) struct SearchValueTarget {
     /// Probability that the player to move wins.
-    pub(super) win_probability: f32,
+    pub(crate) win_probability: f32,
     /// Expected final score from the player-to-move perspective, in points.
-    pub(super) score_mean: f32,
+    pub(crate) score_mean: f32,
     /// Standard deviation of the final score; unchanged by perspective.
-    pub(super) score_stdev: f32,
+    pub(crate) score_stdev: f32,
 }
 
-struct SearchWorker<N: NodeStore> {
+pub(crate) struct SearchWorker<N: NodeStore> {
     // The worker reuses its graph storage and scratch buffers across moves.
     search_graph: SearchGraph<N>,
     playout_path: Vec<PlayoutStep>, // scratch work to avoid reallocating
@@ -131,7 +131,7 @@ struct SearchWorker<N: NodeStore> {
 }
 
 #[derive(Debug)]
-enum SearchError {
+pub(crate) enum SearchError {
     NodeStore(InsertError),
     InferenceError(InferenceError),
     NoSelectableMove,
@@ -150,7 +150,7 @@ impl From<InsertError> for SearchError {
 }
 
 impl<N: NodeStore> SearchWorker<N> {
-    fn new(node_store: N, params: SearchParams) -> Self {
+    pub(crate) fn new(node_store: N, params: SearchParams) -> Self {
         Self {
             search_graph: SearchGraph::new(node_store),
             playout_path: Vec::new(),
@@ -221,7 +221,7 @@ impl<N: NodeStore> SearchWorker<N> {
         }
         Ok(())
     }
-    async fn search<R: Rng + ?Sized>(
+    pub(crate) async fn search<R: Rng + ?Sized>(
         &mut self,
         game_state: &GameState,
         budget: usize,

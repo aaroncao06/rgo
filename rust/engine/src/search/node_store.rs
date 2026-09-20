@@ -5,7 +5,7 @@ use crate::search::{graph_key::GraphKey, node::SearchNode};
 const EMPTY_INDEX: u32 = u32::MAX; //max index is empty_index-1
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum InsertError {
+pub(crate) enum InsertError {
     KeyAlreadyExists,
     StoreFull,
 }
@@ -19,7 +19,7 @@ pub(super) enum InsertError {
 /// valid, initialized node and remain at the same address until `clear` is
 /// called or the store is dropped. Inserting or looking up other nodes must not
 /// move or invalidate any previously returned node.
-pub(super) unsafe trait NodeStore {
+pub(crate) unsafe trait NodeStore {
     fn find(&mut self, key: GraphKey) -> Option<NonNull<SearchNode>>;
     fn insert(&mut self, key: GraphKey) -> Result<NonNull<SearchNode>, InsertError>;
     fn len(&self) -> usize;
@@ -32,13 +32,13 @@ struct NodeEntry {
     next_in_bucket: u32,
     node: SearchNode,
 }
-pub(super) struct FixedArenaNodeStore {
+pub(crate) struct FixedArenaNodeStore {
     entries: Vec<NodeEntry>,
     bucket_heads: Box<[u32]>, //basically hash -> index of head of linked list of node entries
     node_capacity: usize,
 }
 impl FixedArenaNodeStore {
-    pub(super) fn new(node_capacity: usize) -> Self {
+    pub(crate) fn new(node_capacity: usize) -> Self {
         assert!(
             node_capacity > 0 && node_capacity <= u32::MAX as usize,
             "node capacity out of bounds"
