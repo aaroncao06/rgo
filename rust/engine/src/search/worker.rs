@@ -54,8 +54,9 @@ impl<N: NodeStore> SearchGraph<N> {
         root_game_state: &GameState,
         root_output: Arc<NNOutput>,
         root_utility: f64,
+        node_capacity: usize,
     ) {
-        self.node_store.clear();
+        self.node_store.reset_with_capacity(node_capacity);
         let key = GraphKey::new(root_game_state);
         let node = Self::initialized_root(root_output, root_utility);
         let safe_area = root_game_state
@@ -119,6 +120,28 @@ pub(crate) struct SearchValueTarget {
     pub(crate) score_stdev: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SearchBudget {
+    /// Maximum number of non-root graph nodes created by this search.
+    pub(crate) max_nodes: usize,
+    /// Safety bound for playouts that finish without creating a node.
+    pub(crate) max_playouts: usize,
+}
+
+impl SearchBudget {
+    pub(crate) const fn new(max_nodes: usize, max_playouts: usize) -> Self {
+        // max nodes being fewer than playouts means wasted memory
+        assert!(
+            max_playouts >= max_nodes,
+            "playout safety limit must cover the node budget"
+        );
+        Self {
+            max_nodes,
+            max_playouts,
+        }
+    }
+}
+
 pub(crate) struct SearchWorker<N: NodeStore> {
     // The worker reuses its graph storage and scratch buffers across moves.
     search_graph: SearchGraph<N>,
@@ -177,11 +200,18 @@ impl<N: NodeStore> SearchWorker<N> {
         inference_client: &mut InferenceClient,
     ) -> Result<(), SearchError> {
         // just so that cross game graph reuse is not allowed
-        self.reset_graph(root_game_state, inference_client).await
+        // keep capacity the same for now, reallocations only happen when we know the target budget
+        self.reset_graph(
+            root_game_state,
+            self.search_graph.node_store.capacity(),
+            inference_client,
+        )
+        .await
     }
     async fn reset_graph(
         &mut self,
         root_game_state: &GameState,
+        node_capacity: usize,
         inference_client: &mut InferenceClient,
     ) -> Result<(), SearchError> {
         // full reset, in the future can have a version where you retain subgraph between moves
@@ -204,7 +234,7 @@ impl<N: NodeStore> SearchWorker<N> {
             None => self.scratch_game_state = Some(root_game_state.clone()),
         }
         self.search_graph
-            .reset(root_game_state, root_output, root_utility);
+            .reset(root_game_state, root_output, root_utility, node_capacity);
         self.recent_score_center = score_center;
         self.playout_path.clear();
         self.visited_nodes.clear();
@@ -212,24 +242,29 @@ impl<N: NodeStore> SearchWorker<N> {
     }
     async fn run_playouts(
         &mut self,
-        budget: usize,
+        budget: SearchBudget,
         inference_client: &mut InferenceClient,
     ) -> Result<(), SearchError> {
-        for _ in 0..budget {
+        let mut completed_playouts = 0;
+        while self.search_graph.node_store.len() < budget.max_nodes
+            && completed_playouts < budget.max_playouts
+        {
             // Backends handle retryable failures; search propagates remaining errors.
             self.playout(inference_client).await?;
+            completed_playouts += 1;
         }
         Ok(())
     }
     pub(crate) async fn search<R: Rng + ?Sized>(
         &mut self,
         game_state: &GameState,
-        budget: usize,
+        budget: SearchBudget,
         inference_client: &mut InferenceClient,
         rng: &mut R,
     ) -> Result<SearchResult, SearchError> {
         // Run a complete self-play search without retaining the graph between moves.
-        self.reset_graph(game_state, inference_client).await?;
+        self.reset_graph(game_state, budget.max_nodes, inference_client)
+            .await?;
         self.apply_root_policy_temperature_and_noise(game_state, rng);
         self.run_playouts(budget, inference_client).await?;
 

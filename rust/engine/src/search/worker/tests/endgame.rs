@@ -14,7 +14,7 @@ fn root_worker(
     let mut output = NNOutput::from_raw([0.0; POLICY_SIZE], 0.0, 0.0, -20.0)
         .with_ownership_logits(ownership.map(|v| v.clamp(-0.999999, 0.999999).atanh()));
     output.process_in_place(Player::White, &[true; POLICY_SIZE]);
-    worker.search_graph.reset(state, Arc::new(output), 0.0);
+    worker.search_graph.reset(state, Arc::new(output), 0.0, 16);
     worker
 }
 
@@ -63,6 +63,7 @@ fn ending_bonus_thresholds_perspectives_and_disabled_cases() {
         &GameState::new(Rules::TROMP_TAYLORISH),
         processed_output([0.0; POLICY_SIZE], 0.0),
         0.0,
+        16,
     );
     assert_eq!(bonus(&worker, loc(4, 4)), 0.0); // Missing map, like KataGo's helper.
 }
@@ -269,7 +270,7 @@ async fn search_prunes_pass_alive_eyes_with_and_without_playouts() {
         let mut client = inference_client_with_policy(false, logits);
         let mut rng = SmallRng::seed_from_u64(123);
         let chosen = worker
-            .search(&state, budget, &mut client, &mut rng)
+            .search(&state, node_budget(budget), &mut client, &mut rng)
             .await
             .unwrap()
             .selected_move;
@@ -296,7 +297,9 @@ async fn zero_budget_with_all_policy_mass_pruned_returns_an_error() {
     let mut client = inference_client_with_policy(false, logits);
     let mut rng = SmallRng::seed_from_u64(123);
     assert!(matches!(
-        worker.search(&state, 0, &mut client, &mut rng).await,
+        worker
+            .search(&state, node_budget(0), &mut client, &mut rng)
+            .await,
         Err(SearchError::NoSelectableMove)
     ));
 }

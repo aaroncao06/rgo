@@ -18,13 +18,15 @@ pub(crate) enum InsertError {
 /// Every `NonNull<SearchNode>` returned by an implementation must point to a
 /// valid, initialized node and remain at the same address until `clear` is
 /// called or the store is dropped. Inserting or looking up other nodes must not
-/// move or invalidate any previously returned node.
+/// move or invalidate any previously returned node. `clear` and
+/// `reset_with_capacity` invalidate every previously returned pointer.
 pub(crate) unsafe trait NodeStore {
     fn find(&mut self, key: GraphKey) -> Option<NonNull<SearchNode>>;
     fn insert(&mut self, key: GraphKey) -> Result<NonNull<SearchNode>, InsertError>;
     fn len(&self) -> usize;
     fn capacity(&self) -> usize;
     fn clear(&mut self);
+    fn reset_with_capacity(&mut self, node_capacity: usize);
 }
 
 struct NodeEntry {
@@ -39,12 +41,29 @@ pub(crate) struct FixedArenaNodeStore {
 }
 impl FixedArenaNodeStore {
     pub(crate) fn new(node_capacity: usize) -> Self {
+        Self::validate_capacity(node_capacity);
+        let entries = Vec::with_capacity(node_capacity);
+        let bucket_heads =
+            vec![EMPTY_INDEX; Self::bucket_capacity(node_capacity)].into_boxed_slice();
+        Self {
+            entries,
+            bucket_heads,
+            node_capacity,
+        }
+    }
+
+    fn validate_capacity(node_capacity: usize) {
         assert!(
-            node_capacity > 0 && node_capacity <= u32::MAX as usize,
+            node_capacity <= u32::MAX as usize,
             "node capacity out of bounds"
         );
-        let entries = Vec::with_capacity(node_capacity);
-        let bucket_capacity = {
+    }
+
+    fn bucket_capacity(node_capacity: usize) -> usize {
+        if node_capacity == 0 {
+            1
+        } else {
+            // Keep the bucket count at the nearest power of two to 4x nodes.
             let value = node_capacity
                 .checked_mul(4)
                 .expect("bucket-count target overflow");
@@ -58,12 +77,6 @@ impl FixedArenaNodeStore {
             } else {
                 upper
             }
-        }; // nearest power of two lol
-        let bucket_heads = vec![EMPTY_INDEX; bucket_capacity].into_boxed_slice();
-        Self {
-            entries,
-            bucket_heads,
-            node_capacity,
         }
     }
 }
@@ -141,6 +154,20 @@ unsafe impl NodeStore for FixedArenaNodeStore {
         self.entries.clear();
         self.bucket_heads.fill(EMPTY_INDEX);
     }
+    fn reset_with_capacity(&mut self, node_capacity: usize) {
+        if node_capacity == self.node_capacity {
+            self.clear();
+            return;
+        }
+
+        // Release the old arena before allocating its replacement. Search
+        // budgets are also memory budgets, so retaining the largest arena (or
+        // briefly holding both arenas) would violate the purpose of resizing.
+        self.entries = Vec::new();
+        self.bucket_heads = Box::new([]);
+
+        *self = Self::new(node_capacity);
+    }
 }
 
 #[cfg(test)]
@@ -152,9 +179,11 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "node capacity out of bounds")]
-    fn store_rejects_zero_capacity() {
-        let _ = FixedArenaNodeStore::new(0);
+    fn zero_capacity_store_is_valid_but_always_full() {
+        let mut store = FixedArenaNodeStore::new(0);
+
+        assert_eq!(store.capacity(), 0);
+        assert_eq!(store.insert(key(1)), Err(InsertError::StoreFull));
     }
 
     #[test]
@@ -263,6 +292,27 @@ mod tests {
 
         store.insert(key(3)).expect("cleared storage can be reused");
         assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn reset_with_capacity_clears_and_resizes_the_store() {
+        let mut store = FixedArenaNodeStore::new(2);
+        store.insert(key(1)).unwrap();
+
+        store.reset_with_capacity(4);
+
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.capacity(), 4);
+        assert_eq!(store.find(key(1)), None);
+        for value in 0..4 {
+            store.insert(key(value)).unwrap();
+        }
+        assert_eq!(store.insert(key(4)), Err(InsertError::StoreFull));
+
+        store.reset_with_capacity(0);
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.capacity(), 0);
+        assert_eq!(store.insert(key(1)), Err(InsertError::StoreFull));
     }
 
     #[test]
