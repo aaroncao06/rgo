@@ -73,8 +73,9 @@ impl InferenceBackend for OwnershipBackend {
 #[tokio::test]
 async fn root_requests_upgrade_cached_outputs_without_mutating_interior_outputs() {
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let handle = ModelRuntime::start(vec![OwnershipBackend(requests.clone())], 1, 1, 16, 1);
+    let handle = ModelRuntime::start(17, vec![OwnershipBackend(requests.clone())], 1, 1, 16, 1);
     let mut client = InferenceClient::new(handle, false);
+    assert_eq!(client.model_version(), 17);
     let state = GameState::new(Rules::TROMP_TAYLORISH);
     let interior = client.evaluate(&state, false).await.unwrap();
     assert!(!interior.has_ownership());
@@ -106,6 +107,7 @@ async fn root_requests_upgrade_cached_outputs_without_mutating_interior_outputs(
 async fn randomized_symmetry_is_restored_before_caching() {
     let requests = Arc::new(Mutex::new(0));
     let handle = ModelRuntime::start(
+        0,
         vec![EchoSpatialOwnershipBackend(requests.clone())],
         1,
         1,
@@ -146,6 +148,7 @@ async fn randomized_symmetry_is_restored_before_caching() {
 #[test]
 fn client_can_disable_randomized_symmetry() {
     let handle = ModelRuntime::start(
+        0,
         vec![TestBackend {
             batch_sizes: Arc::new(Mutex::new(Vec::new())),
             fail: false,
@@ -163,6 +166,7 @@ fn client_can_disable_randomized_symmetry() {
 #[should_panic(expected = "backend omitted requested ownership output")]
 async fn missing_requested_ownership_violates_backend_contract() {
     let handle = ModelRuntime::start(
+        0,
         vec![TestBackend {
             batch_sizes: Arc::new(Mutex::new(Vec::new())),
             fail: false,
@@ -262,7 +266,7 @@ async fn model_runtime_evaluates_through_a_client() {
         batch_sizes: batch_sizes.clone(),
         fail: false,
     };
-    let model_handle = ModelRuntime::start(vec![backend], 4, 1, 8, 2);
+    let model_handle = ModelRuntime::start(0, vec![backend], 4, 1, 8, 2);
     let queue = model_handle.0.queue.clone();
     let mut client = InferenceClient::new(model_handle, false);
 
@@ -283,7 +287,7 @@ async fn repeated_evaluation_uses_the_model_cache() {
         batch_sizes: batch_sizes.clone(),
         fail: false,
     };
-    let model_handle = ModelRuntime::start(vec![backend], 4, 1, 8, 2);
+    let model_handle = ModelRuntime::start(0, vec![backend], 4, 1, 8, 2);
     let mut client = InferenceClient::new(model_handle, false);
     let game_state = GameState::new(Rules::TROMP_TAYLORISH);
 
@@ -300,7 +304,7 @@ fn model_runtime_shuts_down_after_the_last_handle_is_dropped() {
         batch_sizes: Arc::new(Mutex::new(Vec::new())),
         fail: false,
     };
-    let first_handle = ModelRuntime::start(vec![backend], 4, 1, 8, 2);
+    let first_handle = ModelRuntime::start(0, vec![backend], 4, 1, 8, 2);
     let second_handle = first_handle.clone();
     let queue = first_handle.0.queue.clone();
 
@@ -318,7 +322,7 @@ async fn multiple_clients_share_one_model_runtime() {
         batch_sizes: batch_sizes.clone(),
         fail: false,
     };
-    let model_handle = ModelRuntime::start(vec![backend], 2, 2, 8, 2);
+    let model_handle = ModelRuntime::start(0, vec![backend], 2, 2, 8, 2);
     let mut first_client = InferenceClient::new(model_handle.clone(), false);
     let mut second_client = InferenceClient::new(model_handle, false);
     let first_game = GameState::new(Rules::TROMP_TAYLORISH);

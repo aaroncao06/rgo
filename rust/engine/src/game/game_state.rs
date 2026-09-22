@@ -41,6 +41,20 @@ impl GameState {
         &self.board
     }
 
+    /// Starts a fresh game while retaining reusable history allocation.
+    pub(crate) fn reset(&mut self, rules: Rules) {
+        self.board = Board::new();
+        self.rules = rules;
+        self.next_player = Player::Black;
+        self.turn_number = 0;
+        self.consecutive_ending_passes = 0;
+        self.passes_by_player = [0; 2];
+        self.superko_banned.fill(false);
+
+        self.seen_position_hashes.clear();
+        self.seen_position_hashes.insert(self.board.position_hash());
+    }
+
     /// Restores this state from `source` while retaining the hash-set's
     /// allocated capacity for reuse across playouts.
     pub(crate) fn reset_from(&mut self, source: &GameState) {
@@ -215,6 +229,36 @@ mod tests {
         );
         assert_eq!(scratch.superko_banned, source.superko_banned);
         assert_eq!(scratch.seen_position_hashes, source.seen_position_hashes);
+    }
+
+    #[test]
+    fn reset_starts_a_fresh_game_and_reuses_history_allocation() {
+        let mut state = GameState::new(Rules::OGS_CHINESE);
+        assert!(state.play(loc(4, 4)));
+        assert!(state.play(loc(3, 3)));
+        assert!(state.play(Loc::PASS));
+        let history_capacity = state.seen_position_hashes.capacity();
+
+        state.reset(rules());
+
+        assert_eq!(state.board.position_hash(), Board::new().position_hash());
+        assert_eq!(state.rules.komi, rules().komi);
+        assert_eq!(
+            state.rules.multi_stone_suicide_legal,
+            rules().multi_stone_suicide_legal
+        );
+        assert_eq!(state.next_player, Player::Black);
+        assert_eq!(state.turn_number, 0);
+        assert_eq!(state.consecutive_ending_passes, 0);
+        assert_eq!(state.passes_by_player, [0; 2]);
+        assert!(state.superko_banned.iter().all(|&banned| !banned));
+        assert_eq!(state.seen_position_hashes.len(), 1);
+        assert!(
+            state
+                .seen_position_hashes
+                .contains(&state.board.position_hash())
+        );
+        assert_eq!(state.seen_position_hashes.capacity(), history_capacity);
     }
 
     #[test]

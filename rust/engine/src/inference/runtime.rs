@@ -17,8 +17,11 @@ mod queue;
 use cache::{EvaluationCache, EvaluationKey};
 use queue::{BatchQueue, EvalSlot};
 
+pub(crate) type ModelVersion = u64;
+
 pub(crate) struct ModelRuntime {
     // each model runtime owns its own queue and cache and executors. makes it easier to switch out and make new ones
+    model_version: ModelVersion,
     queue: Arc<BatchQueue>, // model runtime owns this, should be responsible for dropping everything
     cache: EvaluationCache,
     executor_threads: Vec<JoinHandle<()>>,
@@ -43,6 +46,9 @@ struct InferenceExecutor<B: InferenceBackend> {
     max_batch_size: usize,
 }
 impl ModelHandle {
+    fn model_version(&self) -> ModelVersion {
+        self.0.model_version
+    }
     fn submit_request(&self, request: Arc<EvalSlot>) -> Result<(), InferenceError> {
         self.0.queue.submit_request(request)
     }
@@ -54,6 +60,9 @@ impl ModelHandle {
     }
 }
 impl InferenceClient {
+    pub(crate) fn model_version(&self) -> ModelVersion {
+        self.model_handle.model_version()
+    }
     pub(crate) fn new(model_handle: ModelHandle, randomize_symmetry: bool) -> Self {
         let symmetry_rng = randomize_symmetry.then(|| {
             SmallRng::try_from_rng(&mut SysRng)
@@ -71,6 +80,11 @@ impl InferenceClient {
             model_handle,
             slot: Arc::new(EvalSlot::new()),
             symmetry_rng: Some(SmallRng::seed_from_u64(symmetry_seed)),
+        }
+    }
+    pub(crate) fn reseed_symmetry(&mut self, symmetry_seed: u64) {
+        if let Some(rng) = self.symmetry_rng.as_mut() {
+            *rng = SmallRng::seed_from_u64(symmetry_seed);
         }
     }
     fn next_symmetry(&mut self) -> Option<Symmetry> {
@@ -193,6 +207,7 @@ impl ModelRuntime {
     /// not implement capacity backpressure. Dropping the last handle closes and
     /// drains the queue, then joins the executor threads.
     pub(crate) fn start<B>(
+        model_version: ModelVersion,
         backends: Vec<B>,
         max_batch_size: usize,
         queue_capacity: usize, // max number of inference clients, each with one outstanding request
@@ -217,6 +232,7 @@ impl ModelRuntime {
             }));
         }
         ModelHandle(Arc::new(Self {
+            model_version,
             queue,
             cache,
             executor_threads,

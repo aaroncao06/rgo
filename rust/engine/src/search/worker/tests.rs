@@ -42,6 +42,7 @@ fn inference_client(fail: bool) -> InferenceClient {
 
 fn inference_client_with_policy(fail: bool, policy_logits: [f32; POLICY_SIZE]) -> InferenceClient {
     let model_handle = ModelRuntime::start(
+        0,
         vec![TestBackend {
             fail,
             policy_logits,
@@ -81,6 +82,7 @@ impl InferenceBackend for OneShotBackend {
 
 fn one_shot_inference_client(policy_logits: [f32; POLICY_SIZE]) -> InferenceClient {
     let model_handle = ModelRuntime::start(
+        0,
         vec![OneShotBackend {
             policy_logits,
             evaluated: false,
