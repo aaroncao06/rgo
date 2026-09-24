@@ -178,6 +178,13 @@ impl GameState {
     pub(crate) fn final_score_white_minus_black(&self) -> f32 {
         self.count_area_score_white_minus_black() as f32 + self.rules.komi
     }
+
+    /// Final area ownership on the board's padded coordinate array.
+    pub(crate) fn final_ownership(&self) -> [Color; ARRAY_LEN] {
+        debug_assert!(self.is_finished(), "cannot score an unfinished game");
+        self.board
+            .calculate_area(self.rules.multi_stone_suicide_legal)
+    }
 }
 
 #[cfg(test)]

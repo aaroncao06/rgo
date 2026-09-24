@@ -199,8 +199,8 @@ fn ending_bonus_changes_root_selection_and_lcb_without_changing_graph_stats() {
             .insert(GraphKey::from_raw(i as u128 + 1))
             .unwrap();
         let child = unsafe { ptr.as_mut() };
-        child.attach_nn_output(processed_output([0.0; POLICY_SIZE], 0.0));
-        for _ in 0..100 {
+        child.initialize_from_nn_eval(processed_output([0.0; POLICY_SIZE], 0.0), 0.0);
+        for _ in 1..100 {
             child.record_visit(0.5, 0.0, 0.0, 0.0);
         }
         let edge = root.node.add_child(point, 0.5, ptr);

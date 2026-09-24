@@ -68,10 +68,15 @@ impl SearchNode {
             children: ChildStorage::new(),
         }
     }
-    pub(super) fn attach_nn_output(&mut self, output: Arc<NNOutput>) {
+    pub(super) fn initialize_from_nn_eval(&mut self, nn_output: Arc<NNOutput>, white_utility: f64) {
         debug_assert!(self.nn_output.is_none(), "only populate empty nodes");
-        debug_assert!(output.is_processed());
-        self.nn_output = Some(output);
+        debug_assert_eq!(self.stats.visits, 0, "only initialize unvisited nodes");
+        debug_assert!(nn_output.is_processed());
+        let white_win = f64::from(nn_output.white_win_prob());
+        let white_score = f64::from(nn_output.white_score_mean());
+        let white_score_mean_sq = f64::from(nn_output.white_score_mean_sq());
+        self.nn_output = Some(nn_output);
+        self.record_visit(white_win, white_score, white_score_mean_sq, white_utility);
     }
     pub(super) fn record_visit(
         &mut self,
@@ -259,25 +264,33 @@ mod tests {
     }
 
     #[test]
-    fn output_attachment_and_visit_recording_update_separate_state() {
+    fn nn_initialization_records_the_first_visit() {
         let mut node = SearchNode::new();
         let output = processed_output();
+        let initial_win = f64::from(output.white_win_prob());
+        let initial_score = f64::from(output.white_score_mean());
+        let initial_score_mean_sq = f64::from(output.white_score_mean_sq());
 
-        node.attach_nn_output(output.clone());
-        node.record_visit(0.75, 3.5, 14.0, 0.6);
+        node.initialize_from_nn_eval(output.clone(), 0.6);
         node.record_visit(0.25, -1.5, 6.0, -0.2);
 
         assert!(Arc::ptr_eq(node.nn_output.as_ref().unwrap(), &output));
         assert_eq!(node.stats.visits, 2);
-        assert_eq!(node.stats.white_win_sum, 1.0);
-        assert_eq!(node.stats.white_score_sum, 2.0);
-        assert_eq!(node.stats.white_score_mean_sq_sum, 20.0);
+        assert_eq!(node.stats.white_win_sum, initial_win + 0.25);
+        assert_eq!(node.stats.white_score_sum, initial_score - 1.5);
+        assert_eq!(
+            node.stats.white_score_mean_sq_sum,
+            initial_score_mean_sq + 6.0
+        );
         assert!((node.stats.white_utility_sum - 0.4).abs() < 1e-12);
         assert!((node.stats.white_utility_sq_sum - 0.4).abs() < 1e-12);
         assert_eq!(node.visits(), 2);
-        assert_eq!(node.white_win_rate(), 0.5);
-        assert_eq!(node.white_score_mean(), 1.0);
-        assert_eq!(node.white_score_mean_sq(), 10.0);
+        assert_eq!(node.white_win_rate(), (initial_win + 0.25) / 2.0);
+        assert_eq!(node.white_score_mean(), (initial_score - 1.5) / 2.0);
+        assert_eq!(
+            node.white_score_mean_sq(),
+            (initial_score_mean_sq + 6.0) / 2.0
+        );
         assert!((node.white_utility() - 0.2).abs() < 1e-12);
         assert!((node.white_utility_mean_sq() - 0.2).abs() < 1e-12);
         assert_eq!(node.policy_probs(), output.policy_probs());

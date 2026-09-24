@@ -58,7 +58,7 @@ impl<N: NodeStore> SearchGraph<N> {
     ) {
         self.node_store.reset_with_capacity(node_capacity);
         let key = GraphKey::new(root_game_state);
-        let node = Self::initialized_root(root_output, root_utility);
+        let node = Self::new_root_node(root_output, root_utility);
         let safe_area = root_game_state
             .board()
             .calculate_pass_alive_area(root_game_state.rules().multi_stone_suicide_legal);
@@ -80,15 +80,9 @@ impl<N: NodeStore> SearchGraph<N> {
             }
         }
     }
-    fn initialized_root(output: Arc<NNOutput>, utility: f64) -> Box<SearchNode> {
+    fn new_root_node(output: Arc<NNOutput>, utility: f64) -> Box<SearchNode> {
         let mut root = Box::new(SearchNode::new());
-        root.attach_nn_output(output.clone());
-        root.record_visit(
-            f64::from(output.white_win_prob()),
-            f64::from(output.white_score_mean()),
-            f64::from(output.white_score_mean_sq()),
-            utility,
-        );
+        root.initialize_from_nn_eval(output, utility);
         root
     }
     fn advance_root(&mut self, move_loc: Loc) {
@@ -395,13 +389,7 @@ impl<N: NodeStore> SearchWorker<N> {
                             self.params,
                         );
                         let child = unsafe { child.as_mut() };
-                        child.attach_nn_output(output.clone());
-                        child.record_visit(
-                            f64::from(output.white_win_prob()),
-                            f64::from(output.white_score_mean()),
-                            f64::from(output.white_score_mean_sq()),
-                            utility,
-                        );
+                        child.initialize_from_nn_eval(output, utility);
                     } else {
                         // use terminal state stats not model output
                         let white_score =

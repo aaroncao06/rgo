@@ -121,13 +121,7 @@ fn processed_output(policy_logits: [f32; POLICY_SIZE], white_win_logit: f32) -> 
 
 fn initialized_node(output: Arc<NNOutput>, utility: f64) -> Box<SearchNode> {
     let mut node = Box::new(SearchNode::new());
-    node.attach_nn_output(output.clone());
-    node.record_visit(
-        f64::from(output.white_win_prob()),
-        f64::from(output.white_score_mean()),
-        f64::from(output.white_score_mean_sq()),
-        utility,
-    );
+    node.initialize_from_nn_eval(output, utility);
     node
 }
 
@@ -377,7 +371,7 @@ async fn final_lcb_weights_use_edge_sample_size_for_transpositions() {
             .unwrap();
         // SAFETY: fresh live arena node, initialized before linking it.
         let child = unsafe { pointer.as_mut() };
-        child.attach_nn_output(processed_output(logits, 0.0));
+        child.initialize_from_nn_eval(processed_output(logits, 0.0), 0.0);
         child.replace_stats(SearchStats {
             visits: 100,
             white_win_sum: 50.0,
@@ -441,8 +435,8 @@ async fn final_weights_reduce_overexploration_without_changing_graph_stats() {
             .unwrap();
         // SAFETY: fresh arena node; no other references to this node are live.
         let child = unsafe { ptr.as_mut() };
-        child.attach_nn_output(processed_output(logits, 0.0));
-        for _ in 0..visits {
+        child.initialize_from_nn_eval(processed_output(logits, 0.0), utility);
+        for _ in 1..visits {
             child.record_visit(0.5, 0.0, 0.0, utility);
         }
         let root = &mut worker.search_graph.root.as_mut().unwrap().node;
@@ -716,13 +710,11 @@ async fn graph_cycles_end_the_playout_and_back_up_without_inference() {
         unsafe {
             first
                 .as_mut()
-                .attach_nn_output(processed_output(policy(first_move), 0.0));
-            first.as_mut().record_visit(0.5, 0.0, 0.0, 0.0);
+                .initialize_from_nn_eval(processed_output(policy(first_move), 0.0), 0.0);
             if !self_loop {
                 second
                     .as_mut()
-                    .attach_nn_output(processed_output(policy(second_move), 0.0));
-                second.as_mut().record_visit(0.5, 0.0, 0.0, 0.0);
+                    .initialize_from_nn_eval(processed_output(policy(second_move), 0.0), 0.0);
             }
         }
         let root = &mut worker.search_graph.root.as_mut().unwrap().node;
@@ -788,8 +780,8 @@ async fn transposed_child_catches_up_before_requesting_more_inference() {
     let mut child_ptr = worker.search_graph.node_store.insert(child_key).unwrap();
     {
         let child = unsafe { child_ptr.as_mut() };
-        child.attach_nn_output(processed_output([0.0; POLICY_SIZE], 0.0));
-        for _ in 0..3 {
+        child.initialize_from_nn_eval(processed_output([0.0; POLICY_SIZE], 0.0), 0.0);
+        for _ in 1..3 {
             child.record_visit(0.5, 0.0, 0.0, 0.0);
         }
     }
