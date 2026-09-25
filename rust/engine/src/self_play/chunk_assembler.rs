@@ -12,7 +12,7 @@ pub(super) struct TrainingChunk {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ChunkWriterError {
+pub(super) enum ChunkAssemblerError {
     OutputClosed,
 }
 
@@ -24,14 +24,14 @@ pub(super) enum ChunkWriterError {
 /// This task is the sole owner of the active chunk. Workers transfer game
 /// buffers through `completed_games_rx`; emptied buffers are returned to their
 /// originating workers for reuse.
-pub(super) struct ChunkWriter {
+pub(super) struct ChunkAssembler {
     chunk_size: usize,
     completed_games_rx: mpsc::Receiver<CompletedGame>,
     chunks_tx: mpsc::Sender<TrainingChunk>,
     active_samples: Vec<TrainingSample>,
 }
 
-impl ChunkWriter {
+impl ChunkAssembler {
     pub(super) fn new(
         chunk_size: usize,
         completed_games_rx: mpsc::Receiver<CompletedGame>,
@@ -46,14 +46,14 @@ impl ChunkWriter {
         }
     }
 
-    pub(super) async fn run(mut self) -> Result<(), ChunkWriterError> {
+    pub(super) async fn run(mut self) -> Result<(), ChunkAssemblerError> {
         while let Some(game) = self.completed_games_rx.recv().await {
             self.append_game(game).await?;
         }
         self.flush().await
     }
 
-    async fn append_game(&mut self, mut game: CompletedGame) -> Result<(), ChunkWriterError> {
+    async fn append_game(&mut self, mut game: CompletedGame) -> Result<(), ChunkAssemblerError> {
         // Training records are sampled independently, so their order within a
         // chunk is irrelevant. `pop` avoids shifting the remaining samples.
         while !game.samples.is_empty() {
@@ -84,7 +84,7 @@ impl ChunkWriter {
         Ok(())
     }
 
-    async fn flush(&mut self) -> Result<(), ChunkWriterError> {
+    async fn flush(&mut self) -> Result<(), ChunkAssemblerError> {
         if self.active_samples.is_empty() {
             return Ok(());
         }
@@ -97,7 +97,7 @@ impl ChunkWriter {
         self.chunks_tx
             .send(TrainingChunk { samples })
             .await
-            .map_err(|_| ChunkWriterError::OutputClosed)
+            .map_err(|_| ChunkAssemblerError::OutputClosed)
     }
 }
 
@@ -128,8 +128,8 @@ mod tests {
         let (completed_tx, completed_rx) = mpsc::channel(1);
         let (chunks_tx, mut chunks_rx) = mpsc::channel(1);
         let (recycle_tx, recycle_rx) = oneshot::channel();
-        let writer = ChunkWriter::new(2, completed_rx, chunks_tx);
-        let writer_task = tokio::spawn(writer.run());
+        let assembler = ChunkAssembler::new(2, completed_rx, chunks_tx);
+        let assembler_task = tokio::spawn(assembler.run());
         let samples = vec![sample(), sample()];
         let allocation = samples.as_ptr();
 
@@ -148,15 +148,15 @@ mod tests {
         assert_eq!(recycled.as_ptr(), allocation);
 
         drop(completed_tx);
-        assert_eq!(writer_task.await.unwrap(), Ok(()));
+        assert_eq!(assembler_task.await.unwrap(), Ok(()));
     }
 
     #[tokio::test]
     async fn combines_complete_games_in_one_chunk() {
         let (completed_tx, completed_rx) = mpsc::channel(2);
         let (chunks_tx, mut chunks_rx) = mpsc::channel(1);
-        let writer = ChunkWriter::new(2, completed_rx, chunks_tx);
-        let writer_task = tokio::spawn(writer.run());
+        let assembler = ChunkAssembler::new(2, completed_rx, chunks_tx);
+        let assembler_task = tokio::spawn(assembler.run());
         let mut recycle_receivers = Vec::new();
 
         for _ in 0..2 {
@@ -177,7 +177,7 @@ mod tests {
         for receiver in recycle_receivers {
             assert!(receiver.await.unwrap().is_empty());
         }
-        assert_eq!(writer_task.await.unwrap(), Ok(()));
+        assert_eq!(assembler_task.await.unwrap(), Ok(()));
     }
 
     #[tokio::test]
@@ -185,8 +185,8 @@ mod tests {
         let (completed_tx, completed_rx) = mpsc::channel(1);
         let (chunks_tx, mut chunks_rx) = mpsc::channel(3);
         let (recycle_tx, recycle_rx) = oneshot::channel();
-        let writer = ChunkWriter::new(2, completed_rx, chunks_tx);
-        let writer_task = tokio::spawn(writer.run());
+        let assembler = ChunkAssembler::new(2, completed_rx, chunks_tx);
+        let assembler_task = tokio::spawn(assembler.run());
 
         completed_tx
             .send(CompletedGame {
@@ -203,7 +203,7 @@ mod tests {
         }
         assert_eq!(chunk_sizes, [2, 2, 1]);
         assert!(recycle_rx.await.unwrap().is_empty());
-        assert_eq!(writer_task.await.unwrap(), Ok(()));
+        assert_eq!(assembler_task.await.unwrap(), Ok(()));
     }
 
     #[tokio::test]
@@ -211,7 +211,7 @@ mod tests {
         let (completed_tx, completed_rx) = mpsc::channel(2);
         let (chunks_tx, chunks_rx) = mpsc::channel(1);
         drop(chunks_rx);
-        let writer = ChunkWriter::new(1, completed_rx, chunks_tx);
+        let assembler = ChunkAssembler::new(1, completed_rx, chunks_tx);
 
         let (first_recycle_tx, first_recycle_rx) = oneshot::channel();
         completed_tx
@@ -229,11 +229,11 @@ mod tests {
             })
             .await
             .unwrap();
-        let writer_task = tokio::spawn(writer.run());
+        let assembler_task = tokio::spawn(assembler.run());
 
         assert_eq!(
-            writer_task.await.unwrap(),
-            Err(ChunkWriterError::OutputClosed)
+            assembler_task.await.unwrap(),
+            Err(ChunkAssemblerError::OutputClosed)
         );
         assert!(first_recycle_rx.await.unwrap().is_empty());
         assert!(second_recycle_rx.await.is_err());

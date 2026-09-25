@@ -4,7 +4,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::{
     RNG_SEED,
-    chunk_writer::CompletedGame,
+    chunk_assembler::CompletedGame,
     params::SelfPlayParams,
     training_data::{TrainingSample, ValueTarget},
 };
@@ -48,7 +48,7 @@ struct SelfPlayRecord {
 #[derive(Debug)]
 pub(super) enum SelfPlayError {
     Search(SearchError),
-    ChunkWriterClosed,
+    ChunkAssemblerClosed,
 }
 
 impl From<SearchError> for SelfPlayError {
@@ -144,7 +144,7 @@ impl SelfPlayWorker {
                 .take()
                 .expect("submitted buffer has a recycle receiver")
                 .await
-                .map_err(|_| SelfPlayError::ChunkWriterClosed)?,
+                .map_err(|_| SelfPlayError::ChunkAssemblerClosed)?,
         };
         build_training_samples(&mut self.records, &mut self.game_state, &mut samples);
         let (recycle_tx, recycle_rx) = oneshot::channel();
@@ -154,7 +154,7 @@ impl SelfPlayWorker {
         };
         if let Err(error) = self.completed_games_tx.send(completed_game).await {
             self.training_samples = Some(error.0.samples);
-            return Err(SelfPlayError::ChunkWriterClosed);
+            return Err(SelfPlayError::ChunkAssemblerClosed);
         }
         self.recycle_rx = Some(recycle_rx);
         Ok(())

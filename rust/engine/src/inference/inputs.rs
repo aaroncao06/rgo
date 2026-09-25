@@ -3,8 +3,8 @@ use super::symmetry::Symmetry;
 use crate::game::board::{Color, Loc};
 use crate::game::game_state::GameState;
 
-const NUM_SPATIAL_FEATURES: usize = 3; // player masks, superko banned
-const NUM_GLOBAL_FEATURES: usize = 2; // komi, passes
+pub(crate) const NUM_SPATIAL_FEATURES: usize = 3; // player masks, superko banned
+pub(crate) const NUM_GLOBAL_FEATURES: usize = 2; // komi, passes
 
 // takes in current board,
 pub(crate) struct NNInput {
