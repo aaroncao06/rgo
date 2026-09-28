@@ -112,7 +112,7 @@ pub(crate) struct Board {
 }
 
 impl Board {
-    pub(crate) fn new() -> Self {
+    pub(super) fn new() -> Self {
         let mut colors = [Color::Empty; ARRAY_LEN];
         for i in 0..STRIDE {
             colors[i] = Color::Wall;
@@ -272,7 +272,7 @@ impl Board {
         counter
     }
 
-    pub(crate) fn play_move_assume_legal(&mut self, loc: Loc, player: Player) {
+    pub(super) fn play_move_assume_legal(&mut self, loc: Loc, player: Player) {
         //create new chain, merge with nearby chains, decrement opponent liberties, kill and increment liberties and mark ko
         self.simple_ko = None;
         if loc == Loc::PASS {
@@ -392,7 +392,7 @@ impl Board {
         }
         !self.is_illegal_suicide(loc, player, multi_stone_suicide_legal)
     }
-    pub(crate) fn is_legal_ignoring_ko(
+    pub(super) fn is_legal_ignoring_ko(
         &self,
         loc: Loc,
         player: Player,
@@ -501,7 +501,7 @@ impl Board {
             (next != start).then_some(next) // just an if statement lol
         })
     }
-    pub(crate) fn get_position_hash_after_move(&self, loc: Loc, player: Player) -> Hash128 {
+    pub(super) fn get_position_hash_after_move(&self, loc: Loc, player: Player) -> Hash128 {
         //see what stones get removed if you do a move. order of moves doesnt matter for the hash
         if loc == Loc::PASS {
             return self.position_hash;

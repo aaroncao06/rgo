@@ -117,9 +117,9 @@ pub(crate) struct SearchValueTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SearchBudget {
     /// Maximum number of non-root graph nodes created by this search.
-    pub(crate) max_nodes: usize,
+    max_nodes: usize,
     /// Safety bound for playouts that finish without creating a node.
-    pub(crate) max_playouts: usize,
+    max_playouts: usize,
 }
 
 impl SearchBudget {
