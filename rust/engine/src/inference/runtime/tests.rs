@@ -3,7 +3,92 @@ use crate::{
     game::{board::Loc, rules::Rules},
     inference::policy::POLICY_SIZE,
 };
-use std::{sync::Mutex, thread};
+use std::{
+    rc::Rc,
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread,
+};
+
+struct ThreadLocalBackend {
+    drops: Arc<AtomicUsize>,
+    _not_send: Rc<()>,
+}
+
+impl Drop for ThreadLocalBackend {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl InferenceBackend for ThreadLocalBackend {
+    fn evaluate_batch(
+        &mut self,
+        inputs: &[NNInput],
+        outputs: &mut Vec<Arc<NNOutput>>,
+    ) -> Result<(), InferenceError> {
+        outputs.extend(inputs.iter().map(|_| test_output()));
+        Ok(())
+    }
+}
+
+#[test]
+fn runtime_constructs_non_send_backend_on_executor_thread() {
+    let caller = thread::current().id();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let backend_drops = drops.clone();
+    let handle = ModelRuntime::start(
+        0,
+        vec![move || {
+            assert_ne!(thread::current().id(), caller);
+            Ok::<_, &'static str>(ThreadLocalBackend {
+                drops: backend_drops,
+                _not_send: Rc::new(()),
+            })
+        }],
+        1,
+        1,
+        8,
+        1,
+    )
+    .unwrap();
+    drop(handle);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn failed_backend_startup_joins_other_executors() {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let result = ModelRuntime::start(
+        0,
+        [false, true]
+            .map(|fail| {
+                let drops = drops.clone();
+                move || {
+                    if fail {
+                        Err("backend initialization failed")
+                    } else {
+                        Ok(ThreadLocalBackend {
+                            drops,
+                            _not_send: Rc::new(()),
+                        })
+                    }
+                }
+            })
+            .into(),
+        1,
+        1,
+        8,
+        1,
+    );
+    assert!(matches!(
+        result,
+        Err(ModelStartupError::Backend("backend initialization failed"))
+    ));
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
 
 fn test_input() -> NNInput {
     NNInput::encode(&GameState::new(Rules::TROMP_TAYLORISH))
@@ -73,7 +158,15 @@ impl InferenceBackend for OwnershipBackend {
 #[tokio::test]
 async fn root_requests_upgrade_cached_outputs_without_mutating_interior_outputs() {
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let handle = ModelRuntime::start(17, vec![OwnershipBackend(requests.clone())], 1, 1, 16, 1);
+    let handle = ModelRuntime::start(
+        17,
+        vec![test_backend_factory(OwnershipBackend(requests.clone()))],
+        1,
+        1,
+        16,
+        1,
+    )
+    .unwrap();
     let mut client = InferenceClient::new(handle, None);
     assert_eq!(client.model_version(), 17);
     let state = GameState::new(Rules::TROMP_TAYLORISH);
@@ -108,12 +201,15 @@ async fn randomized_symmetry_is_restored_before_caching() {
     let requests = Arc::new(Mutex::new(0));
     let handle = ModelRuntime::start(
         0,
-        vec![EchoSpatialOwnershipBackend(requests.clone())],
+        vec![test_backend_factory(EchoSpatialOwnershipBackend(
+            requests.clone(),
+        ))],
         1,
         1,
         16,
         1,
-    );
+    )
+    .unwrap();
 
     // Choose a seed whose first symmetry is nontrivial.
     let seed = (0..1000)
@@ -149,15 +245,16 @@ async fn randomized_symmetry_is_restored_before_caching() {
 fn client_can_disable_randomized_symmetry() {
     let handle = ModelRuntime::start(
         0,
-        vec![TestBackend {
+        vec![test_backend_factory(TestBackend {
             batch_sizes: Arc::new(Mutex::new(Vec::new())),
             fail: false,
-        }],
+        })],
         1,
         1,
         8,
         1,
-    );
+    )
+    .unwrap();
     let mut client = InferenceClient::new(handle, None);
     assert_eq!(client.next_symmetry(), None);
     let mut unbound = InferenceClient::unbound(None);
@@ -168,30 +265,32 @@ fn client_can_disable_randomized_symmetry() {
 fn rebinding_a_client_preserves_its_slot_and_symmetry_sequence() {
     let old_model = ModelRuntime::start(
         0,
-        vec![TestBackend {
+        vec![test_backend_factory(TestBackend {
             batch_sizes: Arc::new(Mutex::new(Vec::new())),
             fail: false,
-        }],
+        })],
         1,
         1,
         16,
         1,
-    );
+    )
+    .unwrap();
     let mut client = InferenceClient::unbound(Some(42));
     assert!(!client.has_model());
     client.install_model(old_model);
     let mut uninterrupted = InferenceClient::new(
         ModelRuntime::start(
             2,
-            vec![TestBackend {
+            vec![test_backend_factory(TestBackend {
                 batch_sizes: Arc::new(Mutex::new(Vec::new())),
                 fail: false,
-            }],
+            })],
             1,
             1,
             16,
             1,
-        ),
+        )
+        .unwrap(),
         Some(42),
     );
     for _ in 0..5 {
@@ -202,15 +301,16 @@ fn rebinding_a_client_preserves_its_slot_and_symmetry_sequence() {
     assert!(!client.has_model());
     let new_model = ModelRuntime::start(
         1,
-        vec![TestBackend {
+        vec![test_backend_factory(TestBackend {
             batch_sizes: Arc::new(Mutex::new(Vec::new())),
             fail: false,
-        }],
+        })],
         1,
         1,
         16,
         1,
-    );
+    )
+    .unwrap();
     client.install_model(new_model);
     assert!(Arc::ptr_eq(&slot, &client.slot));
     for _ in 0..20 {
@@ -223,15 +323,16 @@ fn rebinding_a_client_preserves_its_slot_and_symmetry_sequence() {
 async fn missing_requested_ownership_violates_backend_contract() {
     let handle = ModelRuntime::start(
         0,
-        vec![TestBackend {
+        vec![test_backend_factory(TestBackend {
             batch_sizes: Arc::new(Mutex::new(Vec::new())),
             fail: false,
-        }],
+        })],
         1,
         1,
         16,
         1,
-    );
+    )
+    .unwrap();
     let mut client = InferenceClient::new(handle, None);
     let state = GameState::new(Rules::TROMP_TAYLORISH);
     let _ = client.evaluate(&state, true).await;
@@ -322,7 +423,8 @@ async fn model_runtime_evaluates_through_a_client() {
         batch_sizes: batch_sizes.clone(),
         fail: false,
     };
-    let model_handle = ModelRuntime::start(0, vec![backend], 4, 1, 8, 2);
+    let model_handle =
+        ModelRuntime::start(0, vec![test_backend_factory(backend)], 4, 1, 8, 2).unwrap();
     let queue = model_handle.0.queue.clone();
     let mut client = InferenceClient::new(model_handle, None);
 
@@ -343,7 +445,8 @@ async fn repeated_evaluation_uses_the_model_cache() {
         batch_sizes: batch_sizes.clone(),
         fail: false,
     };
-    let model_handle = ModelRuntime::start(0, vec![backend], 4, 1, 8, 2);
+    let model_handle =
+        ModelRuntime::start(0, vec![test_backend_factory(backend)], 4, 1, 8, 2).unwrap();
     let mut client = InferenceClient::new(model_handle, None);
     let game_state = GameState::new(Rules::TROMP_TAYLORISH);
 
@@ -360,7 +463,8 @@ fn model_runtime_shuts_down_after_the_last_handle_is_dropped() {
         batch_sizes: Arc::new(Mutex::new(Vec::new())),
         fail: false,
     };
-    let first_handle = ModelRuntime::start(0, vec![backend], 4, 1, 8, 2);
+    let first_handle =
+        ModelRuntime::start(0, vec![test_backend_factory(backend)], 4, 1, 8, 2).unwrap();
     let second_handle = first_handle.clone();
     let queue = first_handle.0.queue.clone();
 
@@ -378,7 +482,8 @@ async fn multiple_clients_share_one_model_runtime() {
         batch_sizes: batch_sizes.clone(),
         fail: false,
     };
-    let model_handle = ModelRuntime::start(0, vec![backend], 2, 2, 8, 2);
+    let model_handle =
+        ModelRuntime::start(0, vec![test_backend_factory(backend)], 2, 2, 8, 2).unwrap();
     let mut first_client = InferenceClient::new(model_handle.clone(), None);
     let mut second_client = InferenceClient::new(model_handle, None);
     let first_game = GameState::new(Rules::TROMP_TAYLORISH);

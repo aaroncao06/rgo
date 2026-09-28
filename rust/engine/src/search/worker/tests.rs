@@ -2,7 +2,10 @@ use super::*;
 use crate::{
     game::rules::Rules,
     inference::{
-        backend::InferenceBackend, inputs::NNInput, policy::POLICY_SIZE, runtime::ModelRuntime,
+        backend::InferenceBackend,
+        inputs::NNInput,
+        policy::POLICY_SIZE,
+        runtime::{ModelRuntime, test_backend_factory},
     },
     search::{move_selection, node::SearchStats, node_store::FixedArenaNodeStore},
 };
@@ -43,15 +46,16 @@ fn inference_client(fail: bool) -> InferenceClient {
 fn inference_client_with_policy(fail: bool, policy_logits: [f32; POLICY_SIZE]) -> InferenceClient {
     let model_handle = ModelRuntime::start(
         0,
-        vec![TestBackend {
+        vec![test_backend_factory(TestBackend {
             fail,
             policy_logits,
-        }],
+        })],
         1,
         1,
         16,
         1,
-    );
+    )
+    .unwrap();
     InferenceClient::new(model_handle, None)
 }
 
@@ -83,15 +87,16 @@ impl InferenceBackend for OneShotBackend {
 fn one_shot_inference_client(policy_logits: [f32; POLICY_SIZE]) -> InferenceClient {
     let model_handle = ModelRuntime::start(
         0,
-        vec![OneShotBackend {
+        vec![test_backend_factory(OneShotBackend {
             policy_logits,
             evaluated: false,
-        }],
+        })],
         1,
         1,
         16,
         1,
-    );
+    )
+    .unwrap();
     InferenceClient::new(model_handle, None)
 }
 
