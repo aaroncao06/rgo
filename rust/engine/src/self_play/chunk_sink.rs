@@ -8,10 +8,9 @@ use tokio::{
     fs::{self, File},
     io::AsyncWriteExt,
     sync::mpsc,
-    task::JoinError,
 };
 
-use super::{chunk_assembler::TrainingChunk, training_data::encode_chunk};
+use super::chunk_assembler::TrainingChunk;
 
 const CHUNK_FILE_PREFIX: &str = "chunk-";
 const CHUNK_FILE_SUFFIX: &str = ".rgo";
@@ -20,7 +19,6 @@ const PENDING_CHUNK_FILE: &str = ".pending-chunk.tmp";
 #[derive(Debug)]
 pub(super) enum FileChunkSinkError {
     Io(io::Error),
-    EncodingTaskFailed(JoinError),
     RandomnessUnavailable(SysError),
 }
 
@@ -78,16 +76,13 @@ impl FileChunkSink {
         chunk_id: u128,
         chunk: TrainingChunk,
     ) -> Result<(), FileChunkSinkError> {
-        let bytes = tokio::task::spawn_blocking(move || encode_chunk(&chunk.samples))
-            .await
-            .map_err(FileChunkSinkError::EncodingTaskFailed)?;
         let final_path = self.output_dir.join(format!(
             "{CHUNK_FILE_PREFIX}{chunk_id:032x}{CHUNK_FILE_SUFFIX}"
         ));
         let temporary_path = self.output_dir.join(PENDING_CHUNK_FILE);
 
         let mut file = File::create(&temporary_path).await?;
-        file.write_all(&bytes).await?;
+        file.write_all(&chunk.bytes).await?;
         file.sync_all().await?;
         drop(file);
         fs::rename(&temporary_path, final_path).await?;
@@ -124,7 +119,8 @@ mod tests {
             chunk_assembler::{ChunkAssembler, CompletedGame},
             training_data::{
                 CHUNK_CHECKSUM_SIZE, CHUNK_FORMAT_VERSION, CHUNK_HEADER_SIZE, CHUNK_MAGIC,
-                TRAINING_RECORD_SIZE, TrainingSample, ValueTarget, verify_chunk_checksum,
+                TRAINING_RECORD_SIZE, TrainingSample, ValueTarget, encode_chunk,
+                verify_chunk_checksum,
             },
         },
     };
@@ -194,7 +190,7 @@ mod tests {
                 let sink_task = tokio::spawn(sink.run());
                 chunks_tx
                     .send(TrainingChunk {
-                        samples: vec![sample()],
+                        bytes: encode_chunk(&[sample()]),
                     })
                     .await
                     .unwrap();

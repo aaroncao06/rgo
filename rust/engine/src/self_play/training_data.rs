@@ -30,62 +30,95 @@ pub(super) struct TrainingSample {
     pub(super) value_target: ValueTarget,
 }
 
-/// Encodes a versioned chunk without relying on Rust's in-memory struct layout.
-/// All numeric fields are little-endian, every record has a fixed size, and a
-/// SHA-256 footer covers the complete header and record payload.
-pub(super) fn encode_chunk(samples: &[TrainingSample]) -> Vec<u8> {
-    let num_records = u32::try_from(samples.len()).expect("chunk record count exceeds u32");
-    let mut bytes = Vec::with_capacity(
-        CHUNK_HEADER_SIZE
-            .checked_add(
-                samples
-                    .len()
-                    .checked_mul(TRAINING_RECORD_SIZE)
-                    .expect("encoded chunk size overflow"),
-            )
-            .and_then(|size| size.checked_add(CHUNK_CHECKSUM_SIZE))
-            .expect("encoded chunk size overflow"),
-    );
+/// Builds one versioned chunk directly in its final byte representation.
+///
+/// Full chunks hash each record as it is encoded. Only the final partial chunk
+/// needs a second hashing pass because its record count is not known when its
+/// header is initialized.
+pub(super) struct ChunkEncoder {
+    record_capacity: usize,
+    record_count: usize,
+    bytes: Vec<u8>,
+    checksum: Sha256,
+}
 
-    bytes.extend_from_slice(&CHUNK_MAGIC);
-    for value in [
-        CHUNK_FORMAT_VERSION,
-        TRAINING_RECORD_SIZE as u32,
-        num_records,
-        BOARD_POLICY_SIZE as u32,
-        POLICY_SIZE as u32,
-        NUM_SPATIAL_FEATURES as u32,
-        NUM_GLOBAL_FEATURES as u32,
-    ] {
-        bytes.extend_from_slice(&value.to_le_bytes());
+impl ChunkEncoder {
+    pub(super) fn new(record_capacity: usize) -> Self {
+        assert!(record_capacity > 0, "training chunks must be nonempty");
+        let header = chunk_header(record_capacity);
+        let mut bytes = Vec::with_capacity(encoded_chunk_size(record_capacity));
+        bytes.extend_from_slice(&header);
+        let mut checksum = Sha256::new();
+        checksum.update(header);
+        Self {
+            record_capacity,
+            record_count: 0,
+            bytes,
+            checksum,
+        }
     }
 
-    for sample in samples {
+    pub(super) fn record_count(&self) -> usize {
+        self.record_count
+    }
+
+    pub(super) fn remaining_capacity(&self) -> usize {
+        self.record_capacity - self.record_count
+    }
+
+    pub(super) fn push(&mut self, sample: &TrainingSample) {
+        assert!(
+            self.record_count < self.record_capacity,
+            "training chunk capacity exceeded"
+        );
+        let record_start = self.bytes.len();
         debug_assert!(
             !sample.input.include_ownership,
             "ownership requests are inference metadata, not training input"
         );
-        extend_f32s(&mut bytes, &sample.input.spatial);
-        extend_f32s(&mut bytes, &sample.input.global);
-        extend_f32s(&mut bytes, &sample.policy_target);
+        extend_f32s(&mut self.bytes, &sample.input.spatial);
+        extend_f32s(&mut self.bytes, &sample.input.global);
+        extend_f32s(&mut self.bytes, &sample.policy_target);
         extend_f32s(
-            &mut bytes,
+            &mut self.bytes,
             &[
                 sample.value_target.win_probability,
                 sample.value_target.score_mean,
                 sample.value_target.score_stdev,
             ],
         );
-        bytes.extend_from_slice(&sample.value_target.ownership);
+        self.bytes.extend_from_slice(&sample.value_target.ownership);
+        self.checksum.update(&self.bytes[record_start..]);
+        self.record_count += 1;
     }
 
-    debug_assert_eq!(
-        bytes.len(),
-        CHUNK_HEADER_SIZE + samples.len() * TRAINING_RECORD_SIZE
-    );
-    let checksum = Sha256::digest(&bytes);
-    bytes.extend_from_slice(&checksum);
-    bytes
+    pub(super) fn finish(mut self) -> Vec<u8> {
+        assert!(self.record_count > 0, "cannot finish an empty chunk");
+        debug_assert_eq!(
+            self.bytes.len(),
+            CHUNK_HEADER_SIZE + self.record_count * TRAINING_RECORD_SIZE
+        );
+
+        let checksum = if self.record_count == self.record_capacity {
+            self.checksum.finalize()
+        } else {
+            self.bytes[..CHUNK_HEADER_SIZE].copy_from_slice(&chunk_header(self.record_count));
+            Sha256::digest(&self.bytes)
+        };
+        self.bytes.extend_from_slice(&checksum);
+        self.bytes
+    }
+}
+
+/// Test helper for encoding a complete sample slice. Production chunk assembly
+/// encodes records incrementally.
+#[cfg(test)]
+pub(super) fn encode_chunk(samples: &[TrainingSample]) -> Vec<u8> {
+    let mut encoder = ChunkEncoder::new(samples.len());
+    for sample in samples {
+        encoder.push(sample);
+    }
+    encoder.finish()
 }
 
 pub(super) fn verify_chunk_checksum(bytes: &[u8]) -> bool {
@@ -100,6 +133,37 @@ fn extend_f32s(bytes: &mut Vec<u8>, values: &[f32]) {
     for value in values {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
+}
+
+fn chunk_header(record_count: usize) -> [u8; CHUNK_HEADER_SIZE] {
+    let record_count = u32::try_from(record_count).expect("chunk record count exceeds u32");
+    let mut header = [0; CHUNK_HEADER_SIZE];
+    header[..CHUNK_MAGIC.len()].copy_from_slice(&CHUNK_MAGIC);
+    let mut offset = CHUNK_MAGIC.len();
+    for value in [
+        CHUNK_FORMAT_VERSION,
+        TRAINING_RECORD_SIZE as u32,
+        record_count,
+        BOARD_POLICY_SIZE as u32,
+        POLICY_SIZE as u32,
+        NUM_SPATIAL_FEATURES as u32,
+        NUM_GLOBAL_FEATURES as u32,
+    ] {
+        header[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
+        offset += size_of::<u32>();
+    }
+    header
+}
+
+fn encoded_chunk_size(record_capacity: usize) -> usize {
+    CHUNK_HEADER_SIZE
+        .checked_add(
+            record_capacity
+                .checked_mul(TRAINING_RECORD_SIZE)
+                .expect("encoded chunk size overflow"),
+        )
+        .and_then(|size| size.checked_add(CHUNK_CHECKSUM_SIZE))
+        .expect("encoded chunk size overflow")
 }
 
 #[cfg(test)]
