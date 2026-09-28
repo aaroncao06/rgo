@@ -44,9 +44,14 @@ pub(super) struct ChunkEncoder {
 
 impl ChunkEncoder {
     pub(super) fn new(record_capacity: usize) -> Self {
+        Self::with_buffer(record_capacity, Vec::new())
+    }
+
+    pub(super) fn with_buffer(record_capacity: usize, mut bytes: Vec<u8>) -> Self {
         assert!(record_capacity > 0, "training chunks must be nonempty");
         let header = chunk_header(record_capacity);
-        let mut bytes = Vec::with_capacity(encoded_chunk_size(record_capacity));
+        bytes.clear();
+        bytes.reserve(encoded_chunk_size(record_capacity));
         bytes.extend_from_slice(&header);
         let mut checksum = Sha256::new();
         checksum.update(header);

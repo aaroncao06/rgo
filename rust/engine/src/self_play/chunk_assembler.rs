@@ -9,6 +9,7 @@ pub(super) struct CompletedGame {
 
 pub(super) struct TrainingChunk {
     pub(super) bytes: Vec<u8>,
+    pub(super) recycle_tx: oneshot::Sender<Vec<u8>>,
 }
 
 #[derive(Clone, Copy)]
@@ -20,8 +21,8 @@ pub(super) enum ChunkMode {
 }
 
 struct EncodedStep {
-    active_chunk: ChunkEncoder,
-    completed_chunk: Option<TrainingChunk>,
+    active_chunk: Option<ChunkEncoder>,
+    completed_chunk: Option<Vec<u8>>,
     game: CompletedGame,
 }
 
@@ -39,12 +40,17 @@ pub(super) enum ChunkAssemblerError {
 /// Workers transfer game buffers through `completed_games_rx`; emptied buffers
 /// are returned to their originating workers for reuse. The channel lifecycle
 /// remains asynchronous and cancellable, while encoding and hashing run on
-/// Tokio's blocking pool. Fixed-record mode alone retains an active chunk.
+/// Tokio's blocking pool. At most two byte buffers circulate between this
+/// assembler and the sink. The assembler waits for the previous buffer before
+/// sending another, so only one chunk is ever awaiting a return.
+/// Fixed-record mode alone retains an active chunk.
 pub(super) struct ChunkAssembler {
     mode: ChunkMode,
     completed_games_rx: mpsc::Receiver<CompletedGame>,
     chunks_tx: mpsc::Sender<TrainingChunk>,
     active_chunk: Option<ChunkEncoder>,
+    spare_bytes: Option<Vec<u8>>,
+    in_flight: Option<oneshot::Receiver<Vec<u8>>>,
 }
 
 impl ChunkAssembler {
@@ -65,6 +71,8 @@ impl ChunkAssembler {
             completed_games_rx,
             chunks_tx,
             active_chunk,
+            spare_bytes: Some(Vec::new()),
+            in_flight: None,
         }
     }
 
@@ -84,7 +92,7 @@ impl ChunkAssembler {
     }
 
     async fn append_game_per_game(
-        &self,
+        &mut self,
         mut game: CompletedGame,
     ) -> Result<(), ChunkAssemblerError> {
         if game.samples.is_empty() {
@@ -92,24 +100,20 @@ impl ChunkAssembler {
             return Ok(());
         }
 
-        let (game, chunk) = tokio::task::spawn_blocking(move || {
-            let mut encoder = ChunkEncoder::new(game.samples.len());
+        let bytes = self.acquire_buffer();
+        let (game, bytes) = tokio::task::spawn_blocking(move || {
+            let mut encoder = ChunkEncoder::with_buffer(game.samples.len(), bytes);
             for sample in &game.samples {
                 encoder.push(sample);
             }
             game.samples.clear();
-            (
-                game,
-                TrainingChunk {
-                    bytes: encoder.finish(),
-                },
-            )
+            (game, encoder.finish())
         })
         .await
         .expect("chunk encoding task panicked");
 
         let _ = game.recycle_tx.send(game.samples);
-        self.send_chunk(chunk).await
+        self.send_chunk(bytes).await
     }
 
     async fn append_game_fixed(
@@ -118,17 +122,17 @@ impl ChunkAssembler {
         chunk_size: usize,
     ) -> Result<(), ChunkAssemblerError> {
         loop {
-            let active_chunk = self
-                .active_chunk
-                .take()
-                .expect("chunk assembler always owns an active encoder");
+            let active_chunk = match self.active_chunk.take() {
+                Some(chunk) => chunk,
+                None => ChunkEncoder::with_buffer(chunk_size, self.acquire_buffer()),
+            };
             let result = tokio::task::spawn_blocking(move || {
                 Self::encode_until_chunk(active_chunk, chunk_size, game)
             })
             .await
             .expect("chunk encoding task panicked");
 
-            self.active_chunk = Some(result.active_chunk);
+            self.active_chunk = result.active_chunk;
             game = result.game;
 
             if game.samples.is_empty() {
@@ -165,12 +169,11 @@ impl ChunkAssembler {
         }
         game.samples.truncate(remaining);
 
-        let completed_chunk = (active_chunk.record_count() == chunk_size).then(|| {
-            let encoder = std::mem::replace(&mut active_chunk, ChunkEncoder::new(chunk_size));
-            TrainingChunk {
-                bytes: encoder.finish(),
-            }
-        });
+        let (active_chunk, completed_chunk) = if active_chunk.record_count() == chunk_size {
+            (None, Some(active_chunk.finish()))
+        } else {
+            (Some(active_chunk), None)
+        };
 
         EncodedStep {
             active_chunk,
@@ -179,28 +182,47 @@ impl ChunkAssembler {
         }
     }
 
-    async fn send_chunk(&self, chunk: TrainingChunk) -> Result<(), ChunkAssemblerError> {
+    fn acquire_buffer(&mut self) -> Vec<u8> {
+        self.spare_bytes
+            .take()
+            .expect("the previous send must leave a spare byte buffer")
+    }
+
+    async fn send_chunk(&mut self, bytes: Vec<u8>) -> Result<(), ChunkAssemblerError> {
+        if let Some(previous) = self.in_flight.take() {
+            debug_assert!(self.spare_bytes.is_none());
+            self.spare_bytes = Some(
+                previous
+                    .await
+                    .map_err(|_| ChunkAssemblerError::OutputClosed)?,
+            );
+        } else if self.spare_bytes.is_none() {
+            // Per-game mode starts with one buffer; its first publication
+            // creates the second buffer for overlapping the next encode.
+            // After the first send, in_flight remains Some on the success path.
+            self.spare_bytes = Some(Vec::new());
+        }
+        let (recycle_tx, recycle_rx) = oneshot::channel();
         self.chunks_tx
-            .send(chunk)
+            .send(TrainingChunk { bytes, recycle_tx })
             .await
-            .map_err(|_| ChunkAssemblerError::OutputClosed)
+            .map_err(|_| ChunkAssemblerError::OutputClosed)?;
+        self.in_flight = Some(recycle_rx);
+        Ok(())
     }
 
     async fn flush(&mut self) -> Result<(), ChunkAssemblerError> {
-        let active_chunk = self
-            .active_chunk
-            .take()
-            .expect("chunk assembler always owns an active encoder");
+        let Some(active_chunk) = self.active_chunk.take() else {
+            return Ok(());
+        };
         if active_chunk.record_count() == 0 {
             return Ok(());
         }
 
-        let chunk = tokio::task::spawn_blocking(move || TrainingChunk {
-            bytes: active_chunk.finish(),
-        })
-        .await
-        .expect("chunk encoding task panicked");
-        self.send_chunk(chunk).await
+        let bytes = tokio::task::spawn_blocking(move || active_chunk.finish())
+            .await
+            .expect("chunk encoding task panicked");
+        self.send_chunk(bytes).await
     }
 }
 
@@ -243,10 +265,10 @@ mod tests {
         let step = ChunkAssembler::encode_until_chunk(ChunkEncoder::new(2), 2, game);
 
         assert_eq!(step.game.samples.len(), 3);
-        assert_eq!(step.active_chunk.record_count(), 0);
+        assert!(step.active_chunk.is_none());
         let chunk = step.completed_chunk.expect("one full chunk");
-        assert_eq!(record_count(&chunk), 2);
-        assert!(verify_chunk_checksum(&chunk.bytes));
+        assert_eq!(u32::from_le_bytes(chunk[16..20].try_into().unwrap()), 2);
+        assert!(verify_chunk_checksum(&chunk));
     }
 
     #[tokio::test]
@@ -272,6 +294,9 @@ mod tests {
             // The input channel remains open: publication cannot rely on shutdown.
             let chunk = chunks_rx.recv().await.unwrap();
             assert_eq!(chunk.bytes, expected_bytes);
+            let mut bytes = chunk.bytes;
+            bytes.clear();
+            chunk.recycle_tx.send(bytes).unwrap();
             let recycled = recycle_rx.await.unwrap();
             assert!(recycled.is_empty());
             assert_eq!(recycled.as_ptr(), allocation);
@@ -305,6 +330,98 @@ mod tests {
         drop(completed_tx);
         assert_eq!(assembler_task.await.unwrap(), Ok(()));
         assert!(chunks_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn per_game_mode_reuses_only_two_byte_buffers() {
+        let (completed_tx, completed_rx) = mpsc::channel(1);
+        let (chunks_tx, mut chunks_rx) = mpsc::channel(1);
+        let assembler = ChunkAssembler::new(ChunkMode::PerGame, completed_rx, chunks_tx);
+        let assembler_task = tokio::spawn(assembler.run());
+
+        let (recycle_tx, recycle_rx) = oneshot::channel();
+        completed_tx
+            .send(CompletedGame {
+                samples: vec![sample()],
+                recycle_tx,
+            })
+            .await
+            .unwrap();
+        let first = chunks_rx.recv().await.unwrap();
+        let first_allocation = first.bytes.as_ptr();
+        assert!(recycle_rx.await.unwrap().is_empty());
+
+        let (recycle_tx, recycle_rx) = oneshot::channel();
+        completed_tx
+            .send(CompletedGame {
+                samples: vec![sample()],
+                recycle_tx,
+            })
+            .await
+            .unwrap();
+        // Encoding may finish, but publication waits for the first buffer.
+        assert!(recycle_rx.await.unwrap().is_empty());
+        assert!(matches!(
+            chunks_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let mut bytes = first.bytes;
+        bytes.clear();
+        first.recycle_tx.send(bytes).unwrap();
+
+        let second = chunks_rx.recv().await.unwrap();
+        assert_ne!(second.bytes.as_ptr(), first_allocation);
+
+        let (recycle_tx, recycle_rx) = oneshot::channel();
+        completed_tx
+            .send(CompletedGame {
+                samples: vec![sample()],
+                recycle_tx,
+            })
+            .await
+            .unwrap();
+        assert!(recycle_rx.await.unwrap().is_empty());
+        let mut bytes = second.bytes;
+        bytes.clear();
+        second.recycle_tx.send(bytes).unwrap();
+        let third = chunks_rx.recv().await.unwrap();
+        assert_eq!(third.bytes.as_ptr(), first_allocation);
+        drop(completed_tx);
+        assert_eq!(assembler_task.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn dropped_sink_buffer_stops_assembly_instead_of_hanging() {
+        let (completed_tx, completed_rx) = mpsc::channel(1);
+        let (chunks_tx, mut chunks_rx) = mpsc::channel(1);
+        let assembler = ChunkAssembler::new(ChunkMode::PerGame, completed_rx, chunks_tx);
+        let assembler_task = tokio::spawn(assembler.run());
+
+        let (recycle_tx, recycle_rx) = oneshot::channel();
+        completed_tx
+            .send(CompletedGame {
+                samples: vec![sample()],
+                recycle_tx,
+            })
+            .await
+            .unwrap();
+        // Dropping the chunk simulates sink failure before buffer return.
+        drop(chunks_rx.recv().await.unwrap());
+        assert!(recycle_rx.await.unwrap().is_empty());
+
+        let (recycle_tx, recycle_rx) = oneshot::channel();
+        completed_tx
+            .send(CompletedGame {
+                samples: vec![sample()],
+                recycle_tx,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            assembler_task.await.unwrap(),
+            Err(ChunkAssemblerError::OutputClosed)
+        );
+        assert!(recycle_rx.await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -384,11 +501,18 @@ mod tests {
         drop(completed_tx);
 
         let mut chunk_sizes = Vec::new();
+        let mut byte_allocations = Vec::new();
         while let Some(chunk) = chunks_rx.recv().await {
             assert!(verify_chunk_checksum(&chunk.bytes));
             chunk_sizes.push(record_count(&chunk));
+            byte_allocations.push(chunk.bytes.as_ptr());
+            let mut bytes = chunk.bytes;
+            bytes.clear();
+            let _ = chunk.recycle_tx.send(bytes);
         }
         assert_eq!(chunk_sizes, [2, 2, 1]);
+        assert_ne!(byte_allocations[0], byte_allocations[1]);
+        assert_eq!(byte_allocations[0], byte_allocations[2]);
         assert!(recycle_rx.await.unwrap().is_empty());
         assert_eq!(assembler_task.await.unwrap(), Ok(()));
     }

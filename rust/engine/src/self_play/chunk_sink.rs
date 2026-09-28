@@ -66,23 +66,22 @@ impl FileChunkSink {
 
         while let Some(chunk) = self.chunks_rx.recv().await {
             let chunk_id = random_chunk_id().map_err(FileChunkSinkError::RandomnessUnavailable)?;
-            self.write_chunk(chunk_id, chunk).await?;
+            self.write_chunk(chunk_id, &chunk.bytes).await?;
+            let mut bytes = chunk.bytes;
+            bytes.clear();
+            let _ = chunk.recycle_tx.send(bytes);
         }
         Ok(())
     }
 
-    async fn write_chunk(
-        &self,
-        chunk_id: u128,
-        chunk: TrainingChunk,
-    ) -> Result<(), FileChunkSinkError> {
+    async fn write_chunk(&self, chunk_id: u128, bytes: &[u8]) -> Result<(), FileChunkSinkError> {
         let final_path = self.output_dir.join(format!(
             "{CHUNK_FILE_PREFIX}{chunk_id:032x}{CHUNK_FILE_SUFFIX}"
         ));
         let temporary_path = self.output_dir.join(PENDING_CHUNK_FILE);
 
         let mut file = File::create(&temporary_path).await?;
-        file.write_all(&chunk.bytes).await?;
+        file.write_all(bytes).await?;
         file.sync_all().await?;
         drop(file);
         fs::rename(&temporary_path, final_path).await?;
@@ -188,14 +187,18 @@ mod tests {
                 let (chunks_tx, chunks_rx) = mpsc::channel(1);
                 let sink = FileChunkSink::new(output_dir, chunks_rx);
                 let sink_task = tokio::spawn(sink.run());
+                let (recycle_tx, recycle_rx) = tokio::sync::oneshot::channel();
+                let bytes = encode_chunk(&[sample()]);
+                let allocation = bytes.as_ptr();
                 chunks_tx
-                    .send(TrainingChunk {
-                        bytes: encode_chunk(&[sample()]),
-                    })
+                    .send(TrainingChunk { bytes, recycle_tx })
                     .await
                     .unwrap();
                 drop(chunks_tx);
                 assert!(sink_task.await.unwrap().is_ok());
+                let returned = recycle_rx.await.unwrap();
+                assert!(returned.is_empty());
+                assert_eq!(returned.as_ptr(), allocation);
             }
         };
 
