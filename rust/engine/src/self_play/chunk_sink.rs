@@ -116,7 +116,7 @@ mod tests {
         game::{game_state::GameState, rules::Rules},
         inference::{inputs::NNInput, policy::POLICY_SIZE},
         self_play::{
-            chunk_assembler::{ChunkAssembler, CompletedGame},
+            chunk_assembler::{ChunkAssembler, ChunkMode, CompletedGame},
             training_data::{
                 CHUNK_CHECKSUM_SIZE, CHUNK_FORMAT_VERSION, CHUNK_HEADER_SIZE, CHUNK_MAGIC,
                 TRAINING_RECORD_SIZE, TrainingSample, ValueTarget, encode_chunk,
@@ -238,7 +238,8 @@ mod tests {
         let output_dir = TestDir::new();
         let (completed_games_tx, completed_games_rx) = mpsc::channel(1);
         let (chunks_tx, chunks_rx) = mpsc::channel(1);
-        let assembler = ChunkAssembler::new(2, completed_games_rx, chunks_tx);
+        let assembler =
+            ChunkAssembler::new(ChunkMode::FixedRecords(2), completed_games_rx, chunks_tx);
         let sink = FileChunkSink::new(output_dir.0.clone(), chunks_rx);
         let assembler_task = tokio::spawn(assembler.run());
         let sink_task = tokio::spawn(sink.run());
