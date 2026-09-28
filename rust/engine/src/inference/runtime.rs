@@ -9,7 +9,7 @@ use crate::inference::{
     policy::legal_mask,
     symmetry::Symmetry,
 };
-use rand::{RngExt, SeedableRng, rngs::SmallRng, rngs::SysRng};
+use rand::{RngExt, SeedableRng, rngs::SmallRng};
 use std::{sync::Arc, thread::JoinHandle};
 
 mod cache;
@@ -31,10 +31,10 @@ pub(crate) struct ModelRuntime {
 #[derive(Clone)]
 pub(crate) struct ModelHandle(Arc<ModelRuntime>);
 
-/// A worker's client for one model runtime, with one reusable request slot.
+/// A worker's reusable request slot and symmetry RNG, bound to a model when active.
 /// Only one evaluation may be outstanding for a client.
 pub(crate) struct InferenceClient {
-    model_handle: ModelHandle,
+    model_handle: Option<ModelHandle>,
     slot: Arc<EvalSlot>,
     symmetry_rng: Option<SmallRng>,
 }
@@ -46,6 +46,10 @@ struct InferenceExecutor<B: InferenceBackend> {
     max_batch_size: usize,
 }
 impl ModelHandle {
+    pub(crate) fn is_last_handle(&self) -> bool {
+        Arc::strong_count(&self.0) == 1
+    }
+
     fn model_version(&self) -> ModelVersion {
         self.0.model_version
     }
@@ -61,31 +65,46 @@ impl ModelHandle {
 }
 impl InferenceClient {
     pub(crate) fn model_version(&self) -> ModelVersion {
-        self.model_handle.model_version()
+        self.model_handle().model_version()
     }
-    pub(crate) fn new(model_handle: ModelHandle, randomize_symmetry: bool) -> Self {
-        let symmetry_rng = randomize_symmetry.then(|| {
-            SmallRng::try_from_rng(&mut SysRng)
-                .expect("system RNG unavailable for inference symmetry")
-        });
+    pub(crate) fn new(model_handle: ModelHandle, symmetry_seed: Option<u64>) -> Self {
+        let mut client = Self::unbound(symmetry_seed);
+        client.install_model(model_handle);
+        client
+    }
+    pub(crate) fn unbound(symmetry_seed: Option<u64>) -> Self {
         Self {
-            model_handle,
+            model_handle: None,
             slot: Arc::new(EvalSlot::new()),
-            symmetry_rng,
+            symmetry_rng: symmetry_seed.map(SmallRng::seed_from_u64),
         }
     }
-    #[cfg(test)]
-    pub(crate) fn with_symmetry_seed(model_handle: ModelHandle, symmetry_seed: u64) -> Self {
-        Self {
-            model_handle,
-            slot: Arc::new(EvalSlot::new()),
-            symmetry_rng: Some(SmallRng::seed_from_u64(symmetry_seed)),
-        }
+    fn model_handle(&self) -> &ModelHandle {
+        self.model_handle
+            .as_ref()
+            .expect("inference requires an installed model")
     }
-    pub(crate) fn reseed_symmetry(&mut self, symmetry_seed: u64) {
-        if let Some(rng) = self.symmetry_rng.as_mut() {
-            *rng = SmallRng::seed_from_u64(symmetry_seed);
-        }
+    pub(crate) fn has_model(&self) -> bool {
+        self.model_handle.is_some()
+    }
+    pub(crate) fn release_model(&mut self) {
+        debug_assert!(
+            self.slot.is_idle(),
+            "cannot release a model during inference"
+        );
+        drop(
+            self.model_handle
+                .take()
+                .expect("cannot release an unbound inference client"),
+        );
+    }
+    pub(crate) fn install_model(&mut self, model_handle: ModelHandle) {
+        debug_assert!(self.model_handle.is_none(), "model already installed");
+        debug_assert!(
+            self.slot.is_idle(),
+            "cannot install a model during inference"
+        );
+        self.model_handle = Some(model_handle);
     }
     fn next_symmetry(&mut self) -> Option<Symmetry> {
         self.symmetry_rng
@@ -109,7 +128,7 @@ impl InferenceClient {
         // either kind of evaluation is a valid prediction for the same position;
         // sharing avoids splitting the cache merely for exact reproducibility.
         let key = EvaluationKey::new(game_state);
-        let cached = match self.model_handle.lookup(key) {
+        let cached = match self.model_handle().lookup(key) {
             Some(output) if !include_ownership || output.has_ownership() => return Ok(output),
             cached => cached,
         };
@@ -127,7 +146,7 @@ impl InferenceClient {
 
         self.slot.queue(input);
         // send a clone of the arc pointer
-        if let Err(error) = self.model_handle.submit_request(self.slot.clone()) {
+        if let Err(error) = self.model_handle().submit_request(self.slot.clone()) {
             self.slot.cancel_queued();
             return Err(error);
         }
@@ -150,7 +169,7 @@ impl InferenceClient {
             fresh.process_in_place(next_player, &legal_mask);
         }
 
-        self.model_handle.insert(key, output.clone());
+        self.model_handle().insert(key, output.clone());
 
         Ok(output)
     }

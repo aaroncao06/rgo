@@ -30,7 +30,6 @@ struct QueueInner {
 }
 
 impl EvalSlot {
-    #[cfg(test)]
     pub(super) fn is_idle(&self) -> bool {
         matches!(&*self.state.lock().unwrap(), SlotState::Idle)
     }

@@ -70,6 +70,7 @@ impl SearchBudgetPolicy {
 pub(super) struct SelfPlayParams {
     pub(super) rules: Rules,
     pub(super) search_budget_policy: SearchBudgetPolicy,
+    pub(super) randomize_inference_symmetry: bool,
 }
 
 impl Default for SelfPlayParams {
@@ -77,6 +78,7 @@ impl Default for SelfPlayParams {
         Self {
             rules: Rules::TROMP_TAYLORISH,
             search_budget_policy: SearchBudgetPolicy::fixed(SearchBudget::new(512, 1024)),
+            randomize_inference_symmetry: true,
         }
     }
 }
@@ -105,6 +107,7 @@ mod tests {
             params.search_budget_policy.sample(&mut rng),
             SearchBudget::new(512, 1024)
         );
+        assert!(params.randomize_inference_symmetry);
     }
 
     #[test]

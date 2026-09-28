@@ -1,6 +1,6 @@
 use rand::{SeedableRng, rngs::SmallRng};
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use super::{
     RNG_SEED,
@@ -16,7 +16,7 @@ use crate::{
     inference::{
         inputs::NNInput,
         policy::{BOARD_POLICY_SIZE, POLICY_SIZE, loc_to_policy},
-        runtime::InferenceClient,
+        runtime::{InferenceClient, ModelHandle},
     },
     search::{
         node_store::FixedArenaNodeStore,
@@ -49,12 +49,21 @@ struct SelfPlayRecord {
 pub(super) enum SelfPlayError {
     Search(SearchError),
     ChunkAssemblerClosed,
+    ModelCoordinatorClosed,
 }
 
 impl From<SearchError> for SelfPlayError {
     fn from(error: SearchError) -> Self {
         Self::Search(error)
     }
+}
+
+// orchestrator says pause > workers say paused > orchestrator constructs new runtime and sends new handle
+pub(super) struct WorkerModelControl {
+    pub(super) worker_index: usize,
+    pub(super) pause_rx: watch::Receiver<bool>,
+    pub(super) paused_tx: mpsc::Sender<usize>,
+    pub(super) resume_rx: mpsc::Receiver<ModelHandle>,
 }
 
 // training_samples and recycle_rx are option since they are sent to the chunk writer
@@ -66,6 +75,7 @@ pub(super) struct SelfPlayWorker {
     recycle_rx: Option<oneshot::Receiver<Vec<TrainingSample>>>,
     search_worker: SearchWorker<FixedArenaNodeStore>,
     inference_client: InferenceClient,
+    model_control: WorkerModelControl,
     rng: SmallRng,
     params: SelfPlayParams,
 }
@@ -74,13 +84,17 @@ impl SelfPlayWorker {
     pub(super) fn new(
         search_params: SearchParams,
         self_play_params: SelfPlayParams,
-        mut inference_client: InferenceClient,
         completed_games_tx: mpsc::Sender<CompletedGame>,
+        model_control: WorkerModelControl,
     ) -> Self {
         let worker_id = NEXT_WORKER_ID.fetch_add(1, Ordering::Relaxed);
         let gameplay_seed = derive_rng_seed(RNG_SEED, worker_id, GAMEPLAY_RNG_STREAM);
         let symmetry_seed = derive_rng_seed(RNG_SEED, worker_id, SYMMETRY_RNG_STREAM);
-        inference_client.reseed_symmetry(symmetry_seed);
+        let inference_client = InferenceClient::unbound(
+            self_play_params
+                .randomize_inference_symmetry
+                .then_some(symmetry_seed),
+        );
 
         let node_store = FixedArenaNodeStore::new(0);
         let game_state = GameState::new(self_play_params.rules);
@@ -92,6 +106,7 @@ impl SelfPlayWorker {
             recycle_rx: None,
             search_worker: SearchWorker::new(node_store, search_params),
             inference_client,
+            model_control,
             rng: SmallRng::seed_from_u64(gameplay_seed),
             params: self_play_params,
         }
@@ -121,15 +136,48 @@ impl SelfPlayWorker {
         });
 
         let played = self.game_state.play(selected_move);
-        assert!(played, "search selected an illegal move");
+        debug_assert!(played, "search selected an illegal move");
 
         Ok(())
     }
+
+    async fn pause_for_model_update(&mut self) -> Result<(), SelfPlayError> {
+        if !self.inference_client.has_model() {
+            let model = self
+                .model_control
+                .resume_rx
+                .recv()
+                .await
+                .ok_or(SelfPlayError::ModelCoordinatorClosed)?;
+            self.inference_client.install_model(model);
+        }
+        if !*self.model_control.pause_rx.borrow() {
+            // latest send value was not to pause
+            return Ok(());
+        }
+        // This is called only between searches, so no inference is outstanding.
+        self.inference_client.release_model();
+        self.model_control
+            .paused_tx
+            .send(self.model_control.worker_index)
+            .await
+            .map_err(|_| SelfPlayError::ModelCoordinatorClosed)?;
+        let model = self
+            .model_control
+            .resume_rx
+            .recv()
+            .await
+            .ok_or(SelfPlayError::ModelCoordinatorClosed)?;
+        self.inference_client.install_model(model);
+        Ok(())
+    }
+
     pub(super) async fn play_game(&mut self) -> Result<(), SelfPlayError> {
         self.game_state.reset(self.params.rules);
         self.records.clear();
         let search_budget = self.params.search_budget_policy.sample(&mut self.rng);
         while !self.game_state.is_finished() {
+            self.pause_for_model_update().await?;
             self.play_move(search_budget).await?;
         }
         self.submit_finished_game().await
@@ -201,10 +249,8 @@ fn build_training_samples(
                 ownership,
             },
         });
-        assert!(
-            game_state.play(record.selected_move),
-            "recorded self-play move failed during replay"
-        );
+        let played = game_state.play(record.selected_move);
+        debug_assert!(played, "recorded self-play move failed during replay");
     }
     debug_assert_eq!(
         game_state.current_state_hash(),
