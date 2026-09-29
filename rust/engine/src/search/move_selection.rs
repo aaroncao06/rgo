@@ -65,7 +65,7 @@ pub(super) fn adjust_lcb(
     reference_weight: f64,
     min_prop: f64,
 ) {
-    assert_eq!(weights.len(), lcbs.len());
+    debug_assert_eq!(weights.len(), lcbs.len());
     let mut best_lcb = -1e10;
     let mut best_index = None;
     for (i, (&weight, &(lcb, _))) in weights.iter().zip(lcbs).enumerate() {

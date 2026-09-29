@@ -72,7 +72,7 @@ impl ChunkEncoder {
     }
 
     pub(super) fn push(&mut self, sample: &TrainingSample) {
-        assert!(
+        debug_assert!(
             self.record_count < self.record_capacity,
             "training chunk capacity exceeded"
         );
@@ -98,7 +98,7 @@ impl ChunkEncoder {
     }
 
     pub(super) fn finish(mut self) -> Vec<u8> {
-        assert!(self.record_count > 0, "cannot finish an empty chunk");
+        debug_assert!(self.record_count > 0, "cannot finish an empty chunk");
         debug_assert_eq!(
             self.bytes.len(),
             CHUNK_HEADER_SIZE + self.record_count * TRAINING_RECORD_SIZE

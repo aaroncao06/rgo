@@ -174,7 +174,7 @@ impl InferenceClient {
 
         // executor moves its Arc<NNOutput> into the slot so it doesnt retain a copy, cache gets its copy after the mutation
         let mut output = self.slot.wait_for_result().await?;
-        assert!(
+        debug_assert!(
             !include_ownership || output.has_ownership(),
             "backend omitted requested ownership output"
         );
@@ -198,7 +198,7 @@ impl InferenceClient {
 
 impl<B: InferenceBackend> InferenceExecutor<B> {
     fn new(queue: Arc<BatchQueue>, backend: B, max_batch_size: usize) -> Self {
-        assert!(max_batch_size > 0, "need positive batch size");
+        debug_assert!(max_batch_size > 0, "need positive batch size");
         Self {
             queue,
             backend,

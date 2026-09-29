@@ -1,3 +1,11 @@
 [workspace]
 members = ["engine"]
 resolver = "2"
+
+# Panics are fatal for the entire process, including inference executor threads.
+# Cargo test uses unwinding independently of these normal build profiles.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

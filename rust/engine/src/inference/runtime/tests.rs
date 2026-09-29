@@ -318,6 +318,7 @@ fn rebinding_a_client_preserves_its_slot_and_symmetry_sequence() {
     }
 }
 
+#[cfg(debug_assertions)]
 #[tokio::test]
 #[should_panic(expected = "backend omitted requested ownership output")]
 async fn missing_requested_ownership_violates_backend_contract() {
