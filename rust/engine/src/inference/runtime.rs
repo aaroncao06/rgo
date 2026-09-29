@@ -11,6 +11,7 @@ use crate::inference::{
 };
 use rand::{RngExt, SeedableRng, rngs::SmallRng};
 use std::{
+    error::Error,
     path::Path,
     sync::{Arc, mpsc},
     thread::JoinHandle,
@@ -35,6 +36,16 @@ pub(crate) struct ModelRuntime {
 pub(crate) enum ModelStartupError<E> {
     Backend(E),
     ExecutorPanicked,
+}
+
+type BoxedModelError = Box<dyn Error + Send + Sync>;
+
+/// Checkpoint preparation and executor startup fail at different stages.
+/// The backend error stays boxed until the concrete model backend is chosen.
+#[derive(Debug)]
+pub(crate) enum ModelLoadError {
+    Checkpoint(BoxedModelError),
+    Startup(ModelStartupError<BoxedModelError>),
 }
 
 // wrapper so that client doesnt access executor threads and allow easy switching. api for queueing and caching
@@ -234,8 +245,8 @@ impl ModelRuntime {
     /// then start inference. The orchestrator only coordinates when this happens.
     /// Backend construction happens on each executor thread; see `start`.
     #[allow(dead_code)]
-    pub(crate) fn load(_checkpoint_path: &Path) -> Result<ModelHandle, &'static str> {
-        Err("model loading is not implemented yet")
+    pub(crate) fn load(_checkpoint_path: &Path) -> Result<ModelHandle, ModelLoadError> {
+        unimplemented!("model loading is not implemented yet")
     }
 
     /// Start an immutable model runtime and its executor threads.

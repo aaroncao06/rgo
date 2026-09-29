@@ -1,5 +1,4 @@
 use rand::{SeedableRng, rngs::SmallRng};
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use super::{
@@ -27,12 +26,11 @@ use crate::{
 
 const GAMEPLAY_RNG_STREAM: u64 = 0x243f_6a88_85a3_08d3;
 const SYMMETRY_RNG_STREAM: u64 = 0x1319_8a2e_0370_7344;
-static NEXT_WORKER_ID: AtomicU64 = AtomicU64::new(0);
 
-fn derive_rng_seed(global_seed: u64, worker_id: u64, stream: u64) -> u64 {
+fn derive_rng_seed(global_seed: u64, worker_index: u64, stream: u64) -> u64 {
     // SplitMix64 gives each purpose and worker a deterministic, independent
     // stream while leaving one global seed as the only user-facing setting.
-    let mut value = global_seed ^ worker_id.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ stream;
+    let mut value = global_seed ^ worker_index.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ stream;
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
@@ -87,9 +85,13 @@ impl SelfPlayWorker {
         completed_games_tx: mpsc::Sender<CompletedGame>,
         model_control: WorkerModelControl,
     ) -> Self {
-        let worker_id = NEXT_WORKER_ID.fetch_add(1, Ordering::Relaxed);
-        let gameplay_seed = derive_rng_seed(RNG_SEED, worker_id, GAMEPLAY_RNG_STREAM);
-        let symmetry_seed = derive_rng_seed(RNG_SEED, worker_id, SYMMETRY_RNG_STREAM);
+        debug_assert!(
+            *model_control.pause_rx.borrow(),
+            "new workers must start paused until their first model arrives"
+        );
+        let worker_index = model_control.worker_index as u64;
+        let gameplay_seed = derive_rng_seed(RNG_SEED, worker_index, GAMEPLAY_RNG_STREAM);
+        let symmetry_seed = derive_rng_seed(RNG_SEED, worker_index, SYMMETRY_RNG_STREAM);
         let inference_client = InferenceClient::unbound(
             self_play_params
                 .randomize_inference_symmetry
@@ -141,22 +143,14 @@ impl SelfPlayWorker {
         Ok(())
     }
 
-    async fn pause_for_model_update(&mut self) -> Result<(), SelfPlayError> {
-        if !self.inference_client.has_model() {
-            let model = self
-                .model_control
-                .resume_rx
-                .recv()
-                .await
-                .ok_or(SelfPlayError::ModelCoordinatorClosed)?;
-            self.inference_client.install_model(model);
-        }
+    async fn sync_model(&mut self) -> Result<(), SelfPlayError> {
         if !*self.model_control.pause_rx.borrow() {
-            // latest send value was not to pause
             return Ok(());
         }
         // This is called only between searches, so no inference is outstanding.
-        self.inference_client.release_model();
+        if self.inference_client.has_model() {
+            self.inference_client.release_model();
+        }
         self.model_control
             .paused_tx
             .send(self.model_control.worker_index)
@@ -175,9 +169,9 @@ impl SelfPlayWorker {
     pub(super) async fn play_game(&mut self) -> Result<(), SelfPlayError> {
         self.game_state.reset(self.params.rules);
         self.records.clear();
-        let search_budget = self.params.search_budget_policy.sample(&mut self.rng);
         while !self.game_state.is_finished() {
-            self.pause_for_model_update().await?;
+            self.sync_model().await?;
+            let search_budget = self.params.search_budget_policy.sample(&mut self.rng);
             self.play_move(search_budget).await?;
         }
         self.submit_finished_game().await
