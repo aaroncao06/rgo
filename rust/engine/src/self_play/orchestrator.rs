@@ -1,5 +1,5 @@
-//! Local self-play task lifecycle. A caller publishes its latest checkpoint
-//! path; this module loads and replaces model runtimes at move boundaries.
+//! Local self-play task lifecycle. A caller publishes its latest model
+//! version; this module loads and replaces model runtimes at move boundaries.
 
 use std::{path::PathBuf, thread};
 
@@ -17,7 +17,9 @@ use super::{
     worker::{SelfPlayError, WorkerModelControl},
 };
 use crate::{
-    inference::runtime::{ModelHandle, ModelLoadError, ModelRuntime},
+    inference::runtime::{
+        ModelHandle, ModelLoadError, ModelRuntime, ModelRuntimeConfig, ModelVersion,
+    },
     search::params::SearchParams,
 };
 
@@ -31,9 +33,9 @@ pub(super) enum SelfPlayRunError {
     Sink(FileChunkSinkError),
     Task(tokio::task::JoinError),
     ModelLoad(ModelLoadError),
-    CheckpointSourceClosed,
+    ModelSourceClosed,
     FinishSourceClosed,
-    LatestCheckpointCleared,
+    LatestModelCleared,
     OldModelStillInUse,
     WorkerEventsClosed,
 }
@@ -114,7 +116,7 @@ impl SelfPlayOrchestrator {
     }
 
     /// Run until a finish-games request stops new games. The checkpoint source
-    /// may start at `None`, but must not clear its path once one is published.
+    /// may start at `None`, but must not clear its version once one is published.
     /// Keep both control-channel senders alive while workers are active. Send
     /// `true` to request a graceful finish; dropping either sender during
     /// coordination is an error, not a shutdown signal. The final chunk drain
@@ -124,11 +126,14 @@ impl SelfPlayOrchestrator {
     /// process because worker-group threads may still be running.
     pub(super) async fn run(
         self,
-        latest_checkpoint_rx: watch::Receiver<Option<PathBuf>>,
+        runtime_config: ModelRuntimeConfig,
+        latest_model_version_rx: watch::Receiver<Option<ModelVersion>>,
         finish_games_rx: watch::Receiver<bool>,
     ) -> Result<(), SelfPlayRunError> {
-        self.run_inner(None, latest_checkpoint_rx, finish_games_rx, |path| {
-            ModelRuntime::load(&path)
+        // Each configured worker can have one outstanding inference request.
+        let queue_capacity = self.resume_txs.len();
+        self.run_inner(None, latest_model_version_rx, finish_games_rx, |version| {
+            ModelRuntime::load(version, queue_capacity, &runtime_config)
         })
         .await
     }
@@ -137,42 +142,41 @@ impl SelfPlayOrchestrator {
     async fn run_n_games_per_worker<F>(
         self,
         games_per_worker: usize,
-        latest_checkpoint_rx: watch::Receiver<Option<PathBuf>>,
+        latest_model_version_rx: watch::Receiver<Option<ModelVersion>>,
         load_model: F,
     ) -> Result<(), SelfPlayRunError>
     where
-        F: FnMut(PathBuf) -> Result<ModelHandle, ModelLoadError>,
+        F: FnMut(ModelVersion) -> Result<ModelHandle, ModelLoadError>,
     {
         let (_finish_tx, finish_rx) = watch::channel(false);
         self.run_inner(
             Some(games_per_worker),
-            latest_checkpoint_rx,
+            latest_model_version_rx,
             finish_rx,
             load_model,
         )
         .await
     }
 
-    // Temporary test seam: ModelRuntime::load is not implemented yet. Remove
-    // this loader parameter once the real loader can exercise these lifecycle
-    // tests; the production run() API always uses ModelRuntime::load.
+    // The production run() API always loads ONNX through ModelRuntime::load.
+    // Private lifecycle tests inject controlled failures and update timing here.
     async fn run_inner<F>(
         self,
         max_games_per_worker: Option<usize>,
-        mut latest_checkpoint_rx: watch::Receiver<Option<PathBuf>>,
+        mut latest_model_version_rx: watch::Receiver<Option<ModelVersion>>,
         mut finish_games_rx: watch::Receiver<bool>,
         mut load_model: F,
     ) -> Result<(), SelfPlayRunError>
     where
-        F: FnMut(PathBuf) -> Result<ModelHandle, ModelLoadError>,
+        F: FnMut(ModelVersion) -> Result<ModelHandle, ModelLoadError>,
     {
-        if !wait_for_first_checkpoint(&mut latest_checkpoint_rx, &mut finish_games_rx).await? {
+        if !wait_for_first_model(&mut latest_model_version_rx, &mut finish_games_rx).await? {
             return Ok(());
         }
         let mut pipeline = RunningPipeline::start(
             self,
             max_games_per_worker,
-            latest_checkpoint_rx,
+            latest_model_version_rx,
             finish_games_rx,
         );
         pipeline.drive(&mut load_model).await?;
@@ -182,15 +186,15 @@ impl SelfPlayOrchestrator {
 
 // No game can start without a model. Waiting before spawning workers also
 // lets a finish request exit without leaving them blocked on their first model.
-async fn wait_for_first_checkpoint(
-    latest_checkpoint_rx: &mut watch::Receiver<Option<PathBuf>>,
+async fn wait_for_first_model(
+    latest_model_version_rx: &mut watch::Receiver<Option<ModelVersion>>,
     finish_games_rx: &mut watch::Receiver<bool>,
 ) -> Result<bool, SelfPlayRunError> {
     loop {
         if *finish_games_rx.borrow() {
             return Ok(false);
         }
-        if latest_checkpoint_rx.borrow().is_some() {
+        if latest_model_version_rx.borrow().is_some() {
             return Ok(!*finish_games_rx.borrow());
         }
         tokio::select! {
@@ -198,8 +202,8 @@ async fn wait_for_first_checkpoint(
             change = finish_games_rx.changed() => {
                 change.map_err(|_| SelfPlayRunError::FinishSourceClosed)?;
             }
-            change = latest_checkpoint_rx.changed() => {
-                change.map_err(|_| SelfPlayRunError::CheckpointSourceClosed)?;
+            change = latest_model_version_rx.changed() => {
+                change.map_err(|_| SelfPlayRunError::ModelSourceClosed)?;
             }
         }
     }
@@ -209,7 +213,7 @@ async fn wait_for_first_checkpoint(
 /// model handoffs and the final drain.
 struct RunningPipeline {
     pause_tx: watch::Sender<bool>,
-    latest_checkpoint_rx: watch::Receiver<Option<PathBuf>>,
+    latest_model_version_rx: watch::Receiver<Option<ModelVersion>>,
     finish_games_rx: watch::Receiver<bool>,
     paused_rx: mpsc::Receiver<usize>,
     resume_txs: Vec<mpsc::Sender<ModelHandle>>,
@@ -225,7 +229,7 @@ impl RunningPipeline {
     fn start(
         orchestrator: SelfPlayOrchestrator,
         max_games_per_worker: Option<usize>,
-        latest_checkpoint_rx: watch::Receiver<Option<PathBuf>>,
+        latest_model_version_rx: watch::Receiver<Option<ModelVersion>>,
         finish_games_rx: watch::Receiver<bool>,
     ) -> Self {
         let SelfPlayOrchestrator {
@@ -256,7 +260,7 @@ impl RunningPipeline {
 
         Self {
             pause_tx,
-            latest_checkpoint_rx,
+            latest_model_version_rx,
             finish_games_rx,
             paused_rx,
             resume_txs,
@@ -271,19 +275,19 @@ impl RunningPipeline {
 
     async fn drive<F>(&mut self, load_model: &mut F) -> Result<(), SelfPlayRunError>
     where
-        F: FnMut(PathBuf) -> Result<ModelHandle, ModelLoadError>,
+        F: FnMut(ModelVersion) -> Result<ModelHandle, ModelLoadError>,
     {
         // Treat the channel's current value as the first publication.
-        self.latest_checkpoint_rx.mark_changed();
+        self.latest_model_version_rx.mark_changed();
         while self.active_workers > 0 {
             tokio::select! {
                 biased;
-                update = self.latest_checkpoint_rx.changed() => {
-                    update.map_err(|_| SelfPlayRunError::CheckpointSourceClosed)?;
-                    if self.latest_checkpoint_rx.borrow().is_none() {
+                update = self.latest_model_version_rx.changed() => {
+                    update.map_err(|_| SelfPlayRunError::ModelSourceClosed)?;
+                    if self.latest_model_version_rx.borrow().is_none() {
                         // Startup already observed a checkpoint. Its published
-                        // path must never be cleared, even before the first load.
-                        return Err(SelfPlayRunError::LatestCheckpointCleared);
+                        // version must never be cleared, even before the first load.
+                        return Err(SelfPlayRunError::LatestModelCleared);
                     }
                     if !self.replace_model(load_model).await? {
                         // replace model returns false when it already checks active worker == 0
@@ -316,7 +320,7 @@ impl RunningPipeline {
     /// or `false` if all workers finished before the replacement was needed.
     async fn replace_model<F>(&mut self, load_model: &mut F) -> Result<bool, SelfPlayRunError>
     where
-        F: FnMut(PathBuf) -> Result<ModelHandle, ModelLoadError>,
+        F: FnMut(ModelVersion) -> Result<ModelHandle, ModelLoadError>,
     {
         let _ = self.pause_tx.send(true);
         let mut paused_workers = 0;
@@ -332,8 +336,8 @@ impl RunningPipeline {
                         paused_open = false;
                     }
                 }
-                change = self.latest_checkpoint_rx.changed() => {
-                    change.map_err(|_| SelfPlayRunError::CheckpointSourceClosed)?;
+                change = self.latest_model_version_rx.changed() => {
+                    change.map_err(|_| SelfPlayRunError::ModelSourceClosed)?;
                 }
                 change = self.finish_games_rx.changed() => {
                     change.map_err(|_| SelfPlayRunError::FinishSourceClosed)?;
@@ -367,12 +371,9 @@ impl RunningPipeline {
         // drop joins the old executor threads before loading the new backend.
         drop(self.model.take());
         // A newer checkpoint may have appeared during the pause. borrow and update avoids the race
-        let path = self
-            .latest_checkpoint_rx
-            .borrow_and_update()
-            .clone()
-            .ok_or(SelfPlayRunError::LatestCheckpointCleared)?;
-        let new_model = load_model(path).map_err(SelfPlayRunError::ModelLoad)?;
+        let version = (*self.latest_model_version_rx.borrow_and_update())
+            .ok_or(SelfPlayRunError::LatestModelCleared)?;
+        let new_model = load_model(version).map_err(SelfPlayRunError::ModelLoad)?;
         let _ = self.pause_tx.send(false);
         for resume_tx in &self.resume_txs {
             if !resume_tx.is_closed() {
@@ -465,13 +466,25 @@ mod tests {
             inputs::NNInput,
             outputs::NNOutput,
             policy::{PASS_POLICY_INDEX, POLICY_SIZE},
-            runtime::{ModelRuntime, test_backend_factory},
+            runtime::{start_test_runtime, test_backend_factory},
         },
         search::worker::SearchBudget,
         self_play::training_data::verify_chunk_checksum,
     };
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
+    fn cpu_runtime_config() -> ModelRuntimeConfig {
+        ModelRuntimeConfig {
+            model_dir: PathBuf::from("unused-models"),
+            executors: vec![crate::inference::runtime::ExecutorConfig {
+                device: crate::inference::onnx::InferenceDevice::Cpu { intra_threads: 1 },
+                max_batch_size: 4,
+            }],
+            cache_capacity: 64,
+            num_cache_shards: 1,
+        }
+    }
 
     struct TestDir(PathBuf);
 
@@ -612,13 +625,12 @@ mod tests {
         games_per_worker: usize,
         worker_count: usize,
     ) -> Result<(), SelfPlayRunError> {
-        let (_latest_tx, latest_rx) = watch::channel(Some(PathBuf::from("model-0")));
+        let (_latest_tx, latest_rx) = watch::channel(Some(0));
         orchestrator
             .run_n_games_per_worker(games_per_worker, latest_rx, |_| {
-                Ok(ModelRuntime::start(
+                Ok(start_test_runtime(
                     0,
-                    vec![test_backend_factory(PassBackend)],
-                    8,
+                    vec![test_backend_factory(PassBackend, 8)],
                     worker_count,
                     64,
                     1,
@@ -691,13 +703,13 @@ mod tests {
     async fn continuous_run_returns_on_worker_failure() {
         let dir = TestDir::new();
         let orchestrator = orchestrator(dir.0.clone(), ChunkMode::PerGame, 1);
-        let (_latest_tx, latest_rx) = watch::channel(Some(PathBuf::from("model-0")));
+        let (_latest_tx, latest_rx) = watch::channel(Some(0));
         let (_finish_tx, finish_rx) = watch::channel(false);
 
         let result = orchestrator
             .run_inner(None, latest_rx, finish_rx, |_| {
                 Ok(
-                    ModelRuntime::start(0, vec![test_backend_factory(FailingBackend)], 8, 1, 64, 1)
+                    start_test_runtime(0, vec![test_backend_factory(FailingBackend, 8)], 1, 64, 1)
                         .unwrap(),
                 )
             })
@@ -713,13 +725,13 @@ mod tests {
         let dir = TestDir::new();
         let missing = dir.0.join("missing");
         let orchestrator = orchestrator(missing, ChunkMode::PerGame, 1);
-        let (_latest_tx, latest_rx) = watch::channel(Some(PathBuf::from("model-0")));
+        let (_latest_tx, latest_rx) = watch::channel(Some(0));
         let (_finish_tx, finish_rx) = watch::channel(false);
 
         let result = orchestrator
             .run_inner(None, latest_rx, finish_rx, |_| {
                 Ok(
-                    ModelRuntime::start(0, vec![test_backend_factory(PassBackend)], 8, 1, 64, 1)
+                    start_test_runtime(0, vec![test_backend_factory(PassBackend, 8)], 1, 64, 1)
                         .unwrap(),
                 )
             })
@@ -731,13 +743,13 @@ mod tests {
     async fn initial_load_failure_returns_promptly() {
         let dir = TestDir::new();
         let orchestrator = orchestrator(dir.0.clone(), ChunkMode::PerGame, 2);
-        let (_latest_tx, latest_rx) = watch::channel(Some(PathBuf::from("missing-model")));
+        let (_latest_tx, latest_rx) = watch::channel(Some(99));
 
         let result = orchestrator
             .run_n_games_per_worker(1, latest_rx, |_| {
-                Err(ModelLoadError::Checkpoint(
-                    "initial model load failed".into(),
-                ))
+                Err(ModelLoadError::Backend(ort::Error::new(
+                    "initial model load failed",
+                )))
             })
             .await;
         assert!(matches!(result, Err(SelfPlayRunError::ModelLoad(_))));
@@ -749,16 +761,20 @@ mod tests {
         let dir = TestDir::new();
         let orchestrator = orchestrator(dir.0.clone(), ChunkMode::PerGame, 1);
         let (latest_tx, latest_rx) = watch::channel(None);
-        let run = orchestrator.run_n_games_per_worker(1, latest_rx, |path| {
-            assert_eq!(path, PathBuf::from("model-0"));
-            Ok(
-                ModelRuntime::start(0, vec![test_backend_factory(PassBackend)], 8, 1, 64, 1)
-                    .unwrap(),
+        let run = orchestrator.run_n_games_per_worker(1, latest_rx, |version| {
+            assert_eq!(version, 42);
+            Ok(start_test_runtime(
+                version,
+                vec![test_backend_factory(PassBackend, 8)],
+                1,
+                64,
+                1,
             )
+            .unwrap())
         });
         let publish = async {
             tokio::task::yield_now().await;
-            latest_tx.send(Some(PathBuf::from("model-0"))).unwrap();
+            latest_tx.send(Some(42)).unwrap();
             latest_tx
         };
         let (result, _latest_tx) = tokio::join!(run, publish);
@@ -770,10 +786,10 @@ mod tests {
     async fn rejects_checkpoint_cleared_between_startup_gate_and_first_load() {
         let dir = TestDir::new();
         let orchestrator = orchestrator(dir.0.clone(), ChunkMode::PerGame, 1);
-        let (latest_tx, mut latest_rx) = watch::channel(Some(PathBuf::from("model-0")));
+        let (latest_tx, mut latest_rx) = watch::channel(Some(0));
         let (_finish_tx, mut finish_rx) = watch::channel(false);
         assert!(
-            wait_for_first_checkpoint(&mut latest_rx, &mut finish_rx)
+            wait_for_first_model(&mut latest_rx, &mut finish_rx)
                 .await
                 .unwrap()
         );
@@ -793,10 +809,7 @@ mod tests {
             .unwrap();
         }
         pipeline.drain().await.unwrap();
-        assert!(matches!(
-            result,
-            Err(SelfPlayRunError::LatestCheckpointCleared)
-        ));
+        assert!(matches!(result, Err(SelfPlayRunError::LatestModelCleared)));
     }
 
     #[tokio::test]
@@ -805,7 +818,7 @@ mod tests {
         let orchestrator = orchestrator(dir.0.clone(), ChunkMode::PerGame, 1);
         let (_latest_tx, latest_rx) = watch::channel(None);
         let (finish_tx, finish_rx) = watch::channel(false);
-        let run = orchestrator.run(latest_rx, finish_rx);
+        let run = orchestrator.run(cpu_runtime_config(), latest_rx, finish_rx);
         let request_finish = async {
             tokio::task::yield_now().await;
             finish_tx.send(true).unwrap();
@@ -824,7 +837,9 @@ mod tests {
         drop(finish_tx);
 
         assert!(matches!(
-            orchestrator.run(latest_rx, finish_rx).await,
+            orchestrator
+                .run(cpu_runtime_config(), latest_rx, finish_rx)
+                .await,
             Err(SelfPlayRunError::FinishSourceClosed)
         ));
         assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
@@ -835,7 +850,7 @@ mod tests {
         let dir = TestDir::new();
         let orchestrator = orchestrator(dir.0.clone(), ChunkMode::PerGame, 1);
         let mut pause_rx = orchestrator.pause_tx.subscribe();
-        let (latest_tx, latest_rx) = watch::channel(Some(PathBuf::from("model-0")));
+        let (latest_tx, latest_rx) = watch::channel(Some(0));
         let (finish_tx, finish_rx) = watch::channel(false);
         let (first_eval_tx, first_eval_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -844,16 +859,18 @@ mod tests {
         let mut release_rx = Some(release_rx);
         let run = async {
             let result = orchestrator
-                .run_inner(Some(1), latest_rx, finish_rx, |path| {
-                    assert_eq!(path, PathBuf::from("model-0"));
-                    Ok(ModelRuntime::start(
+                .run_inner(Some(1), latest_rx, finish_rx, |version| {
+                    assert_eq!(version, 0);
+                    Ok(start_test_runtime(
                         0,
-                        vec![test_backend_factory(BlockingPassBackend {
-                            first_eval_tx: first_eval_tx.take(),
-                            release_rx: release_rx.take().unwrap(),
-                            drops: drops.clone(),
-                        })],
-                        8,
+                        vec![test_backend_factory(
+                            BlockingPassBackend {
+                                first_eval_tx: first_eval_tx.take(),
+                                release_rx: release_rx.take().unwrap(),
+                                drops: drops.clone(),
+                            },
+                            8,
+                        )],
                         1,
                         64,
                         1,
@@ -869,17 +886,14 @@ mod tests {
         let close_source = async {
             first_eval_rx.await.unwrap();
             assert!(!*pause_rx.borrow_and_update());
-            latest_tx.send(Some(PathBuf::from("model-1"))).unwrap();
+            latest_tx.send(Some(1)).unwrap();
             pause_rx.changed().await.unwrap();
             assert!(*pause_rx.borrow());
             drop(latest_tx);
         };
         let (result, ()) = tokio::join!(run, close_source);
         drop(finish_tx);
-        assert!(matches!(
-            result,
-            Err(SelfPlayRunError::CheckpointSourceClosed)
-        ));
+        assert!(matches!(result, Err(SelfPlayRunError::ModelSourceClosed)));
     }
 
     #[tokio::test]
@@ -887,38 +901,30 @@ mod tests {
         let dir = TestDir::new();
         let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let orchestrator = orchestrator(dir.0.clone(), ChunkMode::PerGame, 1);
-        let (latest_tx, latest_rx) = watch::channel(Some(PathBuf::from("model-0")));
+        let (latest_tx, latest_rx) = watch::channel(Some(0));
 
         orchestrator
-            .run_n_games_per_worker(1, latest_rx, |path| match path.to_str().unwrap() {
-                "model-0" => {
-                    let model = ModelRuntime::start(
+            .run_n_games_per_worker(1, latest_rx, |version| match version {
+                0 => {
+                    let model = start_test_runtime(
                         0,
-                        vec![test_backend_factory(DropTrackingBackend(drops.clone()))],
-                        8,
+                        vec![test_backend_factory(DropTrackingBackend(drops.clone()), 8)],
                         1,
                         64,
                         1,
                     )
                     .unwrap();
-                    latest_tx.send(Some(PathBuf::from("model-1"))).unwrap();
+                    latest_tx.send(Some(1)).unwrap();
                     Ok(model)
                 }
-                "model-1" => {
+                1 => {
                     assert_eq!(drops.load(Ordering::SeqCst), 1);
                     Ok(
-                        ModelRuntime::start(
-                            1,
-                            vec![test_backend_factory(PassBackend)],
-                            8,
-                            1,
-                            64,
-                            1,
-                        )
-                        .unwrap(),
+                        start_test_runtime(1, vec![test_backend_factory(PassBackend, 8)], 1, 64, 1)
+                            .unwrap(),
                     )
                 }
-                _ => panic!("unexpected model path"),
+                _ => panic!("unexpected model version"),
             })
             .await
             .unwrap();
@@ -930,38 +936,30 @@ mod tests {
         let dir = TestDir::new();
         let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let orchestrator = orchestrator_with_layout(dir.0.clone(), ChunkMode::PerGame, 2, 2);
-        let (latest_tx, latest_rx) = watch::channel(Some(PathBuf::from("model-0")));
+        let (latest_tx, latest_rx) = watch::channel(Some(0));
 
         orchestrator
-            .run_n_games_per_worker(1, latest_rx, |path| match path.to_str().unwrap() {
-                "model-0" => {
-                    let model = ModelRuntime::start(
+            .run_n_games_per_worker(1, latest_rx, |version| match version {
+                0 => {
+                    let model = start_test_runtime(
                         0,
-                        vec![test_backend_factory(DropTrackingBackend(drops.clone()))],
-                        8,
+                        vec![test_backend_factory(DropTrackingBackend(drops.clone()), 8)],
                         4,
                         64,
                         1,
                     )
                     .unwrap();
-                    latest_tx.send(Some(PathBuf::from("model-1"))).unwrap();
+                    latest_tx.send(Some(1)).unwrap();
                     Ok(model)
                 }
-                "model-1" => {
+                1 => {
                     assert_eq!(drops.load(Ordering::SeqCst), 1);
                     Ok(
-                        ModelRuntime::start(
-                            1,
-                            vec![test_backend_factory(PassBackend)],
-                            8,
-                            4,
-                            64,
-                            1,
-                        )
-                        .unwrap(),
+                        start_test_runtime(1, vec![test_backend_factory(PassBackend, 8)], 4, 64, 1)
+                            .unwrap(),
                     )
                 }
-                _ => panic!("unexpected model path"),
+                _ => panic!("unexpected model version"),
             })
             .await
             .unwrap();
@@ -972,26 +970,20 @@ mod tests {
     async fn model_update_failure_returns_promptly() {
         let dir = TestDir::new();
         let orchestrator = orchestrator(dir.0.clone(), ChunkMode::PerGame, 2);
-        let (latest_tx, latest_rx) = watch::channel(Some(PathBuf::from("model-0")));
+        let (latest_tx, latest_rx) = watch::channel(Some(0));
 
         let result = orchestrator
-            .run_n_games_per_worker(1, latest_rx, |path| {
-                if path == PathBuf::from("model-0") {
-                    let model = ModelRuntime::start(
-                        0,
-                        vec![test_backend_factory(PassBackend)],
-                        8,
-                        2,
-                        64,
-                        1,
-                    )
-                    .unwrap();
-                    latest_tx
-                        .send(Some(PathBuf::from("missing-model")))
-                        .unwrap();
+            .run_n_games_per_worker(1, latest_rx, |version| {
+                if version == 0 {
+                    let model =
+                        start_test_runtime(0, vec![test_backend_factory(PassBackend, 8)], 2, 64, 1)
+                            .unwrap();
+                    latest_tx.send(Some(99)).unwrap();
                     Ok(model)
                 } else {
-                    Err(ModelLoadError::Checkpoint("model load failed".into()))
+                    Err(ModelLoadError::Backend(ort::Error::new(
+                        "model load failed",
+                    )))
                 }
             })
             .await;
@@ -1003,16 +995,16 @@ mod tests {
         let dir = TestDir::new();
         let orchestrator = orchestrator(dir.0.clone(), ChunkMode::PerGame, 1);
         let mut extra_handle = None;
-        let (latest_tx, latest_rx) = watch::channel(Some(PathBuf::from("model-0")));
+        let (latest_tx, latest_rx) = watch::channel(Some(0));
 
         let result = orchestrator
-            .run_n_games_per_worker(1, latest_rx, |path| {
-                assert_eq!(path, PathBuf::from("model-0"));
+            .run_n_games_per_worker(1, latest_rx, |version| {
+                assert_eq!(version, 0);
                 let model =
-                    ModelRuntime::start(0, vec![test_backend_factory(PassBackend)], 8, 1, 64, 1)
+                    start_test_runtime(0, vec![test_backend_factory(PassBackend, 8)], 1, 64, 1)
                         .unwrap();
                 extra_handle = Some(model.clone());
-                latest_tx.send(Some(PathBuf::from("model-1"))).unwrap();
+                latest_tx.send(Some(1)).unwrap();
                 Ok(model)
             })
             .await;
@@ -1028,48 +1020,46 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let orchestrator = orchestrator(dir.0.clone(), ChunkMode::PerGame, 1);
         let mut pause_rx = orchestrator.pause_tx.subscribe();
-        let (latest_tx, latest_rx) = watch::channel(Some(PathBuf::from("model-0")));
+        let (latest_tx, latest_rx) = watch::channel(Some(41));
         let (finish_tx, finish_rx) = watch::channel(false);
         let mut first_eval_tx = Some(first_eval_tx);
         let mut release_rx = Some(release_rx);
-        let run =
-            orchestrator.run_inner(None, latest_rx, finish_rx, |path| {
-                match path.to_str().unwrap() {
-                    "model-0" => Ok(ModelRuntime::start(
-                        0,
-                        vec![test_backend_factory(BlockingPassBackend {
-                            first_eval_tx: first_eval_tx.take(),
-                            release_rx: release_rx.take().unwrap(),
-                            drops: drops.clone(),
-                        })],
-                        8,
-                        1,
-                        64,
-                        1,
-                    )
-                    .unwrap()),
-                    "model-2" => {
-                        assert_eq!(drops.load(Ordering::SeqCst), 1);
-                        Ok(ModelRuntime::start(
-                            2,
-                            vec![test_backend_factory(PassBackend)],
-                            8,
-                            1,
-                            64,
-                            1,
-                        )
-                        .unwrap())
-                    }
-                    _ => panic!("unexpected model path"),
-                }
-            });
+        let run = orchestrator.run_inner(None, latest_rx, finish_rx, |version| match version {
+            41 => Ok(start_test_runtime(
+                version,
+                vec![test_backend_factory(
+                    BlockingPassBackend {
+                        first_eval_tx: first_eval_tx.take(),
+                        release_rx: release_rx.take().unwrap(),
+                        drops: drops.clone(),
+                    },
+                    8,
+                )],
+                1,
+                64,
+                1,
+            )
+            .unwrap()),
+            103 => {
+                assert_eq!(drops.load(Ordering::SeqCst), 1);
+                Ok(start_test_runtime(
+                    version,
+                    vec![test_backend_factory(PassBackend, 8)],
+                    1,
+                    64,
+                    1,
+                )
+                .unwrap())
+            }
+            _ => panic!("unexpected model version"),
+        });
         let request_update = async {
             first_eval_rx.await.unwrap();
             assert!(!*pause_rx.borrow_and_update());
-            latest_tx.send(Some(PathBuf::from("model-1"))).unwrap();
+            latest_tx.send(Some(99)).unwrap();
             pause_rx.changed().await.unwrap();
             assert!(*pause_rx.borrow());
-            latest_tx.send(Some(PathBuf::from("model-2"))).unwrap();
+            latest_tx.send(Some(103)).unwrap();
             finish_tx.send(true).unwrap();
             release_tx.send(()).unwrap();
         };

@@ -37,7 +37,7 @@ pub(crate) struct OnnxBackend {
 }
 
 impl OnnxBackend {
-    /// Construct on the executor thread, just like other backend factories.
+    /// Construct on the owning executor thread.
     /// CPU intra-op parallelism is explicit to avoid multiplying thread pools.
     pub(crate) fn load(path: &Path, device: InferenceDevice) -> ort::Result<Self> {
         let (provider, intra_threads) = match device {

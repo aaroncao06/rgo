@@ -4,90 +4,139 @@ use crate::{
     inference::policy::POLICY_SIZE,
 };
 use std::{
-    rc::Rc,
+    path::PathBuf,
     sync::{
         Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     thread,
 };
 
-struct ThreadLocalBackend {
-    drops: Arc<AtomicUsize>,
-    _not_send: Rc<()>,
-}
-
-impl Drop for ThreadLocalBackend {
-    fn drop(&mut self) {
-        self.drops.fetch_add(1, Ordering::SeqCst);
-    }
-}
-
-impl InferenceBackend for ThreadLocalBackend {
-    fn evaluate_batch(
-        &mut self,
-        inputs: &[NNInput],
-        outputs: &mut Vec<Arc<NNOutput>>,
-    ) -> Result<(), InferenceError> {
-        outputs.extend(inputs.iter().map(|_| test_output()));
-        Ok(())
-    }
-}
-
-#[test]
-fn runtime_constructs_non_send_backend_on_executor_thread() {
-    let caller = thread::current().id();
-    let drops = Arc::new(AtomicUsize::new(0));
-    let backend_drops = drops.clone();
-    let handle = ModelRuntime::start(
-        0,
-        vec![move || {
-            assert_ne!(thread::current().id(), caller);
-            Ok::<_, &'static str>(ThreadLocalBackend {
-                drops: backend_drops,
-                _not_send: Rc::new(()),
-            })
-        }],
-        1,
-        1,
-        8,
-        1,
-    )
-    .unwrap();
-    drop(handle);
-    assert_eq!(drops.load(Ordering::SeqCst), 1);
-}
-
-#[test]
-fn failed_backend_startup_joins_other_executors() {
-    let drops = Arc::new(AtomicUsize::new(0));
-    let result = ModelRuntime::start(
-        0,
-        [false, true]
-            .map(|fail| {
-                let drops = drops.clone();
-                move || {
-                    if fail {
-                        Err("backend initialization failed")
-                    } else {
-                        Ok(ThreadLocalBackend {
-                            drops,
-                            _not_send: Rc::new(()),
-                        })
-                    }
-                }
+fn onnx_runtime_config() -> ModelRuntimeConfig {
+    ModelRuntimeConfig {
+        model_dir: PathBuf::from("unused-models"),
+        executors: [1, 4]
+            .map(|max_batch_size| ExecutorConfig {
+                device: crate::inference::onnx::InferenceDevice::Cpu { intra_threads: 1 },
+                max_batch_size,
             })
             .into(),
-        1,
-        1,
-        8,
-        1,
+        cache_capacity: 64,
+        num_cache_shards: 2,
+    }
+}
+
+#[test]
+fn model_path_uses_the_published_version_in_the_configured_directory() {
+    assert_eq!(
+        model_path(Path::new("models"), 42),
+        Path::new("models").join("42.onnx")
     );
+}
+
+struct TestModelDir(PathBuf);
+
+impl TestModelDir {
+    fn new() -> Self {
+        static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+        let dir = loop {
+            let id = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("rgo-model-test-{}-{id}", std::process::id()));
+            match std::fs::create_dir(&path) {
+                Ok(()) => break Self(path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("failed to create model fixture directory: {error}"),
+            }
+        };
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+        for (version, filename) in [
+            (42, "v0.onnx"),
+            (43, "wrong_version.onnx"),
+            (44, "wrong_shape.onnx"),
+        ] {
+            std::fs::copy(
+                fixtures.join(filename),
+                dir.0.join(format!("{version}.onnx")),
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    fn config(&self) -> ModelRuntimeConfig {
+        ModelRuntimeConfig {
+            model_dir: self.0.clone(),
+            ..onnx_runtime_config()
+        }
+    }
+}
+
+impl Drop for TestModelDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn load_starts_configured_onnx_executors_and_evaluates() {
+    let models = TestModelDir::new();
+    let handle = ModelRuntime::load(42, 2, &models.config()).unwrap();
+    assert_eq!(handle.0.executor_threads.len(), 2);
+    let state = GameState::new(Rules::TROMP_TAYLORISH);
+    let mut client = InferenceClient::new(handle, None);
+    assert_eq!(client.model_version(), 42);
+    let output = client.evaluate(&state, true).await.unwrap();
+    assert!(output.is_processed());
+    assert!(output.has_ownership());
+    let mut expected = NNOutput::from_raw([0.0; POLICY_SIZE], -3.75, -3.75, -3.75);
+    expected.process_in_place(state.next_player(), &legal_mask(&state));
+    assert_eq!(output.white_win_prob(), expected.white_win_prob());
+    assert_eq!(output.white_score_mean(), expected.white_score_mean());
+}
+
+#[test]
+fn load_returns_checkpoint_errors_through_startup() {
+    let models = TestModelDir::new();
+    for version in [43, 44, 45] {
+        assert!(matches!(
+            ModelRuntime::load(version, 2, &models.config()),
+            Err(ModelStartupError::Backend(_))
+        ));
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+#[test]
+fn load_cleans_up_started_cpu_executors_when_cuda_startup_fails() {
+    let models = TestModelDir::new();
+    let mut config = models.config();
+    config.executors.push(ExecutorConfig {
+        device: crate::inference::onnx::InferenceDevice::Cuda { device_id: 0 },
+        max_batch_size: 8,
+    });
     assert!(matches!(
-        result,
-        Err(ModelStartupError::Backend("backend initialization failed"))
+        ModelRuntime::load(42, 2, &config),
+        Err(ModelStartupError::Backend(_))
     ));
-    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    // A fresh load still works after failed startup has joined its executors.
+    drop(ModelRuntime::load(42, 2, &models.config()).unwrap());
+}
+
+#[test]
+#[should_panic(expected = "need at least one inference backend")]
+fn load_rejects_empty_executor_config() {
+    let mut config = onnx_runtime_config();
+    config.executors.clear();
+    let _ = ModelRuntime::load(0, 1, &config);
+}
+
+#[test]
+#[should_panic(expected = "need positive batch size for every executor")]
+fn load_validates_all_batch_limits_before_starting_executors() {
+    let mut config = onnx_runtime_config();
+    config.executors[1].max_batch_size = 0;
+    let _ = ModelRuntime::load(0, 1, &config);
 }
 
 fn test_input() -> NNInput {
@@ -96,6 +145,69 @@ fn test_input() -> NNInput {
 
 fn test_output() -> Arc<NNOutput> {
     Arc::new(NNOutput::from_raw([0.0; POLICY_SIZE], 0.0, 0.0, 0.0))
+}
+
+#[tokio::test]
+async fn executors_respect_individual_batch_limits_on_a_shared_queue() {
+    struct RecordingBackend {
+        limit: usize,
+        first_batch: bool,
+        started: Arc<std::sync::Barrier>,
+        batches: Arc<Mutex<Vec<(usize, usize)>>>,
+    }
+    impl InferenceBackend for RecordingBackend {
+        fn evaluate_batch(
+            &mut self,
+            inputs: &[NNInput],
+            outputs: &mut Vec<Arc<NNOutput>>,
+        ) -> Result<(), InferenceError> {
+            self.batches
+                .lock()
+                .unwrap()
+                .push((self.limit, inputs.len()));
+            if self.first_batch {
+                self.first_batch = false;
+                // Hold both executors' first batches until the queue is filled.
+                self.started.wait();
+            }
+            outputs.extend(inputs.iter().map(|_| test_output()));
+            Ok(())
+        }
+    }
+
+    let started = Arc::new(std::sync::Barrier::new(3));
+    let batches = Arc::new(Mutex::new(Vec::new()));
+    let factories = [1, 4].map(|limit| {
+        test_backend_factory(
+            RecordingBackend {
+                limit,
+                first_batch: true,
+                started: started.clone(),
+                batches: batches.clone(),
+            },
+            limit,
+        )
+    });
+    let handle = start_test_runtime(0, factories.into(), 16, 8, 1).unwrap();
+    let slots: Vec<_> = (0..16).map(|_| Arc::new(EvalSlot::new())).collect();
+    for slot in &slots {
+        slot.queue(test_input());
+        handle.submit_request(slot.clone()).unwrap();
+    }
+    started.wait();
+    for slot in slots {
+        slot.wait_for_result().await.unwrap();
+    }
+    let batches = batches.lock().unwrap();
+    assert_eq!(batches.iter().map(|(_, size)| size).sum::<usize>(), 16);
+    for limit in [1, 4] {
+        assert!(batches.iter().any(|&(actual, _)| actual == limit));
+    }
+    assert!(
+        batches
+            .iter()
+            .all(|&(limit, size)| size > 0 && size <= limit)
+    );
 }
 
 fn loc(x: usize, y: usize) -> Loc {
@@ -158,10 +270,9 @@ impl InferenceBackend for OwnershipBackend {
 #[tokio::test]
 async fn root_requests_upgrade_cached_outputs_without_mutating_interior_outputs() {
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let handle = ModelRuntime::start(
+    let handle = start_test_runtime(
         17,
-        vec![test_backend_factory(OwnershipBackend(requests.clone()))],
-        1,
+        vec![test_backend_factory(OwnershipBackend(requests.clone()), 1)],
         1,
         16,
         1,
@@ -199,12 +310,12 @@ async fn root_requests_upgrade_cached_outputs_without_mutating_interior_outputs(
 #[tokio::test]
 async fn randomized_symmetry_is_restored_before_caching() {
     let requests = Arc::new(Mutex::new(0));
-    let handle = ModelRuntime::start(
+    let handle = start_test_runtime(
         0,
-        vec![test_backend_factory(EchoSpatialOwnershipBackend(
-            requests.clone(),
-        ))],
-        1,
+        vec![test_backend_factory(
+            EchoSpatialOwnershipBackend(requests.clone()),
+            1,
+        )],
         1,
         16,
         1,
@@ -243,13 +354,15 @@ async fn randomized_symmetry_is_restored_before_caching() {
 
 #[test]
 fn client_can_disable_randomized_symmetry() {
-    let handle = ModelRuntime::start(
+    let handle = start_test_runtime(
         0,
-        vec![test_backend_factory(TestBackend {
-            batch_sizes: Arc::new(Mutex::new(Vec::new())),
-            fail: false,
-        })],
-        1,
+        vec![test_backend_factory(
+            TestBackend {
+                batch_sizes: Arc::new(Mutex::new(Vec::new())),
+                fail: false,
+            },
+            1,
+        )],
         1,
         8,
         1,
@@ -263,13 +376,15 @@ fn client_can_disable_randomized_symmetry() {
 
 #[test]
 fn rebinding_a_client_preserves_its_slot_and_symmetry_sequence() {
-    let old_model = ModelRuntime::start(
+    let old_model = start_test_runtime(
         0,
-        vec![test_backend_factory(TestBackend {
-            batch_sizes: Arc::new(Mutex::new(Vec::new())),
-            fail: false,
-        })],
-        1,
+        vec![test_backend_factory(
+            TestBackend {
+                batch_sizes: Arc::new(Mutex::new(Vec::new())),
+                fail: false,
+            },
+            1,
+        )],
         1,
         16,
         1,
@@ -279,13 +394,15 @@ fn rebinding_a_client_preserves_its_slot_and_symmetry_sequence() {
     assert!(!client.has_model());
     client.install_model(old_model);
     let mut uninterrupted = InferenceClient::new(
-        ModelRuntime::start(
+        start_test_runtime(
             2,
-            vec![test_backend_factory(TestBackend {
-                batch_sizes: Arc::new(Mutex::new(Vec::new())),
-                fail: false,
-            })],
-            1,
+            vec![test_backend_factory(
+                TestBackend {
+                    batch_sizes: Arc::new(Mutex::new(Vec::new())),
+                    fail: false,
+                },
+                1,
+            )],
             1,
             16,
             1,
@@ -299,13 +416,15 @@ fn rebinding_a_client_preserves_its_slot_and_symmetry_sequence() {
     let slot = client.slot.clone();
     client.release_model();
     assert!(!client.has_model());
-    let new_model = ModelRuntime::start(
+    let new_model = start_test_runtime(
         1,
-        vec![test_backend_factory(TestBackend {
-            batch_sizes: Arc::new(Mutex::new(Vec::new())),
-            fail: false,
-        })],
-        1,
+        vec![test_backend_factory(
+            TestBackend {
+                batch_sizes: Arc::new(Mutex::new(Vec::new())),
+                fail: false,
+            },
+            1,
+        )],
         1,
         16,
         1,
@@ -322,13 +441,15 @@ fn rebinding_a_client_preserves_its_slot_and_symmetry_sequence() {
 #[tokio::test]
 #[should_panic(expected = "backend omitted requested ownership output")]
 async fn missing_requested_ownership_violates_backend_contract() {
-    let handle = ModelRuntime::start(
+    let handle = start_test_runtime(
         0,
-        vec![test_backend_factory(TestBackend {
-            batch_sizes: Arc::new(Mutex::new(Vec::new())),
-            fail: false,
-        })],
-        1,
+        vec![test_backend_factory(
+            TestBackend {
+                batch_sizes: Arc::new(Mutex::new(Vec::new())),
+                fail: false,
+            },
+            1,
+        )],
         1,
         16,
         1,
@@ -425,7 +546,7 @@ async fn model_runtime_evaluates_through_a_client() {
         fail: false,
     };
     let model_handle =
-        ModelRuntime::start(0, vec![test_backend_factory(backend)], 4, 1, 8, 2).unwrap();
+        start_test_runtime(0, vec![test_backend_factory(backend, 4)], 1, 8, 2).unwrap();
     let queue = model_handle.0.queue.clone();
     let mut client = InferenceClient::new(model_handle, None);
 
@@ -447,7 +568,7 @@ async fn repeated_evaluation_uses_the_model_cache() {
         fail: false,
     };
     let model_handle =
-        ModelRuntime::start(0, vec![test_backend_factory(backend)], 4, 1, 8, 2).unwrap();
+        start_test_runtime(0, vec![test_backend_factory(backend, 4)], 1, 8, 2).unwrap();
     let mut client = InferenceClient::new(model_handle, None);
     let game_state = GameState::new(Rules::TROMP_TAYLORISH);
 
@@ -465,7 +586,7 @@ fn model_runtime_shuts_down_after_the_last_handle_is_dropped() {
         fail: false,
     };
     let first_handle =
-        ModelRuntime::start(0, vec![test_backend_factory(backend)], 4, 1, 8, 2).unwrap();
+        start_test_runtime(0, vec![test_backend_factory(backend, 4)], 1, 8, 2).unwrap();
     let second_handle = first_handle.clone();
     let queue = first_handle.0.queue.clone();
 
@@ -484,7 +605,7 @@ async fn multiple_clients_share_one_model_runtime() {
         fail: false,
     };
     let model_handle =
-        ModelRuntime::start(0, vec![test_backend_factory(backend)], 2, 2, 8, 2).unwrap();
+        start_test_runtime(0, vec![test_backend_factory(backend, 2)], 2, 8, 2).unwrap();
     let mut first_client = InferenceClient::new(model_handle.clone(), None);
     let mut second_client = InferenceClient::new(model_handle, None);
     let first_game = GameState::new(Rules::TROMP_TAYLORISH);

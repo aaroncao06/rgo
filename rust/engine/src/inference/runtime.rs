@@ -5,21 +5,23 @@ use crate::game::game_state::GameState;
 use crate::inference::{
     backend::{InferenceBackend, InferenceError},
     inputs::NNInput,
+    onnx::OnnxBackend,
     outputs::NNOutput,
     policy::legal_mask,
     symmetry::Symmetry,
 };
 use rand::{RngExt, SeedableRng, rngs::SmallRng};
 use std::{
-    error::Error,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, mpsc},
     thread::JoinHandle,
 };
 
 mod cache;
+mod params;
 mod queue;
 use cache::{EvaluationCache, EvaluationKey};
+pub(crate) use params::{ExecutorConfig, ModelRuntimeConfig};
 use queue::{BatchQueue, EvalSlot};
 
 pub(crate) type ModelVersion = u64;
@@ -38,15 +40,9 @@ pub(crate) enum ModelStartupError<E> {
     ExecutorPanicked,
 }
 
-type BoxedModelError = Box<dyn Error + Send + Sync>;
-
-/// Checkpoint preparation and executor startup fail at different stages.
-/// The backend error stays boxed until the concrete model backend is chosen.
-#[derive(Debug)]
-pub(crate) enum ModelLoadError {
-    Checkpoint(BoxedModelError),
-    Startup(ModelStartupError<BoxedModelError>),
-}
+/// File loading, contract validation, and device initialization all occur on
+/// executor threads and share the same startup error path.
+pub(crate) type ModelLoadError = ModelStartupError<ort::Error>;
 
 // wrapper so that client doesnt access executor threads and allow easy switching. api for queueing and caching
 #[derive(Clone)]
@@ -241,59 +237,52 @@ impl<B: InferenceBackend> InferenceExecutor<B> {
 }
 
 impl ModelRuntime {
-    /// TODO: Validate the checkpoint and initialize the configured backends,
-    /// then start inference. The orchestrator only coordinates when this happens.
-    /// Backend construction happens on each executor thread; see `start`.
-    #[allow(dead_code)]
-    pub(crate) fn load(_checkpoint_path: &Path) -> Result<ModelHandle, ModelLoadError> {
-        unimplemented!("model loading is not implemented yet")
-    }
-
-    /// Start an immutable model runtime and its executor threads.
-    /// `queue_capacity` must cover the maximum number of clients that can submit
-    /// concurrently. The queue relies on this caller-established bound; it does
-    /// not implement capacity backpressure. Dropping the last handle closes and
-    /// drains the queue, then joins the executor threads.
+    /// Load an immutable model runtime, constructing each ONNX backend on its
+    /// executor thread. Returns only after every backend has loaded and validated
+    /// the checkpoint. Failed startup closes the queue and joins all executors.
+    /// Loads `<config.model_dir>/<model_version>.onnx`; versions identify immutable
+    /// published models, not process-local runtime generations.
     ///
-    /// Each `Send` factory runs on its executor thread, so the constructed backend
-    /// need not be `Send`. All executors must report successful initialization
-    /// before a handle is returned. A failed startup closes and joins the others.
-    pub(crate) fn start<B, F, E>(
+    /// `queue_capacity` must cover the maximum concurrent client count; the queue
+    /// does not implement capacity backpressure. Dropping the last handle closes
+    /// and drains the queue, then joins the executor threads.
+    pub(crate) fn load(
         model_version: ModelVersion,
-        backend_factories: Vec<F>,
-        max_batch_size: usize,
-        queue_capacity: usize, // max number of inference clients, each with one outstanding request
-        cache_capacity: usize,
-        num_cache_shards: usize,
-    ) -> Result<ModelHandle, ModelStartupError<E>>
-    where
-        B: InferenceBackend + 'static,
-        F: FnOnce() -> Result<B, E> + Send + 'static,
-        E: Send + 'static,
-    {
+        queue_capacity: usize,
+        config: &ModelRuntimeConfig,
+    ) -> Result<ModelHandle, ModelLoadError> {
         assert!(
-            !backend_factories.is_empty(),
+            !config.executors.is_empty(),
             "need at least one inference backend"
         );
-        assert!(max_batch_size > 0, "need positive batch size");
+        assert!(
+            config
+                .executors
+                .iter()
+                .all(|executor| executor.max_batch_size > 0),
+            "need positive batch size for every executor"
+        );
         assert!(queue_capacity > 0, "need positive queue capacity");
 
+        let checkpoint_path = model_path(&config.model_dir, model_version);
         let queue = Arc::new(BatchQueue::new(queue_capacity));
-        let cache = EvaluationCache::new(cache_capacity, num_cache_shards);
-
-        let mut executor_threads = Vec::with_capacity(backend_factories.len());
+        let cache = EvaluationCache::new(config.cache_capacity, config.num_cache_shards);
+        let mut executor_threads = Vec::with_capacity(config.executors.len());
         let (startup_tx, startup_rx) = mpsc::channel();
-        for factory in backend_factories {
+        for executor in config.executors.iter().copied() {
+            let path = checkpoint_path.clone();
             let queue = queue.clone();
             let startup_tx = startup_tx.clone();
-            executor_threads.push(std::thread::spawn(move || match factory() {
-                Ok(backend) => {
-                    let _ = startup_tx.send(Ok(()));
-                    drop(startup_tx);
-                    InferenceExecutor::new(queue, backend, max_batch_size).run();
-                }
-                Err(error) => {
-                    let _ = startup_tx.send(Err(error));
+            executor_threads.push(std::thread::spawn(move || {
+                match OnnxBackend::load(&path, executor.device) {
+                    Ok(backend) => {
+                        let _ = startup_tx.send(Ok(()));
+                        drop(startup_tx);
+                        InferenceExecutor::new(queue, backend, executor.max_batch_size).run();
+                    }
+                    Err(error) => {
+                        let _ = startup_tx.send(Err(error));
+                    }
                 }
             }));
         }
@@ -319,13 +308,6 @@ impl ModelRuntime {
         })))
     }
 }
-
-#[cfg(test)]
-pub(crate) fn test_backend_factory<B: InferenceBackend + Send + 'static>(
-    backend: B,
-) -> impl FnOnce() -> Result<B, &'static str> + Send {
-    move || Ok(backend)
-}
 //destructor that closes the queue and executor threads
 impl Drop for ModelRuntime {
     fn drop(&mut self) {
@@ -336,5 +318,15 @@ impl Drop for ModelRuntime {
     }
 }
 
+/// Naming convention for immutable published ONNX models.
+fn model_path(model_dir: &Path, version: ModelVersion) -> PathBuf {
+    model_dir.join(format!("{version}.onnx"))
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+pub(crate) use test_support::{start_test_runtime, test_backend_factory};
