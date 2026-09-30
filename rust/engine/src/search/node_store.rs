@@ -1,11 +1,12 @@
 use std::ptr::NonNull;
 
-use crate::search::{graph_key::GraphKey, node::SearchNode};
+// Opaque graph types used by the storage contract; their internals stay private.
+pub use crate::search::{graph_key::GraphKey, node::SearchNode};
 
 const EMPTY_INDEX: u32 = u32::MAX; //max index is empty_index-1
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InsertError {
+pub enum InsertError {
     KeyAlreadyExists,
     StoreFull,
 }
@@ -20,7 +21,7 @@ pub(crate) enum InsertError {
 /// called or the store is dropped. Inserting or looking up other nodes must not
 /// move or invalidate any previously returned node. `clear` and
 /// `reset_with_capacity` invalidate every previously returned pointer.
-pub(crate) unsafe trait NodeStore {
+pub unsafe trait NodeStore {
     fn find(&mut self, key: GraphKey) -> Option<NonNull<SearchNode>>;
     fn insert(&mut self, key: GraphKey) -> Result<NonNull<SearchNode>, InsertError>;
     fn len(&self) -> usize;
@@ -34,13 +35,13 @@ struct NodeEntry {
     next_in_bucket: u32,
     node: SearchNode,
 }
-pub(crate) struct FixedArenaNodeStore {
+pub struct FixedArenaNodeStore {
     entries: Vec<NodeEntry>,
     bucket_heads: Box<[u32]>, //basically hash -> index of head of linked list of node entries
     node_capacity: usize,
 }
 impl FixedArenaNodeStore {
-    pub(crate) fn new(node_capacity: usize) -> Self {
+    pub fn new(node_capacity: usize) -> Self {
         Self::validate_capacity(node_capacity).expect("node capacity out of bounds");
         let entries = Vec::with_capacity(node_capacity);
         let bucket_heads =
@@ -52,7 +53,7 @@ impl FixedArenaNodeStore {
         }
     }
 
-    pub(crate) fn validate_capacity(node_capacity: usize) -> Result<(), &'static str> {
+    pub fn validate_capacity(node_capacity: usize) -> Result<(), &'static str> {
         if node_capacity > u32::MAX as usize {
             return Err("node capacity exceeds the fixed arena's u32 index range");
         }

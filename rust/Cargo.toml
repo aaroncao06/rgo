@@ -1,5 +1,5 @@
 [workspace]
-members = ["engine"]
+members = ["engine", "selfplay"]
 resolver = "2"
 
 # Panics are fatal for the entire process, including inference executor threads.

@@ -19,7 +19,7 @@ struct RawNNOutputs {
 }
 
 #[derive(Clone)]
-pub(crate) struct NNOutput {
+pub struct NNOutput {
     policy: [f32; POLICY_SIZE], // logits -> probs
     win: f32,                   // logit -> white prob
     score_mean: f32,            // score mean -> white score mean
@@ -90,7 +90,7 @@ fn score_mean_sq(mean: f32, stdev: f32) -> f32 {
     mean.mul_add(mean, stdev * stdev)
 }
 impl NNOutput {
-    pub(crate) fn from_raw(
+    pub fn from_raw(
         policy_logits: [f32; POLICY_SIZE],
         win_logit: f32,
         raw_score_mean: f32,
@@ -112,7 +112,7 @@ impl NNOutput {
             ownership: None,
         }
     }
-    pub(crate) fn with_ownership_logits(mut self, logits: [f32; BOARD_POLICY_SIZE]) -> Self {
+    pub fn with_ownership_logits(mut self, logits: [f32; BOARD_POLICY_SIZE]) -> Self {
         debug_assert!(!self.processed);
         debug_assert!(
             logits.iter().all(|v| v.is_finite()),
@@ -132,10 +132,10 @@ impl NNOutput {
             symmetry.restore_output(ownership);
         }
     }
-    pub(crate) fn has_ownership(&self) -> bool {
+    pub fn has_ownership(&self) -> bool {
         self.ownership.is_some()
     }
-    pub(crate) fn white_ownership(&self) -> Option<&[f32; BOARD_POLICY_SIZE]> {
+    pub fn white_ownership(&self) -> Option<&[f32; BOARD_POLICY_SIZE]> {
         debug_assert!(self.processed);
         self.ownership.as_deref()
     }
@@ -183,7 +183,7 @@ impl NNOutput {
             }
         }
     }
-    pub(crate) fn policy_probs(&self) -> &[f32; POLICY_SIZE] {
+    pub fn policy_probs(&self) -> &[f32; POLICY_SIZE] {
         debug_assert!(self.processed);
         &self.policy
     }
@@ -193,22 +193,22 @@ impl NNOutput {
         &mut self.policy
     }
 
-    pub(crate) fn white_win_prob(&self) -> f32 {
+    pub fn white_win_prob(&self) -> f32 {
         debug_assert!(self.processed);
         self.win
     }
 
-    pub(crate) fn white_score_mean(&self) -> f32 {
+    pub fn white_score_mean(&self) -> f32 {
         debug_assert!(self.processed);
         self.score_mean
     }
 
-    pub(crate) fn white_score_mean_sq(&self) -> f32 {
+    pub fn white_score_mean_sq(&self) -> f32 {
         debug_assert!(self.processed);
         self.score_aux
     }
 
-    pub(crate) fn is_processed(&self) -> bool {
+    pub fn is_processed(&self) -> bool {
         self.processed
     }
 }

@@ -12,7 +12,7 @@ use tokio::{fs, sync::watch};
 use crate::inference::runtime::ModelVersion;
 
 #[derive(Debug)]
-pub(in crate::self_play) enum CheckpointWatchError {
+pub(crate) enum CheckpointWatchError {
     Filesystem(io::Error),
     Notification(Arc<notify::Error>),
     EventsClosed,

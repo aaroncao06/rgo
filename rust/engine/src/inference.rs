@@ -1,7 +1,7 @@
-pub(crate) mod backend;
-pub(crate) mod inputs;
-pub(crate) mod onnx;
-pub(crate) mod outputs;
-pub(crate) mod policy;
-pub(crate) mod runtime;
+pub mod backend;
+pub mod inputs;
+pub mod onnx;
+pub mod outputs;
+pub mod policy;
+pub mod runtime;
 mod symmetry;

@@ -8,13 +8,13 @@ use crate::inference::policy::POLICY_SIZE;
 use super::inputs::NNInput;
 
 #[derive(Debug, Clone)]
-pub(crate) enum InferenceError {
+pub enum InferenceError {
     ExecutionFailed,
     MismatchedBatchOutput,
     RuntimeClosed,
     Onnx(Arc<ort::Error>),
 }
-pub(crate) trait InferenceBackend {
+pub trait InferenceBackend {
     /// Evaluate raw model activations in input order.
     ///
     /// The executor supplies a nonempty input batch and an empty, reusable

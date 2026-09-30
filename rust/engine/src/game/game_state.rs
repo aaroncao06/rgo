@@ -7,7 +7,7 @@ use super::rules::Rules;
 use std::collections::HashSet;
 
 #[derive(Clone)]
-pub(crate) struct GameState {
+pub struct GameState {
     board: Board,
     rules: Rules,
     next_player: Player,
@@ -21,7 +21,7 @@ pub(crate) struct GameState {
 }
 
 impl GameState {
-    pub(crate) fn new(rules: Rules) -> Self {
+    pub fn new(rules: Rules) -> Self {
         let board = Board::new();
         let mut seen_position_hashes = HashSet::new();
         seen_position_hashes.insert(board.position_hash());
@@ -37,12 +37,12 @@ impl GameState {
             seen_position_hashes,
         }
     }
-    pub(crate) fn board(&self) -> &Board {
+    pub fn board(&self) -> &Board {
         &self.board
     }
 
     /// Starts a fresh game while retaining reusable history allocation.
-    pub(crate) fn reset(&mut self, rules: Rules) {
+    pub fn reset(&mut self, rules: Rules) {
         self.board = Board::new();
         self.rules = rules;
         self.next_player = Player::Black;
@@ -70,16 +70,16 @@ impl GameState {
         self.seen_position_hashes
             .extend(source.seen_position_hashes.iter().copied());
     }
-    pub(crate) fn rules(&self) -> &Rules {
+    pub fn rules(&self) -> &Rules {
         &self.rules
     }
-    pub(crate) fn next_player(&self) -> Player {
+    pub fn next_player(&self) -> Player {
         self.next_player
     }
     /// Stones, player to move, current superko bans, and consecutive passes.
     /// This common key component excludes rules, komi, and repetition history
     /// beyond the current ban mask. It is not a complete graph identity.
-    pub(crate) fn current_state_hash(&self) -> Hash128 {
+    pub fn current_state_hash(&self) -> Hash128 {
         let mut key = self.board.position_hash();
         key ^= player_hash(self.next_player);
         for loc in Loc::board_iter() {
@@ -91,10 +91,10 @@ impl GameState {
         key
     }
     /// Number of successfully played moves, including passes. Starts at zero.
-    pub(crate) fn turn_number(&self) -> usize {
+    pub fn turn_number(&self) -> usize {
         self.turn_number
     }
-    pub(crate) fn consecutive_ending_passes(&self) -> u8 {
+    pub fn consecutive_ending_passes(&self) -> u8 {
         self.consecutive_ending_passes
     }
     pub(crate) fn opponent_passed_last_four_turns(&self) -> bool {
@@ -122,7 +122,7 @@ impl GameState {
             );
         }
     }
-    pub(crate) fn is_legal(&self, loc: Loc) -> bool {
+    pub fn is_legal(&self, loc: Loc) -> bool {
         if !self.board.is_legal_ignoring_ko(
             loc,
             self.next_player,
@@ -132,10 +132,10 @@ impl GameState {
         }
         loc == Loc::PASS || !self.superko_banned[loc.index()]
     }
-    pub(crate) fn is_finished(&self) -> bool {
+    pub fn is_finished(&self) -> bool {
         self.consecutive_ending_passes >= 2
     }
-    pub(crate) fn play(&mut self, loc: Loc) -> bool {
+    pub fn play(&mut self, loc: Loc) -> bool {
         if !self.is_legal(loc) {
             return false;
         }
@@ -175,12 +175,12 @@ impl GameState {
         }
         score
     }
-    pub(crate) fn final_score_white_minus_black(&self) -> f32 {
+    pub fn final_score_white_minus_black(&self) -> f32 {
         self.count_area_score_white_minus_black() as f32 + self.rules.komi
     }
 
     /// Final area ownership on the board's padded coordinate array.
-    pub(crate) fn final_ownership(&self) -> [Color; ARRAY_LEN] {
+    pub fn final_ownership(&self) -> [Color; ARRAY_LEN] {
         debug_assert!(self.is_finished(), "cannot score an unfinished game");
         self.board
             .calculate_area(self.rules.multi_stone_suicide_legal)

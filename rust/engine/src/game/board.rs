@@ -1,15 +1,15 @@
 use super::hash::{Hash128, stone_hash};
 
 // can make these runtime-configurable in the future
-pub(crate) const BOARD_SIZE: usize = 9;
+pub const BOARD_SIZE: usize = 9;
 pub(crate) const STRIDE: usize = BOARD_SIZE + 1; // first element of each row is the wall
-pub(crate) const ARRAY_LEN: usize = STRIDE * STRIDE + STRIDE + 1; //need bottom row of walls and bottom corner
+pub const ARRAY_LEN: usize = STRIDE * STRIDE + STRIDE + 1; //need bottom row of walls and bottom corner
 
 mod scoring;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Color {
+pub enum Color {
     Empty = 0,
     Black = 1,
     White = 2,
@@ -27,13 +27,13 @@ impl Color {
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Player {
+pub enum Player {
     Black = 1,
     White = 2,
 }
 
 impl Player {
-    pub(crate) fn opponent(self) -> Self {
+    pub fn opponent(self) -> Self {
         match self {
             Self::Black => Self::White,
             Self::White => Self::Black,
@@ -52,29 +52,29 @@ impl From<Player> for Color {
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Loc(u16);
+pub struct Loc(u16);
 
 impl Loc {
     pub(crate) const NULL: Self = Self(0);
-    pub(crate) const PASS: Self = Self(1);
-    pub(crate) fn new(x: usize, y: usize) -> Option<Loc> {
+    pub const PASS: Self = Self(1);
+    pub fn new(x: usize, y: usize) -> Option<Loc> {
         if x < BOARD_SIZE && y < BOARD_SIZE {
             Some(Self(((x + 1) + (y + 1) * STRIDE) as u16))
         } else {
             None
         }
     }
-    pub(crate) fn index(self) -> usize {
+    pub fn index(self) -> usize {
         self.0 as usize // cant have u16
     }
     pub(crate) fn from_index(index: usize) -> Self {
         debug_assert!(index < ARRAY_LEN);
         Self(index as u16)
     }
-    pub(crate) fn x(self) -> usize {
+    pub fn x(self) -> usize {
         (self.0 as usize) % STRIDE - 1
     }
-    pub(crate) fn y(self) -> usize {
+    pub fn y(self) -> usize {
         (self.0 as usize) / STRIDE - 1
     }
     fn is_adjacent(loc1: Self, loc2: Self) -> bool {
@@ -84,10 +84,10 @@ impl Loc {
     fn adjacent_indices(i: usize) -> [usize; 4] {
         [i + 1, i - STRIDE, i - 1, i + STRIDE] // unit circle direction lol
     }
-    pub(crate) fn board_iter() -> impl Iterator<Item = Loc> {
+    pub fn board_iter() -> impl Iterator<Item = Loc> {
         (1..=BOARD_SIZE).flat_map(|y| (1..=BOARD_SIZE).map(move |x| Loc((x + y * STRIDE) as u16)))
     }
-    pub(crate) fn is_on_board(self) -> bool {
+    pub fn is_on_board(self) -> bool {
         let i = self.index();
         let padded_x = i % STRIDE;
         let padded_y = i / STRIDE;
@@ -102,7 +102,7 @@ struct ChainData {
 }
 
 #[derive(Clone)]
-pub(crate) struct Board {
+pub struct Board {
     colors: [Color; ARRAY_LEN], // flat board array
     chain_data: [ChainData; ARRAY_LEN],
     chain_head: [Loc; ARRAY_LEN],
@@ -134,10 +134,10 @@ impl Board {
             position_hash: 0,
         }
     }
-    pub(crate) fn color_at(&self, loc: Loc) -> Color {
+    pub fn color_at(&self, loc: Loc) -> Color {
         self.colors[loc.index()]
     }
-    pub(crate) fn simple_ko(&self) -> Option<Loc> {
+    pub fn simple_ko(&self) -> Option<Loc> {
         self.simple_ko
     }
     pub(crate) fn is_adjacent_to_player(&self, loc: Loc, player: Player) -> bool {

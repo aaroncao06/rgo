@@ -21,12 +21,12 @@ mod cache;
 mod params;
 mod queue;
 use cache::{EvaluationCache, EvaluationKey};
-pub(crate) use params::{ExecutorConfig, ModelRuntimeConfig};
+pub use params::{ExecutorConfig, ModelRuntimeConfig};
 use queue::{BatchQueue, EvalSlot};
 
-pub(crate) type ModelVersion = u64;
+pub type ModelVersion = u64;
 
-pub(crate) struct ModelRuntime {
+pub struct ModelRuntime {
     // each model runtime owns its own queue and cache and executors. makes it easier to switch out and make new ones
     model_version: ModelVersion,
     queue: Arc<BatchQueue>, // model runtime owns this, should be responsible for dropping everything
@@ -35,7 +35,7 @@ pub(crate) struct ModelRuntime {
 }
 
 #[derive(Debug)]
-pub(crate) enum ModelStartupError<E> {
+pub enum ModelStartupError<E> {
     Backend(E),
     ExecutorPanicked,
 }
@@ -43,15 +43,15 @@ pub(crate) enum ModelStartupError<E> {
 /// Configuration validation runs before spawning executors. File loading,
 /// tensor-contract validation, and device initialization run on executor threads;
 /// failures share the same startup error path.
-pub(crate) type ModelLoadError = ModelStartupError<ort::Error>;
+pub type ModelLoadError = ModelStartupError<ort::Error>;
 
 // wrapper so that client doesnt access executor threads and allow easy switching. api for queueing and caching
 #[derive(Clone)]
-pub(crate) struct ModelHandle(Arc<ModelRuntime>);
+pub struct ModelHandle(Arc<ModelRuntime>);
 
 /// A worker's reusable request slot and symmetry RNG, bound to a model when active.
 /// Only one evaluation may be outstanding for a client.
-pub(crate) struct InferenceClient {
+pub struct InferenceClient {
     model_handle: Option<ModelHandle>,
     slot: Arc<EvalSlot>,
     symmetry_rng: Option<SmallRng>,
@@ -64,7 +64,7 @@ struct InferenceExecutor<B: InferenceBackend> {
     max_batch_size: usize,
 }
 impl ModelHandle {
-    pub(crate) fn is_last_handle(&self) -> bool {
+    pub fn is_last_handle(&self) -> bool {
         Arc::strong_count(&self.0) == 1
     }
 
@@ -82,15 +82,15 @@ impl ModelHandle {
     }
 }
 impl InferenceClient {
-    pub(crate) fn model_version(&self) -> ModelVersion {
+    pub fn model_version(&self) -> ModelVersion {
         self.model_handle().model_version()
     }
-    pub(crate) fn new(model_handle: ModelHandle, symmetry_seed: Option<u64>) -> Self {
+    pub fn new(model_handle: ModelHandle, symmetry_seed: Option<u64>) -> Self {
         let mut client = Self::unbound(symmetry_seed);
         client.install_model(model_handle);
         client
     }
-    pub(crate) fn unbound(symmetry_seed: Option<u64>) -> Self {
+    pub fn unbound(symmetry_seed: Option<u64>) -> Self {
         Self {
             model_handle: None,
             slot: Arc::new(EvalSlot::new()),
@@ -102,10 +102,10 @@ impl InferenceClient {
             .as_ref()
             .expect("inference requires an installed model")
     }
-    pub(crate) fn has_model(&self) -> bool {
+    pub fn has_model(&self) -> bool {
         self.model_handle.is_some()
     }
-    pub(crate) fn release_model(&mut self) {
+    pub fn release_model(&mut self) {
         debug_assert!(
             self.slot.is_idle(),
             "cannot release a model during inference"
@@ -116,7 +116,7 @@ impl InferenceClient {
                 .expect("cannot release an unbound inference client"),
         );
     }
-    pub(crate) fn install_model(&mut self, model_handle: ModelHandle) {
+    pub fn install_model(&mut self, model_handle: ModelHandle) {
         debug_assert!(self.model_handle.is_none(), "model already installed");
         debug_assert!(
             self.slot.is_idle(),
@@ -136,7 +136,7 @@ impl InferenceClient {
     /// dropping the future does not cancel the queued/running request or reset
     /// its slot. Await completion before reusing this client, or discard the
     /// client if its evaluation future is cancelled.
-    pub(crate) async fn evaluate(
+    pub async fn evaluate(
         &mut self,
         game_state: &GameState,
         include_ownership: bool,
@@ -247,7 +247,7 @@ impl ModelRuntime {
     /// `queue_capacity` must cover the maximum concurrent client count; the queue
     /// does not implement capacity backpressure. Dropping the last handle closes
     /// and drains the queue, then joins the executor threads.
-    pub(crate) fn load(
+    pub fn load(
         model_version: ModelVersion,
         queue_capacity: usize,
         config: &ModelRuntimeConfig,
@@ -319,7 +319,8 @@ fn model_path(model_dir: &Path, version: ModelVersion) -> PathBuf {
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 mod test_support;
-#[cfg(test)]
-pub(crate) use test_support::{start_test_runtime, test_backend_factory};
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use test_support::{start_test_runtime, test_backend_factory};

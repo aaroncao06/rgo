@@ -1,34 +1,34 @@
 #[derive(Debug, Clone, Copy, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub(crate) struct SearchParams {
-    pub(crate) win_loss_utility_factor: f64,
-    pub(crate) static_score_utility_factor: f64,
-    pub(crate) dynamic_score_utility_factor: f64,
-    pub(crate) dynamic_score_center_zero_weight: f64,
-    pub(crate) dynamic_score_center_scale: f64,
-    pub(crate) cpuct_exploration: f64,
-    pub(crate) cpuct_exploration_log: f64,
-    pub(crate) cpuct_exploration_base: f64,
-    pub(crate) fpu_reduction_max: f64,
-    pub(crate) root_fpu_reduction_max: f64,
-    pub(crate) fpu_parent_weight_by_visited_policy_pow: f64,
-    pub(crate) root_desired_per_child_visits_coeff: f64,
-    pub(crate) value_weight_exponent: f64,
-    pub(crate) chosen_move_temperature_early: f64,
-    pub(crate) chosen_move_temperature: f64,
-    pub(crate) chosen_move_temperature_halflife: f64,
-    pub(crate) chosen_move_subtract: f64,
-    pub(crate) chosen_move_prune: f64,
-    pub(crate) root_noise_enabled: bool,
-    pub(crate) root_dirichlet_noise_total_concentration: f64,
-    pub(crate) root_dirichlet_noise_weight: f64,
-    pub(crate) root_policy_temperature_early: f64,
-    pub(crate) root_policy_temperature: f64,
-    pub(crate) root_ending_bonus_points: f64,
-    pub(crate) root_prune_useless_moves: bool,
-    pub(crate) use_lcb_for_selection: bool,
-    pub(crate) lcb_stdevs: f64,
-    pub(crate) min_visit_prop_for_lcb: f64,
+pub struct SearchParams {
+    pub win_loss_utility_factor: f64,
+    pub static_score_utility_factor: f64,
+    pub dynamic_score_utility_factor: f64,
+    pub dynamic_score_center_zero_weight: f64,
+    pub dynamic_score_center_scale: f64,
+    pub cpuct_exploration: f64,
+    pub cpuct_exploration_log: f64,
+    pub cpuct_exploration_base: f64,
+    pub fpu_reduction_max: f64,
+    pub root_fpu_reduction_max: f64,
+    pub fpu_parent_weight_by_visited_policy_pow: f64,
+    pub root_desired_per_child_visits_coeff: f64,
+    pub value_weight_exponent: f64,
+    pub chosen_move_temperature_early: f64,
+    pub chosen_move_temperature: f64,
+    pub chosen_move_temperature_halflife: f64,
+    pub chosen_move_subtract: f64,
+    pub chosen_move_prune: f64,
+    pub root_noise_enabled: bool,
+    pub root_dirichlet_noise_total_concentration: f64,
+    pub root_dirichlet_noise_weight: f64,
+    pub root_policy_temperature_early: f64,
+    pub root_policy_temperature: f64,
+    pub root_ending_bonus_points: f64,
+    pub root_prune_useless_moves: bool,
+    pub use_lcb_for_selection: bool,
+    pub lcb_stdevs: f64,
+    pub min_visit_prop_for_lcb: f64,
 }
 
 impl Default for SearchParams {
@@ -53,7 +53,7 @@ impl Default for SearchParams {
 
 impl SearchParams {
     /// Check numeric/distribution requirements, not recommended tuning ranges.
-    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+    pub fn validate(&self) -> Result<(), &'static str> {
         let finite = [
             self.win_loss_utility_factor,
             self.static_score_utility_factor,
@@ -125,7 +125,7 @@ impl SearchParams {
 
     /// Values from KataGo's shipped `selfplay8mainb18.cfg`, including defaults
     /// from `Setup::loadParams` for fields omitted by that file.
-    pub(crate) const KATAGO_SELFPLAY8_MAIN_B18: Self = Self {
+    pub const KATAGO_SELFPLAY8_MAIN_B18: Self = Self {
         win_loss_utility_factor: 1.0,
         static_score_utility_factor: 0.05,
         dynamic_score_utility_factor: 0.30,

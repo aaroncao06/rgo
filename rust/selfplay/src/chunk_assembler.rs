@@ -235,9 +235,7 @@ mod tests {
     use crate::{
         game::{game_state::GameState, rules::Rules},
         inference::{inputs::NNInput, policy::POLICY_SIZE},
-        self_play::training_data::{
-            TrainingSample, ValueTarget, encode_chunk, verify_chunk_checksum,
-        },
+        training_data::{TrainingSample, ValueTarget, encode_chunk, verify_chunk_checksum},
     };
 
     fn sample() -> TrainingSample {

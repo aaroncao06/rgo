@@ -1,0 +1,20 @@
+[package]
+name = "rgo-selfplay"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+cuda = ["rgo-engine/cuda"]
+
+[dependencies]
+rgo-engine = { path = "../engine" }
+notify = "8.2"
+rand = { version = "0.10", default-features = false, features = ["sys_rng"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+toml = { version = "1.1", default-features = false, features = ["std", "parse", "serde"] }
+tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+rgo-engine = { path = "../engine", features = ["test-support"] }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std"] }

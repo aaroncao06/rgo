@@ -505,7 +505,7 @@ mod tests {
             runtime::{start_test_runtime, test_backend_factory},
         },
         search::worker::SearchBudget,
-        self_play::training_data::verify_chunk_checksum,
+        training_data::verify_chunk_checksum,
     };
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);

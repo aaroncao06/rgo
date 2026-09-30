@@ -1,8 +1,8 @@
 mod graph_key;
 mod move_selection;
 mod node;
-pub(crate) mod node_store;
-pub(crate) mod params;
+pub mod node_store;
+pub mod params;
 mod root_policy;
 mod utility;
-pub(crate) mod worker;
+pub mod worker;

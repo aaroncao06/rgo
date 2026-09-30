@@ -3,7 +3,7 @@
 
 use super::*;
 
-pub(crate) fn start_test_runtime<B, F, E>(
+pub fn start_test_runtime<B, F, E>(
     model_version: ModelVersion,
     backend_factories: Vec<(F, usize)>,
     queue_capacity: usize, // max number of inference clients, each with one outstanding request
@@ -66,7 +66,7 @@ where
     })))
 }
 
-pub(crate) fn test_backend_factory<B: InferenceBackend + Send + 'static>(
+pub fn test_backend_factory<B: InferenceBackend + Send + 'static>(
     backend: B,
     max_batch_size: usize,
 ) -> (impl FnOnce() -> Result<B, &'static str> + Send, usize) {

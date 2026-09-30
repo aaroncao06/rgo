@@ -3,7 +3,7 @@ use rand::{SeedableRng, rngs::SmallRng};
 use super::*;
 use crate::{inference::onnx::InferenceDevice, search::worker::SearchBudget};
 
-const EXAMPLE: &str = include_str!("../../../../../configs/self_play.toml");
+const EXAMPLE: &str = include_str!("../../../../configs/self_play.toml");
 
 #[test]
 fn example_reuses_algorithm_defaults() {

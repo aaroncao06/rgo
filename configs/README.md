@@ -1,7 +1,8 @@
 # Local self-play configuration
 
-`self_play.toml` is an example consumed by `SelfPlayConfig::load`. Executable
-configuration and shutdown wiring in `main` are not implemented yet.
+`self_play.toml` is an example consumed by `SelfPlayConfig::load` in the
+`rust/selfplay` application. It depends on the reusable `rust/engine` library.
+Executable configuration and shutdown wiring in `main` are not implemented yet.
 
 `SelfPlayConfig` combines operational settings with the existing `SelfPlayParams`,
 `SearchParams`, `ModelRuntimeConfig`, and `ChunkMode`; it does not duplicate their
@@ -26,7 +27,8 @@ the sampler is made robust.
 
 Directory paths are relative to the process working directory, not the config
 file. The example assumes the repository root. The model directory must already
-exist; the file sink creates the output directory. Use one sink per output
+exist; the output directory must also be provisioned by the caller before the
+file sink starts. Use one sink per output
 directory, and publish complete models atomically as `<version>.onnx`.
 
 Each inference executor has its own device and batch limit. CPU thread counts

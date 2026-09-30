@@ -19,7 +19,7 @@ use crate::game::board::BOARD_SIZE;
 /// Select an execution provider, not exclusive ownership of a device.
 #[derive(Debug, Clone, Copy, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum InferenceDevice {
+pub enum InferenceDevice {
     Cpu {
         intra_threads: usize,
     },
@@ -30,7 +30,7 @@ pub(crate) enum InferenceDevice {
 }
 
 impl InferenceDevice {
-    pub(crate) fn validate(self) -> Result<(), &'static str> {
+    pub fn validate(self) -> Result<(), &'static str> {
         match self {
             Self::Cpu { intra_threads: 0 } => Err("CPU intra_threads must be positive"),
             Self::Cuda { device_id } if device_id < 0 => Err("CUDA device_id must be nonnegative"),

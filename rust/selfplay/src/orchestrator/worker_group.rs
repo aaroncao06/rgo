@@ -8,7 +8,7 @@ use tokio::{
 };
 
 use crate::search::params::SearchParams;
-use crate::self_play::{
+use crate::{
     chunk_assembler::CompletedGame,
     params::SelfPlayParams,
     worker::{SelfPlayError, SelfPlayWorker, WorkerModelControl},

@@ -3,19 +3,19 @@ use super::symmetry::Symmetry;
 use crate::game::board::{Color, Loc};
 use crate::game::game_state::GameState;
 
-pub(crate) const NUM_SPATIAL_FEATURES: usize = 3; // player masks, superko banned
-pub(crate) const NUM_GLOBAL_FEATURES: usize = 2; // komi, passes
+pub const NUM_SPATIAL_FEATURES: usize = 3; // player masks, superko banned
+pub const NUM_GLOBAL_FEATURES: usize = 2; // komi, passes
 
 // takes in current board,
-pub(crate) struct NNInput {
+pub struct NNInput {
     /// Request metadata, NOT a model feature. Only roots need ownership output.
-    pub(crate) include_ownership: bool,
-    pub(crate) spatial: [f32; NUM_SPATIAL_FEATURES * BOARD_POLICY_SIZE],
-    pub(crate) global: [f32; NUM_GLOBAL_FEATURES],
+    pub include_ownership: bool,
+    pub spatial: [f32; NUM_SPATIAL_FEATURES * BOARD_POLICY_SIZE],
+    pub global: [f32; NUM_GLOBAL_FEATURES],
 }
 
 impl NNInput {
-    pub(crate) fn encode(game_state: &GameState) -> Self {
+    pub fn encode(game_state: &GameState) -> Self {
         let current_player = game_state.next_player();
         let current_color = Color::from(current_player);
         let opponent_color = Color::from(current_player.opponent());

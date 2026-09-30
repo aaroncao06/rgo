@@ -2,11 +2,16 @@
 
 An experimental Go engine for low-cost 9x9 self-play and training research.
 
-The Rust crate implements board rules, positional superko, scoring, a batched
-inference runtime/cache, and graph search using a selected KataGo self-play
-baseline. Its executable entry point is currently empty: it is not yet a usable
-CLI or a library crate. Real model backends, the self-play runner, and the Python
-trainer remain to be implemented.
+The `rgo-engine` Rust library implements board rules, positional superko,
+scoring, ONNX inference with a batched runtime/cache, and graph search using a
+selected KataGo self-play baseline. The separate `rgo-selfplay` application
+owns game generation, checkpoint watching, configuration, and training-record
+output. Its executable entry point is currently empty; startup and shutdown
+wiring and the Python trainer remain to be implemented.
+
+The engine has no dependency on self-play. A future interactive player can
+reuse the same library. Client/server orchestration will wrap standalone
+self-play and training components in separate applications.
 
 ## Build and test
 
@@ -21,7 +26,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets
 ```
 
-The empty executable currently produces dead-code warnings. Miri tests that
+The unfinished self-play executable currently produces dead-code warnings. Miri tests that
 initialize the score-utility table are slow because they interpret its numerical
 initialization; there is no separate Miri table-generation path.
 
@@ -29,6 +34,9 @@ initialization; there is no separate Miri table-generation path.
 
 | Location | Responsibility |
 |---|---|
+| `rust/engine/src/lib.rs` | Reusable engine library; game, inference, and search modules |
+| `rust/selfplay/src/main.rs` | Standalone self-play application entry point; startup wiring is pending |
+| `rust/selfplay/src/` | Self-play workers, orchestration, checkpoint watching, configuration, and training chunks |
 | `rust/engine/src/game/board.rs` | Coordinates, colors, chains, local legality, move application, and position hashing |
 | `rust/engine/src/game/board/scoring.rs` | Read-only area scoring and pass-alive analysis |
 | `rust/engine/src/game/game_state.rs` | Turns, rules, positional-superko history, scratch reset, and shared current-state hashing |

@@ -8,7 +8,7 @@ const REPETITION_BOUND: usize = 11;
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct GraphKey(Hash128);
+pub struct GraphKey(Hash128);
 
 fn mix(previous: Hash128, state: Hash128) -> Hash128 {
     let prev0 = previous as u64;

@@ -98,25 +98,25 @@ struct PlayoutStep {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct SearchResult {
-    pub(crate) selected_move: Loc,
-    pub(crate) policy_target: [f32; crate::inference::policy::POLICY_SIZE],
-    pub(crate) value_target: SearchValueTarget,
+pub struct SearchResult {
+    pub selected_move: Loc,
+    pub policy_target: [f32; crate::inference::policy::POLICY_SIZE],
+    pub value_target: SearchValueTarget,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct SearchValueTarget {
+pub struct SearchValueTarget {
     /// Probability that the player to move wins.
-    pub(crate) win_probability: f32,
+    pub win_probability: f32,
     /// Expected final score from the player-to-move perspective, in points.
-    pub(crate) score_mean: f32,
+    pub score_mean: f32,
     /// Standard deviation of the final score; unchanged by perspective.
-    pub(crate) score_stdev: f32,
+    pub score_stdev: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct SearchBudget {
+pub struct SearchBudget {
     /// Maximum number of non-root graph nodes created by this search.
     max_nodes: usize,
     /// Safety bound for playouts that finish without creating a node.
@@ -124,18 +124,18 @@ pub(crate) struct SearchBudget {
 }
 
 impl SearchBudget {
-    pub(crate) fn max_nodes(&self) -> usize {
+    pub fn max_nodes(&self) -> usize {
         self.max_nodes
     }
 
-    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+    pub fn validate(&self) -> Result<(), &'static str> {
         if self.max_playouts < self.max_nodes {
             return Err("playout safety limit must cover the node budget");
         }
         Ok(())
     }
 
-    pub(crate) const fn new(max_nodes: usize, max_playouts: usize) -> Self {
+    pub const fn new(max_nodes: usize, max_playouts: usize) -> Self {
         // max nodes being fewer than playouts means wasted memory
         assert!(
             max_playouts >= max_nodes,
@@ -148,7 +148,7 @@ impl SearchBudget {
     }
 }
 
-pub(crate) struct SearchWorker<N: NodeStore> {
+pub struct SearchWorker<N: NodeStore> {
     // The worker reuses its graph storage and scratch buffers across moves.
     search_graph: SearchGraph<N>,
     playout_path: Vec<PlayoutStep>, // scratch work to avoid reallocating
@@ -160,7 +160,7 @@ pub(crate) struct SearchWorker<N: NodeStore> {
 }
 
 #[derive(Debug)]
-pub(crate) enum SearchError {
+pub enum SearchError {
     NodeStore(InsertError),
     InferenceError(InferenceError),
     NoSelectableMove,
@@ -179,7 +179,7 @@ impl From<InsertError> for SearchError {
 }
 
 impl<N: NodeStore> SearchWorker<N> {
-    pub(crate) fn new(node_store: N, params: SearchParams) -> Self {
+    pub fn new(node_store: N, params: SearchParams) -> Self {
         Self {
             search_graph: SearchGraph::new(node_store),
             playout_path: Vec::new(),
@@ -261,7 +261,7 @@ impl<N: NodeStore> SearchWorker<N> {
         }
         Ok(())
     }
-    pub(crate) async fn search<R: Rng + ?Sized>(
+    pub async fn search<R: Rng + ?Sized>(
         &mut self,
         game_state: &GameState,
         budget: SearchBudget,

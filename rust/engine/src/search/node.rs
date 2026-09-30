@@ -1,6 +1,6 @@
 use crate::{game::board::Loc, inference::outputs::NNOutput};
 use std::{ptr::NonNull, sync::Arc};
-pub(crate) struct SearchNode {
+pub struct SearchNode {
     nn_output: Option<Arc<NNOutput>>,
     stats: SearchStats,
     children: ChildStorage,

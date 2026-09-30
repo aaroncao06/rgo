@@ -1,11 +1,11 @@
 use crate::game::board::{BOARD_SIZE, Loc, STRIDE};
 use crate::game::game_state::GameState;
 
-pub(crate) const BOARD_POLICY_SIZE: usize = BOARD_SIZE * BOARD_SIZE;
-pub(crate) const PASS_POLICY_INDEX: usize = BOARD_POLICY_SIZE;
-pub(crate) const POLICY_SIZE: usize = BOARD_POLICY_SIZE + 1;
+pub const BOARD_POLICY_SIZE: usize = BOARD_SIZE * BOARD_SIZE;
+pub const PASS_POLICY_INDEX: usize = BOARD_POLICY_SIZE;
+pub const POLICY_SIZE: usize = BOARD_POLICY_SIZE + 1;
 
-pub(crate) fn loc_to_policy(loc: Loc) -> usize {
+pub fn loc_to_policy(loc: Loc) -> usize {
     // Map a Loc action to its index in the dense NN policy.
     debug_assert!(loc != Loc::NULL);
     if loc == Loc::PASS {
@@ -15,7 +15,7 @@ pub(crate) fn loc_to_policy(loc: Loc) -> usize {
     loc.x() + loc.y() * BOARD_SIZE
 }
 
-pub(crate) fn policy_to_loc(i: usize) -> Loc {
+pub fn policy_to_loc(i: usize) -> Loc {
     debug_assert!(i < POLICY_SIZE);
     if i == PASS_POLICY_INDEX {
         return Loc::PASS;
@@ -25,7 +25,7 @@ pub(crate) fn policy_to_loc(i: usize) -> Loc {
     Loc::from_index((x + 1) + (y + 1) * STRIDE)
 }
 
-pub(crate) fn legal_mask(game_state: &GameState) -> [bool; POLICY_SIZE] {
+pub fn legal_mask(game_state: &GameState) -> [bool; POLICY_SIZE] {
     let mut mask = [false; POLICY_SIZE];
     for i in 0..POLICY_SIZE {
         mask[i] = game_state.is_legal(policy_to_loc(i));

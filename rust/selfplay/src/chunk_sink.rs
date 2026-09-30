@@ -112,15 +112,12 @@ mod tests {
 
     use super::*;
     use crate::{
+        chunk_assembler::{ChunkAssembler, ChunkMode, CompletedGame},
         game::{game_state::GameState, rules::Rules},
         inference::{inputs::NNInput, policy::POLICY_SIZE},
-        self_play::{
-            chunk_assembler::{ChunkAssembler, ChunkMode, CompletedGame},
-            training_data::{
-                CHUNK_CHECKSUM_SIZE, CHUNK_FORMAT_VERSION, CHUNK_HEADER_SIZE, CHUNK_MAGIC,
-                TRAINING_RECORD_SIZE, TrainingSample, ValueTarget, encode_chunk,
-                verify_chunk_checksum,
-            },
+        training_data::{
+            CHUNK_CHECKSUM_SIZE, CHUNK_FORMAT_VERSION, CHUNK_HEADER_SIZE, CHUNK_MAGIC,
+            TRAINING_RECORD_SIZE, TrainingSample, ValueTarget, encode_chunk, verify_chunk_checksum,
         },
     };
     use tokio::sync::oneshot;
