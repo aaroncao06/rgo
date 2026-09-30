@@ -13,7 +13,7 @@ rand = { version = "0.10", default-features = false, features = ["sys_rng"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 toml = { version = "1.1", default-features = false, features = ["std", "parse", "serde"] }
-tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
 
 [dev-dependencies]
 rgo-engine = { path = "../engine", features = ["test-support"] }

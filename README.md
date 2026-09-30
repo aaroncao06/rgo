@@ -6,8 +6,9 @@ The `rgo-engine` Rust library implements board rules, positional superko,
 scoring, ONNX inference with a batched runtime/cache, and graph search using a
 selected KataGo self-play baseline. The separate `rgo-selfplay` application
 owns game generation, checkpoint watching, configuration, and training-record
-output. Its executable entry point is currently empty; startup and shutdown
-wiring and the Python trainer remain to be implemented.
+output. Its executable loads a TOML configuration, watches for local models,
+and finishes active games and drains chunks on Ctrl-C. The Python trainer
+remains to be implemented.
 
 The engine has no dependency on self-play. A future interactive player can
 reuse the same library. Client/server orchestration will wrap standalone
@@ -26,16 +27,33 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets
 ```
 
-The unfinished self-play executable currently produces dead-code warnings. Miri tests that
-initialize the score-utility table are slow because they interpret its numerical
-initialization; there is no separate Miri table-generation path.
+The crates currently produce warnings for unfinished or unused helpers. Miri
+tests that initialize the score-utility table are slow because they interpret its
+numerical initialization; there is no separate Miri table-generation path.
+
+## Run local self-play
+
+From the repository root, create the model directory and run:
+
+```sh
+mkdir -p models
+cargo run --release --manifest-path rust/Cargo.toml -p rgo-selfplay -- configs/self_play.toml
+```
+
+Publish completed models atomically as `models/<version>.onnx`. Self-play waits
+if the directory is empty, creates the configured chunks directory, and loads
+newer models at move boundaries. Ctrl-C (or SIGTERM on Unix) requests a graceful
+finish; a second shutdown signal forces immediate exit, including during blocked
+model startup. Configuration and runtime errors print a diagnostic and exit with
+a nonzero status. See
+[configuration details](configs/README.md).
 
 ## Source map
 
 | Location | Responsibility |
 |---|---|
 | `rust/engine/src/lib.rs` | Reusable engine library; game, inference, and search modules |
-| `rust/selfplay/src/main.rs` | Standalone self-play application entry point; startup wiring is pending |
+| `rust/selfplay/src/main.rs` | Configuration loading, directory provisioning, runtime startup, and shutdown signals |
 | `rust/selfplay/src/` | Self-play workers, orchestration, checkpoint watching, configuration, and training chunks |
 | `rust/engine/src/game/board.rs` | Coordinates, colors, chains, local legality, move application, and position hashing |
 | `rust/engine/src/game/board/scoring.rs` | Read-only area scoring and pass-alive analysis |

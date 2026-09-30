@@ -2,7 +2,19 @@
 
 `self_play.toml` is an example consumed by `SelfPlayConfig::load` in the
 `rust/selfplay` application. It depends on the reusable `rust/engine` library.
-Executable configuration and shutdown wiring in `main` are not implemented yet.
+From the repository root, run it with:
+
+```sh
+cargo run --release --manifest-path rust/Cargo.toml -p rgo-selfplay -- configs/self_play.toml
+```
+
+The executable takes one config path; `--help` prints usage. A future setup CLI
+can construct this same configuration before running it. Ctrl-C (or SIGTERM on
+Unix) finishes active games and drains the output pipeline; a second shutdown
+signal forces immediate exit. Signal handling runs independently of model
+startup; graceful finishing waits for an in-progress load to return, while the
+second-signal forced exit remains available. An empty model directory is valid:
+the process waits for the first model and can be shut down while waiting.
 
 `SelfPlayConfig` combines operational settings with the existing `SelfPlayParams`,
 `SearchParams`, `ModelRuntimeConfig`, and `ChunkMode`; it does not duplicate their
@@ -27,8 +39,8 @@ the sampler is made robust.
 
 Directory paths are relative to the process working directory, not the config
 file. The example assumes the repository root. The model directory must already
-exist; the output directory must also be provisioned by the caller before the
-file sink starts. Use one sink per output
+exist; the executable creates the output directory before starting the file
+sink and syncs newly created directory entries on Unix. Use one sink per output
 directory, and publish complete models atomically as `<version>.onnx`.
 
 Each inference executor has its own device and batch limit. CPU thread counts
