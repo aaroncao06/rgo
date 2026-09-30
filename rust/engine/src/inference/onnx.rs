@@ -3,6 +3,7 @@
 use std::{path::Path, sync::Arc};
 
 use ort::{
+    ep,
     session::{HasSelectedOutputs, OutputSelector, RunOptions, Session, SessionOutputs},
     value::{Outlet, TensorElementType, TensorRef, ValueType},
 };
@@ -15,6 +16,18 @@ use super::{
 };
 use crate::game::board::BOARD_SIZE;
 
+/// Select an execution provider, not exclusive ownership of a device.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum InferenceDevice {
+    Cpu {
+        intra_threads: usize,
+    },
+    /// Requires a CUDA-enabled ONNX Runtime and the crate's `cuda` feature.
+    Cuda {
+        device_id: i32,
+    },
+}
+
 pub(crate) struct OnnxBackend {
     session: Session,
     without_ownership: RunOptions<HasSelectedOutputs>,
@@ -26,10 +39,32 @@ pub(crate) struct OnnxBackend {
 impl OnnxBackend {
     /// Construct on the executor thread, just like other backend factories.
     /// CPU intra-op parallelism is explicit to avoid multiplying thread pools.
-    pub(crate) fn load(path: &Path, intra_threads: usize) -> ort::Result<Self> {
-        assert!(intra_threads > 0, "CPU thread count must be positive");
+    pub(crate) fn load(path: &Path, device: InferenceDevice) -> ort::Result<Self> {
+        let (provider, intra_threads) = match device {
+            InferenceDevice::Cpu { intra_threads } => {
+                assert!(intra_threads > 0, "CPU thread count must be positive");
+                (
+                    ep::CPU::default().with_arena_allocator(true).build(),
+                    intra_threads,
+                )
+            }
+            InferenceDevice::Cuda { device_id } => {
+                assert!(device_id >= 0, "CUDA device ID must be nonnegative");
+                #[cfg(not(feature = "cuda"))]
+                {
+                    return Err(ort::Error::new("CUDA inference requires the cuda feature"));
+                }
+                #[cfg(feature = "cuda")]
+                {
+                    (ep::CUDA::default().with_device_id(device_id).build(), 1)
+                }
+            }
+        };
         let session = Session::builder()?
             .with_intra_threads(intra_threads)?
+            // A requested provider must register successfully; don't silently
+            // turn an unavailable CUDA configuration into a CPU-only session.
+            .with_execution_providers([provider.error_on_failure()])?
             .commit_from_file(path)?;
         validate_contract(&session)?;
         let without_ownership = RunOptions::new()?.with_outputs(

@@ -4,7 +4,7 @@ use crate::game::board::Player;
 fn backend() -> OnnxBackend {
     OnnxBackend::load(
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/v0.onnx"),
-        1,
+        InferenceDevice::Cpu { intra_threads: 1 },
     )
     .unwrap()
 }
@@ -73,7 +73,14 @@ fn rejects_incompatible_contract_metadata() {
 #[test]
 fn rejects_incompatible_input_shape() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/wrong_shape.onnx");
-    assert!(OnnxBackend::load(&path, 1).is_err());
+    assert!(OnnxBackend::load(&path, InferenceDevice::Cpu { intra_threads: 1 }).is_err());
+}
+
+#[cfg(not(feature = "cuda"))]
+#[test]
+fn unavailable_cuda_returns_an_error_instead_of_falling_back_to_cpu() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/v0.onnx");
+    assert!(OnnxBackend::load(&path, InferenceDevice::Cuda { device_id: 0 }).is_err());
 }
 
 #[test]

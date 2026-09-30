@@ -3,6 +3,9 @@ name = "rgo-engine"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+cuda = ["ort/cuda"]
+
 [dependencies]
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "download-binaries", "copy-dylibs", "tls-native", "api-27"] }
 rand = { version = "0.10", default-features = false, features = ["sys_rng"] }
