@@ -129,17 +129,17 @@ pub(super) fn sample_index<R: rand::Rng + ?Sized>(
     temperature: f64,
     rng: &mut R,
 ) -> usize {
-    assert!(temperature.is_finite());
+    debug_assert!(temperature.is_finite());
     let mut max_weight = 0.0;
     let mut best_index = 0;
     for (i, &weight) in weights.iter().enumerate() {
-        assert!(weight.is_finite());
+        debug_assert!(weight.is_finite());
         if weight > max_weight {
             max_weight = weight;
             best_index = i;
         }
     }
-    assert!(max_weight > 0.0);
+    debug_assert!(max_weight > 0.0);
     if temperature <= 1e-4 {
         return best_index;
     }
@@ -348,6 +348,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic]
     fn sampling_requires_a_positive_weight() {
         sample_index(&[0.0, -1.0], 1.0, &mut SmallRng::seed_from_u64(0));

@@ -12,13 +12,17 @@ pub(crate) enum InferenceError {
     ExecutionFailed,
     MismatchedBatchOutput,
     RuntimeClosed,
+    Onnx(Arc<ort::Error>),
 }
 pub(crate) trait InferenceBackend {
     /// Evaluate raw model activations in input order.
     ///
-    /// The executor supplies an empty, reusable output vector. On success,
+    /// The executor supplies a nonempty input batch and an empty, reusable
+    /// output vector. On success,
     /// append exactly one output per input; return an error if the backend
     /// cannot produce that complete batch. Partial outputs on error are ignored.
+    /// Returned raw activations must be finite. This is a model/backend contract
+    /// invariant checked with debug assertions, not a release-time tensor scan.
     /// Each output must be unprocessed and exclusively owned: do not retain
     /// other strong or weak Arc references or share one output between rows.
     /// The client uses Arc::get_mut to apply legal masking and perspective/score

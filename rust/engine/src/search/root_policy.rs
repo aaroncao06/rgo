@@ -11,7 +11,7 @@ pub(super) fn apply_temperature(
     legal: &[bool; POLICY_SIZE],
     temperature: f64,
 ) {
-    assert!(temperature.is_finite() && temperature > 0.0);
+    debug_assert!(temperature.is_finite() && temperature > 0.0);
 
     if (temperature - 1.0).abs() > f64::EPSILON {
         let max_probability = policy
@@ -19,7 +19,7 @@ pub(super) fn apply_temperature(
             .zip(legal)
             .filter_map(|(&probability, &is_legal)| is_legal.then_some(f64::from(probability)))
             .fold(0.0, f64::max);
-        assert!(max_probability > 0.0);
+        debug_assert!(max_probability > 0.0);
         let log_max = max_probability.ln();
         let inverse_temperature = 1.0 / temperature;
         let mut sum = 0.0;
@@ -30,7 +30,7 @@ pub(super) fn apply_temperature(
                 sum += f64::from(*probability);
             }
         }
-        assert!(sum > 0.0 && sum.is_finite());
+        debug_assert!(sum > 0.0 && sum.is_finite());
         for (probability, &is_legal) in policy.iter_mut().zip(legal) {
             if is_legal {
                 *probability = (f64::from(*probability) / sum) as f32;
@@ -51,11 +51,11 @@ pub(super) fn add_dirichlet_noise<R: RngExt + ?Sized>(
     if noise_weight == 0.0 {
         return;
     }
-    assert!((0.0..=1.0).contains(&noise_weight));
-    assert!(noise_total_concentration > 0.0);
+    debug_assert!((0.0..=1.0).contains(&noise_weight));
+    debug_assert!(noise_total_concentration > 0.0);
 
     let legal_count = legal.iter().filter(|&&is_legal| is_legal).count();
-    assert!(legal_count > 0);
+    debug_assert!(legal_count > 0);
     let legal_count_f64 = legal_count as f64;
     let mut alpha = [0.0; POLICY_SIZE];
     let mut log_policy_sum = 0.0;
@@ -97,7 +97,7 @@ pub(super) fn add_dirichlet_noise<R: RngExt + ?Sized>(
             noise_sum += noise[i];
         }
     }
-    assert!(noise_sum > 0.0 && noise_sum.is_finite());
+    debug_assert!(noise_sum > 0.0 && noise_sum.is_finite());
     for i in 0..POLICY_SIZE {
         if legal[i] {
             let draw = noise[i] / noise_sum;
@@ -111,7 +111,7 @@ fn gamma_sample<R: RngExt + ?Sized>(
     rng: &mut R,
     spare_normal: &mut Option<f64>,
 ) -> f64 {
-    assert!(shape > 0.0);
+    debug_assert!(shape > 0.0);
     if shape <= 1.0 {
         let sample = gamma_sample(shape + 1.0, rng, spare_normal);
         let uniform = rng.random::<f64>();

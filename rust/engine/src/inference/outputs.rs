@@ -50,10 +50,10 @@ fn masked_softmax_in_place(policy: &mut [f32; POLICY_SIZE], legal_mask: &[bool; 
             policy[i] = 0_f32;
         }
     }
-    assert!(
+    debug_assert!(
         sum.is_finite() && sum >= 1_f32,
         "invalid policy normalization"
-    ); //keep for now
+    );
     let inv_sum = 1_f32 / sum;
     for i in 0..POLICY_SIZE {
         if legal_mask[i] {
@@ -96,7 +96,8 @@ impl NNOutput {
         raw_score_mean: f32,
         raw_score_stdev_logit: f32,
     ) -> Self {
-        assert!(
+        // Finite raw activations are part of the model/backend contract.
+        debug_assert!(
             win_logit.is_finite()
                 && raw_score_mean.is_finite()
                 && raw_score_stdev_logit.is_finite(),
@@ -113,7 +114,7 @@ impl NNOutput {
     }
     pub(crate) fn with_ownership_logits(mut self, logits: [f32; BOARD_POLICY_SIZE]) -> Self {
         debug_assert!(!self.processed);
-        assert!(
+        debug_assert!(
             logits.iter().all(|v| v.is_finite()),
             "nonfinite ownership output"
         );
@@ -380,6 +381,7 @@ mod tests {
         assert_close(black.white_score_mean_sq(), expected_mean_sq);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "nonfinite value output")]
     fn raw_outputs_reject_nonfinite_scalar_values() {

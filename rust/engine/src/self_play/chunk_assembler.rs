@@ -61,10 +61,7 @@ impl ChunkAssembler {
     ) -> Self {
         let active_chunk = match mode {
             ChunkMode::PerGame => None,
-            ChunkMode::FixedRecords(chunk_size) => {
-                assert!(chunk_size > 0, "training chunks must be nonempty");
-                Some(ChunkEncoder::new(chunk_size))
-            }
+            ChunkMode::FixedRecords(chunk_size) => Some(ChunkEncoder::new(chunk_size)),
         };
         Self {
             mode,
