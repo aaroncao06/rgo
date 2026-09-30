@@ -88,12 +88,13 @@ async fn run(config: SelfPlayConfig) -> Result<(), String> {
         SelfPlayOrchestrator::new(
             config.search,
             config.self_play,
+            config.inference,
             config.worker_threads,
             config.workers_per_thread,
             config.chunk,
             config.output_dir,
         )
-        .run_local(config.inference, finish_rx)
+        .run_local(finish_rx)
         .await
         .map_err(|error| format!("self-play failed: {error:?}"))
     })

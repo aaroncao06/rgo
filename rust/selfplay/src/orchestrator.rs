@@ -47,6 +47,7 @@ pub(super) enum SelfPlayRunError {
 /// Owns one local self-play pipeline and one file sink for its output directory.
 /// Each of the `worker_threads` OS threads runs `workers_per_thread` local tasks.
 pub(super) struct SelfPlayOrchestrator {
+    runtime_config: ModelRuntimeConfig,
     worker_groups: Vec<WorkerGroup>,
     assembler: ChunkAssembler,
     sink: FileChunkSink,
@@ -59,6 +60,7 @@ impl SelfPlayOrchestrator {
     pub(super) fn new(
         search_params: SearchParams,
         self_play_params: SelfPlayParams,
+        runtime_config: ModelRuntimeConfig,
         worker_threads: usize,
         workers_per_thread: usize,
         chunk_mode: ChunkMode,
@@ -110,6 +112,7 @@ impl SelfPlayOrchestrator {
         drop(pause_rx);
 
         Self {
+            runtime_config,
             worker_groups,
             assembler: ChunkAssembler::new(chunk_mode, completed_games_rx, chunks_tx),
             sink: FileChunkSink::new(output_dir, chunks_rx),
@@ -123,7 +126,6 @@ impl SelfPlayOrchestrator {
     /// Use `run` instead when an external coordinator supplies model versions.
     pub(super) async fn run_local(
         self,
-        runtime_config: ModelRuntimeConfig,
         finish_games_rx: watch::Receiver<bool>,
     ) -> Result<(), SelfPlayRunError> {
         let (latest_tx, latest_rx) = watch::channel(None);
@@ -131,13 +133,13 @@ impl SelfPlayOrchestrator {
         // its cause rather than racing an incidental ModelSourceClosed error.
         let mut watcher_tasks = JoinSet::new();
         watcher_tasks.spawn(checkpoint_watcher::run(
-            runtime_config.model_dir.clone(),
+            self.runtime_config.model_dir.clone(),
             latest_tx.clone(),
         ));
         // JoinSet aborts its watcher if this future is cancelled or returns early.
         tokio::select! {
             biased;
-            result = self.run(runtime_config, latest_rx, finish_games_rx) => {
+            result = self.run(latest_rx, finish_games_rx) => {
                 watcher_tasks.abort_all();
                 while watcher_tasks.join_next().await.is_some() {}
                 result
@@ -162,15 +164,17 @@ impl SelfPlayOrchestrator {
     /// process because worker-group threads may still be running.
     pub(super) async fn run(
         self,
-        runtime_config: ModelRuntimeConfig,
         latest_model_version_rx: watch::Receiver<Option<ModelVersion>>,
         finish_games_rx: watch::Receiver<bool>,
     ) -> Result<(), SelfPlayRunError> {
         // Each configured worker can have one outstanding inference request.
         let queue_capacity = self.resume_txs.len();
-        self.run_inner(None, latest_model_version_rx, finish_games_rx, |version| {
-            ModelRuntime::load(version, queue_capacity, &runtime_config)
-        })
+        self.run_inner(
+            None,
+            latest_model_version_rx,
+            finish_games_rx,
+            |version, runtime_config| ModelRuntime::load(version, queue_capacity, runtime_config),
+        )
         .await
     }
 
@@ -179,7 +183,7 @@ impl SelfPlayOrchestrator {
         self,
         games_per_worker: usize,
         latest_model_version_rx: watch::Receiver<Option<ModelVersion>>,
-        load_model: F,
+        mut load_model: F,
     ) -> Result<(), SelfPlayRunError>
     where
         F: FnMut(ModelVersion) -> Result<ModelHandle, ModelLoadError>,
@@ -189,7 +193,7 @@ impl SelfPlayOrchestrator {
             Some(games_per_worker),
             latest_model_version_rx,
             finish_rx,
-            load_model,
+            |version, _| load_model(version),
         )
         .await
     }
@@ -204,7 +208,7 @@ impl SelfPlayOrchestrator {
         mut load_model: F,
     ) -> Result<(), SelfPlayRunError>
     where
-        F: FnMut(ModelVersion) -> Result<ModelHandle, ModelLoadError>,
+        F: FnMut(ModelVersion, &ModelRuntimeConfig) -> Result<ModelHandle, ModelLoadError>,
     {
         if !wait_for_first_model(&mut latest_model_version_rx, &mut finish_games_rx).await? {
             return Ok(());
@@ -248,6 +252,7 @@ async fn wait_for_first_model(
 /// The tasks, channels, and counters that live from pipeline startup through
 /// model handoffs and the final drain.
 struct RunningPipeline {
+    runtime_config: ModelRuntimeConfig,
     pause_tx: watch::Sender<bool>,
     latest_model_version_rx: watch::Receiver<Option<ModelVersion>>,
     finish_games_rx: watch::Receiver<bool>,
@@ -269,6 +274,7 @@ impl RunningPipeline {
         finish_games_rx: watch::Receiver<bool>,
     ) -> Self {
         let SelfPlayOrchestrator {
+            runtime_config,
             worker_groups,
             assembler,
             sink,
@@ -295,6 +301,7 @@ impl RunningPipeline {
         drop(events_tx);
 
         Self {
+            runtime_config,
             pause_tx,
             latest_model_version_rx,
             finish_games_rx,
@@ -311,7 +318,7 @@ impl RunningPipeline {
 
     async fn drive<F>(&mut self, load_model: &mut F) -> Result<(), SelfPlayRunError>
     where
-        F: FnMut(ModelVersion) -> Result<ModelHandle, ModelLoadError>,
+        F: FnMut(ModelVersion, &ModelRuntimeConfig) -> Result<ModelHandle, ModelLoadError>,
     {
         // Treat the channel's current value as the first publication.
         self.latest_model_version_rx.mark_changed();
@@ -356,7 +363,7 @@ impl RunningPipeline {
     /// or `false` if all workers finished before the replacement was needed.
     async fn replace_model<F>(&mut self, load_model: &mut F) -> Result<bool, SelfPlayRunError>
     where
-        F: FnMut(ModelVersion) -> Result<ModelHandle, ModelLoadError>,
+        F: FnMut(ModelVersion, &ModelRuntimeConfig) -> Result<ModelHandle, ModelLoadError>,
     {
         let _ = self.pause_tx.send(true);
         let mut paused_workers = 0;
@@ -409,7 +416,8 @@ impl RunningPipeline {
         // A newer checkpoint may have appeared during the pause. borrow and update avoids the race
         let version = (*self.latest_model_version_rx.borrow_and_update())
             .ok_or(SelfPlayRunError::LatestModelCleared)?;
-        let new_model = load_model(version).map_err(SelfPlayRunError::ModelLoad)?;
+        let new_model =
+            load_model(version, &self.runtime_config).map_err(SelfPlayRunError::ModelLoad)?;
         let _ = self.pause_tx.send(false);
         for resume_tx in &self.resume_txs {
             if !resume_tx.is_closed() {
@@ -649,6 +657,7 @@ mod tests {
         SelfPlayOrchestrator::new(
             search_params,
             params,
+            cpu_runtime_config(),
             worker_threads,
             workers_per_thread,
             mode,
@@ -743,7 +752,7 @@ mod tests {
         let (_finish_tx, finish_rx) = watch::channel(false);
 
         let result = orchestrator
-            .run_inner(None, latest_rx, finish_rx, |_| {
+            .run_inner(None, latest_rx, finish_rx, |_, _| {
                 Ok(
                     start_test_runtime(0, vec![test_backend_factory(FailingBackend, 8)], 1, 64, 1)
                         .unwrap(),
@@ -765,7 +774,7 @@ mod tests {
         let (_finish_tx, finish_rx) = watch::channel(false);
 
         let result = orchestrator
-            .run_inner(None, latest_rx, finish_rx, |_| {
+            .run_inner(None, latest_rx, finish_rx, |_, _| {
                 Ok(
                     start_test_runtime(0, vec![test_backend_factory(PassBackend, 8)], 1, 64, 1)
                         .unwrap(),
@@ -835,7 +844,7 @@ mod tests {
         // depend on the rejected checkpoint being loaded.
         let mut pipeline = RunningPipeline::start(orchestrator, Some(0), latest_rx, finish_rx);
         let result = pipeline
-            .drive(&mut |_| panic!("a cleared checkpoint must not be loaded"))
+            .drive(&mut |_, _| panic!("a cleared checkpoint must not be loaded"))
             .await;
         while pipeline.active_workers > 0 {
             record_worker_event(
@@ -854,7 +863,7 @@ mod tests {
         let orchestrator = orchestrator(dir.0.clone(), ChunkMode::PerGame, 1);
         let (_latest_tx, latest_rx) = watch::channel(None);
         let (finish_tx, finish_rx) = watch::channel(false);
-        let run = orchestrator.run(cpu_runtime_config(), latest_rx, finish_rx);
+        let run = orchestrator.run(latest_rx, finish_rx);
         let request_finish = async {
             tokio::task::yield_now().await;
             finish_tx.send(true).unwrap();
@@ -867,11 +876,10 @@ mod tests {
     #[tokio::test]
     async fn local_watcher_stops_when_finished_before_the_first_model() {
         let dir = TestDir::new();
-        let orchestrator = orchestrator(dir.0.clone(), ChunkMode::PerGame, 1);
-        let mut config = cpu_runtime_config();
-        config.model_dir = dir.0.clone();
+        let mut orchestrator = orchestrator(dir.0.clone(), ChunkMode::PerGame, 1);
+        orchestrator.runtime_config.model_dir = dir.0.clone();
         let (finish_tx, finish_rx) = watch::channel(false);
-        let run = orchestrator.run_local(config, finish_rx);
+        let run = orchestrator.run_local(finish_rx);
         let finish = async {
             tokio::task::yield_now().await;
             finish_tx.send(true).unwrap();
@@ -884,12 +892,11 @@ mod tests {
     #[tokio::test]
     async fn local_watcher_startup_failure_is_reported_with_its_cause() {
         let dir = TestDir::new();
-        let orchestrator = orchestrator(dir.0.clone(), ChunkMode::PerGame, 1);
-        let mut config = cpu_runtime_config();
-        config.model_dir = dir.0.join("missing");
+        let mut orchestrator = orchestrator(dir.0.clone(), ChunkMode::PerGame, 1);
+        orchestrator.runtime_config.model_dir = dir.0.join("missing");
         let (_finish_tx, finish_rx) = watch::channel(false);
         assert!(matches!(
-            orchestrator.run_local(config, finish_rx).await,
+            orchestrator.run_local(finish_rx).await,
             Err(SelfPlayRunError::CheckpointWatch(
                 CheckpointWatchError::Notification(_)
             ))
@@ -905,9 +912,7 @@ mod tests {
         drop(finish_tx);
 
         assert!(matches!(
-            orchestrator
-                .run(cpu_runtime_config(), latest_rx, finish_rx)
-                .await,
+            orchestrator.run(latest_rx, finish_rx).await,
             Err(SelfPlayRunError::FinishSourceClosed)
         ));
         assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
@@ -927,7 +932,7 @@ mod tests {
         let mut release_rx = Some(release_rx);
         let run = async {
             let result = orchestrator
-                .run_inner(Some(1), latest_rx, finish_rx, |version| {
+                .run_inner(Some(1), latest_rx, finish_rx, |version, _| {
                     assert_eq!(version, 0);
                     Ok(start_test_runtime(
                         0,
@@ -1092,7 +1097,7 @@ mod tests {
         let (finish_tx, finish_rx) = watch::channel(false);
         let mut first_eval_tx = Some(first_eval_tx);
         let mut release_rx = Some(release_rx);
-        let run = orchestrator.run_inner(None, latest_rx, finish_rx, |version| match version {
+        let run = orchestrator.run_inner(None, latest_rx, finish_rx, |version, _| match version {
             41 => Ok(start_test_runtime(
                 version,
                 vec![test_backend_factory(
