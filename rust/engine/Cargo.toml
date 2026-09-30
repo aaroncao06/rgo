@@ -7,7 +7,8 @@ edition = "2024"
 cuda = ["ort/cuda"]
 
 [dependencies]
+notify = "8.2"
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "download-binaries", "copy-dylibs", "tls-native", "api-27"] }
 rand = { version = "0.10", default-features = false, features = ["sys_rng"] }
 sha2 = "0.10"
-tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync"] }
+tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }

@@ -5,7 +5,7 @@ use std::{path::PathBuf, thread};
 
 use tokio::{
     sync::{mpsc, watch},
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
 };
 
 use super::{
@@ -23,7 +23,9 @@ use crate::{
     search::params::SearchParams,
 };
 
+mod checkpoint_watcher;
 mod worker_group;
+use checkpoint_watcher::CheckpointWatchError;
 use worker_group::{WorkerEvent, WorkerGroup, WorkerSpec};
 
 #[derive(Debug)]
@@ -33,6 +35,8 @@ pub(super) enum SelfPlayRunError {
     Sink(FileChunkSinkError),
     Task(tokio::task::JoinError),
     ModelLoad(ModelLoadError),
+    CheckpointWatch(CheckpointWatchError),
+    CheckpointWatcherStopped,
     ModelSourceClosed,
     FinishSourceClosed,
     LatestModelCleared,
@@ -112,6 +116,38 @@ impl SelfPlayOrchestrator {
             pause_tx,
             paused_rx,
             resume_txs,
+        }
+    }
+
+    /// Discover published models in the configured local directory while running.
+    /// Use `run` instead when an external coordinator supplies model versions.
+    pub(super) async fn run_local(
+        self,
+        runtime_config: ModelRuntimeConfig,
+        finish_games_rx: watch::Receiver<bool>,
+    ) -> Result<(), SelfPlayRunError> {
+        let (latest_tx, latest_rx) = watch::channel(None);
+        // Retain our sender until run ends, so a watcher error is reported with
+        // its cause rather than racing an incidental ModelSourceClosed error.
+        let mut watcher_tasks = JoinSet::new();
+        watcher_tasks.spawn(checkpoint_watcher::run(
+            runtime_config.model_dir.clone(),
+            latest_tx.clone(),
+        ));
+        // JoinSet aborts its watcher if this future is cancelled or returns early.
+        tokio::select! {
+            biased;
+            result = self.run(runtime_config, latest_rx, finish_games_rx) => {
+                watcher_tasks.abort_all();
+                while watcher_tasks.join_next().await.is_some() {}
+                result
+            }
+            result = watcher_tasks.join_next() => {
+                result.expect("watcher task exists")
+                    .map_err(SelfPlayRunError::Task)?
+                    .map_err(SelfPlayRunError::CheckpointWatch)?;
+                Err(SelfPlayRunError::CheckpointWatcherStopped)
+            }
         }
     }
 
@@ -826,6 +862,38 @@ mod tests {
         let (result, ()) = tokio::join!(run, request_finish);
         result.unwrap();
         assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn local_watcher_stops_when_finished_before_the_first_model() {
+        let dir = TestDir::new();
+        let orchestrator = orchestrator(dir.0.clone(), ChunkMode::PerGame, 1);
+        let mut config = cpu_runtime_config();
+        config.model_dir = dir.0.clone();
+        let (finish_tx, finish_rx) = watch::channel(false);
+        let run = orchestrator.run_local(config, finish_rx);
+        let finish = async {
+            tokio::task::yield_now().await;
+            finish_tx.send(true).unwrap();
+        };
+        let (result, ()) = tokio::join!(run, finish);
+        result.unwrap();
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn local_watcher_startup_failure_is_reported_with_its_cause() {
+        let dir = TestDir::new();
+        let orchestrator = orchestrator(dir.0.clone(), ChunkMode::PerGame, 1);
+        let mut config = cpu_runtime_config();
+        config.model_dir = dir.0.join("missing");
+        let (_finish_tx, finish_rx) = watch::channel(false);
+        assert!(matches!(
+            orchestrator.run_local(config, finish_rx).await,
+            Err(SelfPlayRunError::CheckpointWatch(
+                CheckpointWatchError::Notification(_)
+            ))
+        ));
     }
 
     #[tokio::test]
