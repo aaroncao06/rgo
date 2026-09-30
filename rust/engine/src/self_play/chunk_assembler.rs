@@ -12,7 +12,13 @@ pub(super) struct TrainingChunk {
     pub(super) recycle_tx: oneshot::Sender<Vec<u8>>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(
+    tag = "mode",
+    content = "records",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub(super) enum ChunkMode {
     /// Publish every completed game immediately as one chunk.
     PerGame,

@@ -84,6 +84,26 @@ fn unavailable_cuda_returns_an_error_instead_of_falling_back_to_cpu() {
 }
 
 #[test]
+fn invalid_device_settings_return_errors_before_loading() {
+    let path = std::path::Path::new("unused.onnx");
+    for (device, message) in [
+        (
+            InferenceDevice::Cpu { intra_threads: 0 },
+            "CPU intra_threads must be positive",
+        ),
+        (
+            InferenceDevice::Cuda { device_id: -1 },
+            "CUDA device_id must be nonnegative",
+        ),
+    ] {
+        let error = OnnxBackend::load(path, device)
+            .err()
+            .expect("invalid device must be rejected");
+        assert!(error.to_string().contains(message));
+    }
+}
+
+#[test]
 fn preserves_policy_order_including_pass() {
     let mut backend = backend();
     let input = NNInput {

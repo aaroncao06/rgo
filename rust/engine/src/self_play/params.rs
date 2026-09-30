@@ -1,8 +1,12 @@
 use rand::RngExt;
 
-use crate::{game::rules::Rules, search::worker::SearchBudget};
+use crate::{
+    game::rules::Rules,
+    search::{node_store::FixedArenaNodeStore, worker::SearchBudget},
+};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct SearchBudgetTier {
     probability: f64,
     budget: SearchBudget,
@@ -17,28 +21,43 @@ impl SearchBudgetTier {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(transparent)]
 pub(super) struct SearchBudgetPolicy {
     tiers: Box<[SearchBudgetTier]>,
 }
 
 impl SearchBudgetPolicy {
-    pub(super) fn new(tiers: Vec<SearchBudgetTier>) -> Self {
-        assert!(!tiers.is_empty(), "search budget policy needs a tier");
-        assert!(
-            tiers
-                .iter()
-                .all(|tier| tier.probability.is_finite() && tier.probability > 0.0),
-            "search budget probabilities must be positive and finite"
-        );
-        let total_probability: f64 = tiers.iter().map(|tier| tier.probability).sum();
-        assert!(
-            (total_probability - 1.0).abs() <= 1e-12,
-            "search budget probabilities must sum to one"
-        );
-        Self {
-            tiers: tiers.into_boxed_slice(),
+    pub(super) fn validate(&self) -> Result<(), &'static str> {
+        if self.tiers.is_empty() {
+            return Err("search budget policy needs a tier");
         }
+        if !self
+            .tiers
+            .iter()
+            .all(|tier| tier.probability.is_finite() && tier.probability > 0.0)
+        {
+            return Err("search budget probabilities must be positive and finite");
+        }
+        let total: f64 = self.tiers.iter().map(|tier| tier.probability).sum();
+        if (total - 1.0).abs() > 1e-12 || !total.is_finite() {
+            return Err("search budget probabilities must sum to one");
+        }
+        for tier in &self.tiers {
+            tier.budget.validate()?;
+            // Self-play currently uses the fixed arena. Its index limit is not
+            // an algorithm-level restriction on other SearchWorker stores.
+            FixedArenaNodeStore::validate_capacity(tier.budget.max_nodes())?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn new(tiers: Vec<SearchBudgetTier>) -> Self {
+        let policy = Self {
+            tiers: tiers.into_boxed_slice(),
+        };
+        policy.validate().expect("invalid search budget policy");
+        policy
     }
 
     pub(super) fn fixed(budget: SearchBudget) -> Self {
@@ -66,7 +85,8 @@ impl SearchBudgetPolicy {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub(super) struct SelfPlayParams {
     pub(super) rules: Rules,
     pub(super) search_budget_policy: SearchBudgetPolicy,
@@ -76,7 +96,7 @@ pub(super) struct SelfPlayParams {
 impl Default for SelfPlayParams {
     fn default() -> Self {
         Self {
-            rules: Rules::TROMP_TAYLORISH,
+            rules: Rules::default(),
             search_budget_policy: SearchBudgetPolicy::fixed(SearchBudget::new(512, 1024)),
             randomize_inference_symmetry: true,
         }

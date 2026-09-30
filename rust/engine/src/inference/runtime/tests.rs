@@ -108,7 +108,7 @@ fn load_returns_checkpoint_errors_through_startup() {
 
 #[cfg(not(feature = "cuda"))]
 #[test]
-fn load_cleans_up_started_cpu_executors_when_cuda_startup_fails() {
+fn load_rejects_unsupported_cuda_before_starting_executors() {
     let models = TestModelDir::new();
     let mut config = models.config();
     config.executors.push(ExecutorConfig {
@@ -119,24 +119,41 @@ fn load_cleans_up_started_cpu_executors_when_cuda_startup_fails() {
         ModelRuntime::load(42, 2, &config),
         Err(ModelStartupError::Backend(_))
     ));
-    // A fresh load still works after failed startup has joined its executors.
+    // Rejection leaves the loader usable for a supported configuration.
     drop(ModelRuntime::load(42, 2, &models.config()).unwrap());
 }
 
 #[test]
-#[should_panic(expected = "need at least one inference backend")]
 fn load_rejects_empty_executor_config() {
     let mut config = onnx_runtime_config();
     config.executors.clear();
-    let _ = ModelRuntime::load(0, 1, &config);
+    assert!(matches!(
+        ModelRuntime::load(0, 1, &config),
+        Err(ModelStartupError::Backend(_))
+    ));
 }
 
 #[test]
-#[should_panic(expected = "need positive batch size for every executor")]
 fn load_validates_all_batch_limits_before_starting_executors() {
     let mut config = onnx_runtime_config();
     config.executors[1].max_batch_size = 0;
-    let _ = ModelRuntime::load(0, 1, &config);
+    assert!(matches!(
+        ModelRuntime::load(0, 1, &config),
+        Err(ModelStartupError::Backend(_))
+    ));
+}
+
+#[test]
+fn load_validates_cache_dimensions_before_allocating() {
+    for (capacity, shards) in [(0, 1), (3, 1), (64, 0), (64, 3), (64, 128)] {
+        let mut config = onnx_runtime_config();
+        config.cache_capacity = capacity;
+        config.num_cache_shards = shards;
+        assert!(matches!(
+            ModelRuntime::load(0, 1, &config),
+            Err(ModelStartupError::Backend(_))
+        ));
+    }
 }
 
 fn test_input() -> NNInput {

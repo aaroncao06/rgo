@@ -41,7 +41,7 @@ pub(crate) struct FixedArenaNodeStore {
 }
 impl FixedArenaNodeStore {
     pub(crate) fn new(node_capacity: usize) -> Self {
-        Self::validate_capacity(node_capacity);
+        Self::validate_capacity(node_capacity).expect("node capacity out of bounds");
         let entries = Vec::with_capacity(node_capacity);
         let bucket_heads =
             vec![EMPTY_INDEX; Self::bucket_capacity(node_capacity)].into_boxed_slice();
@@ -52,11 +52,11 @@ impl FixedArenaNodeStore {
         }
     }
 
-    fn validate_capacity(node_capacity: usize) {
-        assert!(
-            node_capacity <= u32::MAX as usize,
-            "node capacity out of bounds"
-        );
+    pub(crate) fn validate_capacity(node_capacity: usize) -> Result<(), &'static str> {
+        if node_capacity > u32::MAX as usize {
+            return Err("node capacity exceeds the fixed arena's u32 index range");
+        }
+        Ok(())
     }
 
     fn bucket_capacity(node_capacity: usize) -> usize {
@@ -173,6 +173,14 @@ unsafe impl NodeStore for FixedArenaNodeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capacity_validation_accepts_the_full_index_range_without_allocating() {
+        assert!(FixedArenaNodeStore::validate_capacity(0).is_ok());
+        assert!(FixedArenaNodeStore::validate_capacity(u32::MAX as usize).is_ok());
+        #[cfg(target_pointer_width = "64")]
+        assert!(FixedArenaNodeStore::validate_capacity(u32::MAX as usize + 1).is_err());
+    }
 
     fn key(value: u128) -> GraphKey {
         GraphKey::from_raw(value)

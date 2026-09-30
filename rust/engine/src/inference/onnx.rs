@@ -17,7 +17,8 @@ use super::{
 use crate::game::board::BOARD_SIZE;
 
 /// Select an execution provider, not exclusive ownership of a device.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum InferenceDevice {
     Cpu {
         intra_threads: usize,
@@ -26,6 +27,19 @@ pub(crate) enum InferenceDevice {
     Cuda {
         device_id: i32,
     },
+}
+
+impl InferenceDevice {
+    pub(crate) fn validate(self) -> Result<(), &'static str> {
+        match self {
+            Self::Cpu { intra_threads: 0 } => Err("CPU intra_threads must be positive"),
+            Self::Cuda { device_id } if device_id < 0 => Err("CUDA device_id must be nonnegative"),
+            Self::Cuda { .. } if !cfg!(feature = "cuda") => {
+                Err("CUDA inference requires the cuda feature")
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 pub(crate) struct OnnxBackend {
@@ -40,25 +54,18 @@ impl OnnxBackend {
     /// Construct on the owning executor thread.
     /// CPU intra-op parallelism is explicit to avoid multiplying thread pools.
     pub(crate) fn load(path: &Path, device: InferenceDevice) -> ort::Result<Self> {
+        device.validate().map_err(ort::Error::new)?;
         let (provider, intra_threads) = match device {
-            InferenceDevice::Cpu { intra_threads } => {
-                assert!(intra_threads > 0, "CPU thread count must be positive");
-                (
-                    ep::CPU::default().with_arena_allocator(true).build(),
-                    intra_threads,
-                )
-            }
+            InferenceDevice::Cpu { intra_threads } => (
+                ep::CPU::default().with_arena_allocator(true).build(),
+                intra_threads,
+            ),
+            #[cfg(feature = "cuda")]
             InferenceDevice::Cuda { device_id } => {
-                assert!(device_id >= 0, "CUDA device ID must be nonnegative");
-                #[cfg(not(feature = "cuda"))]
-                {
-                    return Err(ort::Error::new("CUDA inference requires the cuda feature"));
-                }
-                #[cfg(feature = "cuda")]
-                {
-                    (ep::CUDA::default().with_device_id(device_id).build(), 1)
-                }
+                (ep::CUDA::default().with_device_id(device_id).build(), 1)
             }
+            #[cfg(not(feature = "cuda"))]
+            InferenceDevice::Cuda { .. } => unreachable!("CUDA support was validated"),
         };
         let session = Session::builder()?
             .with_intra_threads(intra_threads)?

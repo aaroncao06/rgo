@@ -40,8 +40,9 @@ pub(crate) enum ModelStartupError<E> {
     ExecutorPanicked,
 }
 
-/// File loading, contract validation, and device initialization all occur on
-/// executor threads and share the same startup error path.
+/// Configuration validation runs before spawning executors. File loading,
+/// tensor-contract validation, and device initialization run on executor threads;
+/// failures share the same startup error path.
 pub(crate) type ModelLoadError = ModelStartupError<ort::Error>;
 
 // wrapper so that client doesnt access executor threads and allow easy switching. api for queueing and caching
@@ -251,17 +252,9 @@ impl ModelRuntime {
         queue_capacity: usize,
         config: &ModelRuntimeConfig,
     ) -> Result<ModelHandle, ModelLoadError> {
-        assert!(
-            !config.executors.is_empty(),
-            "need at least one inference backend"
-        );
-        assert!(
-            config
-                .executors
-                .iter()
-                .all(|executor| executor.max_batch_size > 0),
-            "need positive batch size for every executor"
-        );
+        config
+            .validate()
+            .map_err(|message| ModelStartupError::Backend(ort::Error::new(message)))?;
         assert!(queue_capacity > 0, "need positive queue capacity");
 
         let checkpoint_path = model_path(&config.model_dir, model_version);

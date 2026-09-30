@@ -38,19 +38,25 @@ impl CacheShard {
     }
 }
 impl EvaluationCache {
+    pub(super) fn validate_dimensions(
+        capacity: usize,
+        num_shards: usize,
+    ) -> Result<(), &'static str> {
+        if !capacity.is_power_of_two() {
+            return Err("cache capacity must be a power of two");
+        }
+        if !num_shards.is_power_of_two() {
+            return Err("cache shard count must be a power of two");
+        }
+        if num_shards > capacity {
+            return Err("cache cannot have more shards than entries");
+        }
+        Ok(())
+    }
+
     pub(super) fn new(capacity: usize, num_shards: usize) -> Self {
-        assert!(
-            capacity.is_power_of_two(),
-            "cache capacity must be a power of two"
-        );
-        assert!(
-            num_shards.is_power_of_two(),
-            "cache shard count must be a power of two"
-        );
-        assert!(
-            num_shards <= capacity,
-            "cache cannot have more shards than entries"
-        );
+        Self::validate_dimensions(capacity, num_shards)
+            .expect("invalid evaluation cache dimensions");
 
         let entries_per_shard = capacity / num_shards;
         let mut shards = Vec::with_capacity(num_shards);

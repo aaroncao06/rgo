@@ -1,7 +1,14 @@
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct Rules {
     pub(crate) komi: f32,
     pub(crate) multi_stone_suicide_legal: bool,
+}
+
+impl Default for Rules {
+    fn default() -> Self {
+        Self::TROMP_TAYLORISH
+    }
 }
 
 impl Rules {

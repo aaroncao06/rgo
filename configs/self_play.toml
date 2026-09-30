@@ -1,0 +1,35 @@
+# Example local CPU run. Paths are relative to the process working directory;
+# this example assumes you run from the repository root.
+# Create models/ first, then atomically publish <version>.onnx files into it.
+worker_threads = 2
+workers_per_thread = 4
+output_dir = "self_play_chunks"
+
+# Use { mode = "fixed_records", records = 25000 } to batch across games.
+chunk = { mode = "per_game" }
+
+[inference]
+model_dir = "models"
+cache_capacity = 65536
+num_cache_shards = 16
+
+# Each entry starts one executor. Batch size is configured per device.
+[[inference.executors]]
+max_batch_size = 8
+device = { type = "cpu", intra_threads = 1 }
+# CUDA alternative (build with --features cuda):
+# device = { type = "cuda", device_id = 0 }
+
+# Omit these tables to use the same defaults defined in Rust.
+# Individual fields may be overridden without restating the other defaults.
+# [self_play]
+# randomize_inference_symmetry = true
+# search_budget_policy = [
+#   { probability = 0.9, budget = { max_nodes = 512, max_playouts = 1024 } },
+#   { probability = 0.1, budget = { max_nodes = 2048, max_playouts = 4096 } },
+# ]
+# [self_play.rules]
+# komi = 7.5
+# multi_stone_suicide_legal = true
+# [search]
+# root_noise_enabled = true

@@ -114,7 +114,8 @@ pub(crate) struct SearchValueTarget {
     pub(crate) score_stdev: f32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SearchBudget {
     /// Maximum number of non-root graph nodes created by this search.
     max_nodes: usize,
@@ -123,6 +124,17 @@ pub(crate) struct SearchBudget {
 }
 
 impl SearchBudget {
+    pub(crate) fn max_nodes(&self) -> usize {
+        self.max_nodes
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        if self.max_playouts < self.max_nodes {
+            return Err("playout safety limit must cover the node budget");
+        }
+        Ok(())
+    }
+
     pub(crate) const fn new(max_nodes: usize, max_playouts: usize) -> Self {
         // max nodes being fewer than playouts means wasted memory
         assert!(
