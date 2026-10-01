@@ -8,7 +8,12 @@ fn help_and_usage_do_not_start_self_play() {
         .unwrap();
     assert!(help.status.success());
     assert!(String::from_utf8_lossy(&help.stdout).contains("<config.toml>"));
-    for args in [vec![], vec!["one.toml", "two.toml"]] {
+    for args in [
+        vec![],
+        vec!["one.toml", "two.toml"],
+        vec!["--managed", "one.toml"],
+        vec!["--managed", "one.toml", "two.toml"],
+    ] {
         let output = Command::new(env!("CARGO_BIN_EXE_rgo-selfplay"))
             .args(args)
             .output()
@@ -24,6 +29,7 @@ mod unix {
     use sha2::{Digest, Sha256};
     use std::{
         fs,
+        io::Write,
         path::PathBuf,
         process::{Child, ExitStatus, Stdio},
         sync::atomic::{AtomicU64, Ordering},
@@ -39,6 +45,10 @@ mod unix {
     }
 
     impl TestProcess {
+        fn worker(model: Option<&str>) -> Self {
+            Self::start(model, true)
+        }
+
         fn start(model: Option<&str>, make_model_dir: bool) -> Self {
             let dir = std::env::temp_dir().join(format!(
                 "rgo-cli-test-{}-{}",
@@ -65,14 +75,36 @@ mod unix {
             )
             .unwrap();
             let log = fs::File::create(dir.join("stderr.log")).unwrap();
+            let output = fs::File::create(dir.join("stdout.log")).unwrap();
             let child = Command::new(env!("CARGO_BIN_EXE_rgo-selfplay"))
                 .arg("config.toml")
                 .current_dir(&dir)
-                .stdout(Stdio::null())
+                .stdin(Stdio::piped())
+                .stdout(output)
                 .stderr(log)
                 .spawn()
                 .unwrap();
             Self { dir, child }
+        }
+
+        fn send(&mut self, command: &str) {
+            writeln!(self.child.stdin.as_mut().unwrap(), "{command}").unwrap();
+        }
+
+        fn events(&self) -> Vec<serde_json::Value> {
+            fs::read_to_string(self.dir.join("stdout.log"))
+                .unwrap()
+                .split_inclusive('\n')
+                .filter(|line| line.ends_with('\n'))
+                .map(|line| {
+                    serde_json::from_str(line).expect("stdout must contain only JSON events")
+                })
+                .collect()
+        }
+
+        fn ready(&mut self) {
+            self.until(|run| run.events().iter().any(|event| event["type"] == "ready"));
+            assert_eq!(self.events()[0]["protocol_version"], 1);
         }
 
         fn log(&self) -> String {
@@ -127,48 +159,154 @@ mod unix {
     }
 
     #[test]
-    fn signals_exit_cleanly_while_waiting_for_the_first_model() {
-        for signal in ["-INT", "-TERM"] {
-            let mut run = TestProcess::start(None, true);
-            run.until(|run| run.log().contains("Starting 1 self-play workers"));
-            assert!(run.dir.join("output/chunks").is_dir());
-            run.signal(signal);
-            assert!(run.finish().success(), "{}", run.log());
-            assert!(run.log().contains("training chunks drained"));
-            assert!(run.chunks().is_empty());
-        }
-    }
-
-    #[test]
     fn startup_errors_exit_with_a_diagnostic() {
         let mut missing = TestProcess::start(None, false);
         assert_eq!(missing.finish().code(), Some(1));
         assert!(missing.log().contains("could not open model directory"));
         assert!(!missing.dir.join("output").exists());
-
-        let mut invalid = TestProcess::start(Some("wrong_version.onnx"), true);
-        assert_eq!(invalid.finish().code(), Some(1));
-        assert!(invalid.log().contains("ModelLoad"), "{}", invalid.log());
     }
 
     #[test]
-    fn real_model_produces_chunks_and_drains_on_interrupt() {
-        let mut run = TestProcess::start(Some("v0.onnx"), true);
-        run.until(|run| run.log().contains("Starting 1 self-play workers"));
-        run.until(|run| !run.chunks().is_empty());
-        run.signal("-INT");
+    fn worker_waits_for_commands_even_with_an_existing_model() {
+        let mut run = TestProcess::worker(Some("v0.onnx"));
+        run.ready();
+        run.send(r#"{"type":"finish"}"#);
+        // The parent keeps stdin open: a blocked reader must not delay exit.
         assert!(run.finish().success(), "{}", run.log());
-        assert!(run.log().contains("training chunks drained"));
-        assert!(!run.dir.join("output/chunks/.pending-chunk.tmp").exists());
-        for path in run.chunks() {
+        assert!(run.chunks().is_empty());
+        let events = run.events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1]["type"], "stopped");
+    }
+
+    #[test]
+    fn model_commands_publish_durable_chunks_and_drain() {
+        let mut run = TestProcess::worker(None);
+        run.ready();
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../engine/tests/data/v0.onnx");
+        fs::copy(fixture, run.dir.join("models/42.onnx")).unwrap();
+        run.send(r#"{"type":"model_ready","version":42}"#);
+        run.until(|run| {
+            run.events()
+                .iter()
+                .any(|event| event["type"] == "chunk_ready")
+        });
+        let first = run
+            .events()
+            .into_iter()
+            .find(|event| event["type"] == "chunk_ready")
+            .unwrap();
+        assert!(run.dir.join(first["path"].as_str().unwrap()).is_file());
+        // An installed model stays alive in memory. Duplicate/stale messages
+        // must not reload it or require older model files to remain on disk.
+        fs::remove_file(run.dir.join("models/42.onnx")).unwrap();
+        run.send(r#"{"type":"model_ready","version":42}"#);
+        run.send(r#"{"type":"model_ready","version":0}"#);
+        run.send(r#"{"type":"finish"}"#);
+        assert!(run.finish().success(), "{}", run.log());
+        let events = run.events();
+        assert_eq!(events.last().unwrap()["type"], "stopped");
+        let chunks: Vec<_> = events
+            .iter()
+            .filter(|event| event["type"] == "chunk_ready")
+            .collect();
+        assert!(!chunks.is_empty());
+        assert_eq!(chunks.len(), run.chunks().len());
+        for event in chunks {
+            let path = run.dir.join(event["path"].as_str().unwrap());
             let bytes = fs::read(path).unwrap();
-            assert!(bytes.len() > 68);
             assert_eq!(&bytes[..8], b"RGOCHNK\0");
+            assert_eq!(event["bytes"].as_u64().unwrap(), bytes.len() as u64);
+            assert_eq!(
+                event["records"].as_u64().unwrap(),
+                u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as u64,
+            );
             let checksum_offset = bytes.len() - 32;
             assert_eq!(
                 Sha256::digest(&bytes[..checksum_offset]).as_slice(),
                 &bytes[checksum_offset..]
             );
+        }
+        assert!(!run.dir.join("output/chunks/.pending-chunk.tmp").exists());
+    }
+
+    #[test]
+    fn disconnected_client_finishes_active_games() {
+        let mut run = TestProcess::worker(Some("v0.onnx"));
+        run.ready();
+        run.send(r#"{"type":"model_ready","version":0}"#);
+        run.until(|run| {
+            run.events()
+                .iter()
+                .any(|event| event["type"] == "chunk_ready")
+        });
+        drop(run.child.stdin.take());
+        assert!(run.finish().success(), "{}", run.log());
+        assert_eq!(run.events().last().unwrap()["type"], "stopped");
+    }
+
+    #[test]
+    fn bad_commands_and_unavailable_models_report_errors() {
+        for (command, diagnostic) in [
+            ("not json".into(), "invalid control command"),
+            (
+                r#"{"type":"finish","unexpected":true}"#.into(),
+                "invalid control command",
+            ),
+            (
+                r#"{"type":"model_ready","version":0,"path":"wrong"}"#.into(),
+                "invalid control command",
+            ),
+            (
+                r#"{"type":"model_ready","version":0}"#.into(),
+                "announced model models/0.onnx is unavailable",
+            ),
+            ("x".repeat(4097), "control command exceeds 4096 bytes"),
+        ] {
+            let mut run = TestProcess::worker(None);
+            run.ready();
+            run.send(&command);
+            assert_eq!(run.finish().code(), Some(1), "{}", run.log());
+            let events = run.events();
+            let last = events.last().unwrap();
+            assert_eq!(last["type"], "error");
+            assert!(
+                last["message"].as_str().unwrap().contains(diagnostic),
+                "{last}"
+            );
+            assert!(run.chunks().is_empty());
+        }
+
+        let mut invalid = TestProcess::worker(Some("wrong_version.onnx"));
+        invalid.ready();
+        invalid.send(r#"{"type":"model_ready","version":0}"#);
+        assert_eq!(invalid.finish().code(), Some(1));
+        assert!(
+            invalid.events().last().unwrap()["message"]
+                .as_str()
+                .unwrap()
+                .contains("ModelLoad")
+        );
+    }
+
+    #[test]
+    fn signals_finish_with_stdin_still_open() {
+        for (model, signal) in [(None, "-INT"), (None, "-TERM"), (Some("v0.onnx"), "-INT")] {
+            let mut run = TestProcess::worker(model);
+            run.ready();
+            if model.is_some() {
+                run.send(r#"{"type":"model_ready","version":0}"#);
+                run.until(|run| {
+                    run.events()
+                        .iter()
+                        .any(|event| event["type"] == "chunk_ready")
+                });
+            }
+            run.signal(signal);
+            assert!(run.finish().success(), "{}", run.log());
+            assert_eq!(run.events().last().unwrap()["type"], "stopped");
+            assert!(!run.dir.join("output/chunks/.pending-chunk.tmp").exists());
         }
     }
 }

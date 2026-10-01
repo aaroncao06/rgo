@@ -4,16 +4,18 @@ use std::{
 };
 
 use rand::{TryRng, rngs::SysError, rngs::SysRng};
+use rgo_artifacts::{ChunkId, chunk_path};
 use tokio::{
     fs::{self, File},
     io::AsyncWriteExt,
     sync::mpsc,
 };
 
-use super::chunk_assembler::TrainingChunk;
+use super::{
+    chunk_assembler::TrainingChunk,
+    control::{Event, EventPublisher},
+};
 
-const CHUNK_FILE_PREFIX: &str = "chunk-";
-const CHUNK_FILE_SUFFIX: &str = ".rgo";
 const PENDING_CHUNK_FILE: &str = ".pending-chunk.tmp";
 
 #[derive(Debug)]
@@ -44,13 +46,19 @@ impl From<io::Error> for FileChunkSinkError {
 pub(super) struct FileChunkSink {
     output_dir: PathBuf,
     chunks_rx: mpsc::Receiver<TrainingChunk>,
+    events: EventPublisher,
 }
 
 impl FileChunkSink {
-    pub(super) fn new(output_dir: PathBuf, chunks_rx: mpsc::Receiver<TrainingChunk>) -> Self {
+    pub(super) fn new(
+        output_dir: PathBuf,
+        chunks_rx: mpsc::Receiver<TrainingChunk>,
+        events: EventPublisher,
+    ) -> Self {
         Self {
             output_dir,
             chunks_rx,
+            events,
         }
     }
 
@@ -66,7 +74,7 @@ impl FileChunkSink {
 
         while let Some(chunk) = self.chunks_rx.recv().await {
             let chunk_id = random_chunk_id().map_err(FileChunkSinkError::RandomnessUnavailable)?;
-            self.write_chunk(chunk_id, &chunk.bytes).await?;
+            self.write_chunk(chunk_id, &chunk).await?;
             let mut bytes = chunk.bytes;
             bytes.clear();
             let _ = chunk.recycle_tx.send(bytes);
@@ -74,18 +82,27 @@ impl FileChunkSink {
         Ok(())
     }
 
-    async fn write_chunk(&self, chunk_id: u128, bytes: &[u8]) -> Result<(), FileChunkSinkError> {
-        let final_path = self.output_dir.join(format!(
-            "{CHUNK_FILE_PREFIX}{chunk_id:032x}{CHUNK_FILE_SUFFIX}"
-        ));
+    async fn write_chunk(
+        &self,
+        chunk_id: ChunkId,
+        chunk: &TrainingChunk,
+    ) -> Result<(), FileChunkSinkError> {
+        let final_path = chunk_path(&self.output_dir, chunk_id);
         let temporary_path = self.output_dir.join(PENDING_CHUNK_FILE);
 
         let mut file = File::create(&temporary_path).await?;
-        file.write_all(bytes).await?;
+        file.write_all(&chunk.bytes).await?;
         file.sync_all().await?;
         drop(file);
-        fs::rename(&temporary_path, final_path).await?;
+        fs::rename(&temporary_path, &final_path).await?;
         sync_directory(&self.output_dir).await?;
+        self.events
+            .emit(Event::ChunkReady {
+                path: final_path,
+                bytes: chunk.bytes.len(),
+                records: chunk.records,
+            })
+            .await?;
         Ok(())
     }
 }
@@ -100,14 +117,15 @@ async fn sync_directory(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn random_chunk_id() -> Result<u128, SysError> {
-    let mut bytes = [0; size_of::<u128>()];
+fn random_chunk_id() -> Result<ChunkId, SysError> {
+    let mut bytes = [0; size_of::<ChunkId>()];
     SysRng.try_fill_bytes(&mut bytes)?;
-    Ok(u128::from_le_bytes(bytes))
+    Ok(ChunkId::from_le_bytes(bytes))
 }
 
 #[cfg(test)]
 mod tests {
+    use rgo_artifacts::{CHUNK_FILE_PREFIX, CHUNK_FILE_SUFFIX};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
@@ -165,7 +183,7 @@ mod tests {
         let parent = TestDir::new();
         let missing = parent.0.join("missing");
         let (chunks_tx, chunks_rx) = mpsc::channel(1);
-        let sink = FileChunkSink::new(missing, chunks_rx);
+        let sink = FileChunkSink::new(missing, chunks_rx, EventPublisher::discard());
         drop(chunks_tx);
 
         let Err(FileChunkSinkError::Io(error)) = sink.run().await else {
@@ -182,13 +200,17 @@ mod tests {
             let output_dir = output_dir.0.clone();
             async move {
                 let (chunks_tx, chunks_rx) = mpsc::channel(1);
-                let sink = FileChunkSink::new(output_dir, chunks_rx);
+                let sink = FileChunkSink::new(output_dir, chunks_rx, EventPublisher::discard());
                 let sink_task = tokio::spawn(sink.run());
                 let (recycle_tx, recycle_rx) = tokio::sync::oneshot::channel();
                 let bytes = encode_chunk(&[sample()]);
                 let allocation = bytes.as_ptr();
                 chunks_tx
-                    .send(TrainingChunk { bytes, recycle_tx })
+                    .send(TrainingChunk {
+                        bytes,
+                        records: 1,
+                        recycle_tx,
+                    })
                     .await
                     .unwrap();
                 drop(chunks_tx);
@@ -214,11 +236,12 @@ mod tests {
         assert_ne!(first_name, second_name);
 
         let name = second_name.to_string_lossy();
-        let _id = name
+        let id = name
             .strip_prefix(CHUNK_FILE_PREFIX)
             .and_then(|name| name.strip_suffix(CHUNK_FILE_SUFFIX))
-            .and_then(|id| u128::from_str_radix(id, 16).ok())
+            .and_then(|id| ChunkId::from_str_radix(id, 16).ok())
             .expect("chunk filename contains a 128-bit hexadecimal ID");
+        assert_eq!(chunk_path(&output_dir.0, id), second_entry.path());
 
         let bytes = fs::read(second_entry.path()).await.unwrap();
         assert_eq!(&bytes[..8], &CHUNK_MAGIC);
@@ -240,7 +263,7 @@ mod tests {
         let (chunks_tx, chunks_rx) = mpsc::channel(1);
         let assembler =
             ChunkAssembler::new(ChunkMode::FixedRecords(2), completed_games_rx, chunks_tx);
-        let sink = FileChunkSink::new(output_dir.0.clone(), chunks_rx);
+        let sink = FileChunkSink::new(output_dir.0.clone(), chunks_rx, EventPublisher::discard());
         let assembler_task = tokio::spawn(assembler.run());
         let sink_task = tokio::spawn(sink.run());
         let (recycle_tx, recycle_rx) = oneshot::channel();

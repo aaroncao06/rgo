@@ -7,10 +7,11 @@ edition = "2024"
 cuda = ["rgo-engine/cuda"]
 
 [dependencies]
+rgo-artifacts = { path = "../artifacts" }
 rgo-engine = { path = "../engine" }
-notify = "8.2"
 rand = { version = "0.10", default-features = false, features = ["sys_rng"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sha2 = "0.10"
 toml = { version = "1.1", default-features = false, features = ["std", "parse", "serde"] }
 tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }

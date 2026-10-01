@@ -1,20 +1,77 @@
-# Local self-play configuration
+# Self-play worker configuration
 
 `self_play.toml` is an example consumed by `SelfPlayConfig::load` in the
-`rust/selfplay` application. It depends on the reusable `rust/engine` library.
-From the repository root, run it with:
+`rust/selfplay` worker process. It depends on the reusable `rust/engine` library.
+The client launches and supervises this worker; there is no standalone
+filesystem-watcher mode. The future client setup interface can construct this
+same configuration before launching it.
+
+## Client-to-worker pipe protocol
+
+The internal process launch interface takes one config path:
 
 ```sh
-cargo run --release --manifest-path rust/Cargo.toml -p rgo-selfplay -- configs/self_play.toml
+rgo-selfplay configs/self_play.toml
 ```
 
-The executable takes one config path; `--help` prints usage. A future setup CLI
-can construct this same configuration before running it. Ctrl-C (or SIGTERM on
-Unix) finishes active games and drains the output pipeline; a second shutdown
-signal forces immediate exit. Signal handling runs independently of model
-startup; graceful finishing waits for an in-progress load to return, while the
-second-signal forced exit remains available. An empty model directory is valid:
-the process waits for the first model and can be shut down while waiting.
+The worker always uses local stdin/stdout pipes. The client
+owns server communication and stages remote artifacts in the configured paths;
+shared-storage clients use those paths directly. The model directory must exist,
+but self-play does not scan or watch it. The client/server supervisor is not yet
+implemented; integration tests currently exercise this boundary as the parent
+process. Launch arguments and `--help` are an internal worker interface, rather
+than an additional user-facing execution mode.
+
+Send one JSON command per line on stdin:
+
+```json
+{"type":"model_ready","version":42}
+{"type":"finish"}
+```
+
+`model_ready` means the client has completely published `<model_dir>/42.onnx`.
+Self-play checks that exact path before forwarding the version to its existing
+model-handoff logic. Missing or non-file paths and invalid ONNX models are
+errors. Versions must fit an unsigned 64-bit integer; duplicate and older
+announcements are ignored. Unannounced files do not trigger model changes.
+`finish` stops new games and drains active games and chunks. Closing stdin also
+requests a graceful finish, so a disconnected supervisor does not leave an
+uncontrolled producer running. Commands are limited to 4096 bytes per line,
+including the newline; malformed JSON, unknown commands, and unknown fields
+are errors.
+
+Stdout contains only newline-delimited JSON events; diagnostics remain on stderr:
+
+```json
+{"type":"ready","protocol_version":1}
+{"type":"chunk_ready","path":"self_play_chunks/chunk-<id>.rgo","bytes":2870,"records":2}
+{"type":"stopped"}
+```
+
+`ready` means the control interface is ready, not that a model has loaded.
+`chunk_ready` is emitted only after the complete chunk is atomically published
+and synced; its path follows the configured output path and is relative to the
+child's working directory when that configuration is relative. `records` is the
+actual number of training records, including for a final partial chunk. It comes
+directly from the encoder; the client/server can use it for replay inventory and
+should validate it against the file header when accepting the chunk. `stopped`
+follows all final chunk events after a successful drain. Runtime and command
+failures produce a best-effort `{"type":"error","message":"..."}` event and
+exit with status 1. Startup failures before the interface starts report on
+stderr with a nonzero exit status. The supervisor must monitor exit status and
+continuously drain stdout and stderr. Event delivery is bounded and applies
+backpressure rather than dropping chunk notifications. SIGINT or SIGTERM on
+Unix also requests a graceful finish; a second shutdown signal forces immediate
+exit. Signal handling runs independently of model startup: graceful finishing
+waits for an in-progress load to return, while forced exit remains available.
+The pipe protocol has no force-exit command. The parent requests graceful
+shutdown with `finish`, then kills the child directly if a timeout expires or
+the user requests forced shutdown. A `finish` command does not count as the
+first OS shutdown signal; the direct signal handler counts signals separately.
+An empty model directory is valid; the worker waits for its first model-ready
+command and can finish while waiting.
+
+## Configuration fields
 
 `SelfPlayConfig` combines operational settings with the existing `SelfPlayParams`,
 `SearchParams`, `ModelRuntimeConfig`, and `ChunkMode`; it does not duplicate their

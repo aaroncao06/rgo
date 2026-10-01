@@ -5,14 +5,20 @@ An experimental Go engine for low-cost 9x9 self-play and training research.
 The `rgo-engine` Rust library implements board rules, positional superko,
 scoring, ONNX inference with a batched runtime/cache, and graph search using a
 selected KataGo self-play baseline. The separate `rgo-selfplay` application
-owns game generation, checkpoint watching, configuration, and training-record
-output. Its executable loads a TOML configuration, watches for local models,
-and finishes active games and drains chunks on Ctrl-C. The Python trainer
+owns game generation, configuration, and training-record output. Its worker
+executable loads a TOML configuration and accepts model-ready and finish commands
+from a supervising client over stdin. It reports chunk publication and lifecycle
+events over stdout. The Python trainer
 remains to be implemented.
 
 The engine has no dependency on self-play. A future interactive player can
-reuse the same library. Client/server orchestration will wrap standalone
+reuse the same library. Client/server orchestration will supervise separate
 self-play and training components in separate applications.
+
+The dependency-free `rgo-artifacts` crate owns shared model/chunk identities and
+filename conventions. The engine, self-play, and future client/server components
+use those helpers with their own storage roots; artifact naming does not own
+file persistence or streaming.
 
 ## Build and test
 
@@ -31,30 +37,29 @@ The crates currently produce warnings for unfinished or unused helpers. Miri
 tests that initialize the score-utility table are slow because they interpret its
 numerical initialization; there is no separate Miri table-generation path.
 
-## Run local self-play
+## Self-play worker process
 
-From the repository root, create the model directory and run:
+Self-play is a client-supervised worker, with no standalone filesystem-watcher
+mode. The client supplies model-ready notifications after publishing complete
+models atomically as `<model_dir>/<version>.onnx`. The worker checks the exact
+model path and loads announced versions at move boundaries. It creates the
+configured chunks directory and reports completed, durable chunks to the client.
 
-```sh
-mkdir -p models
-cargo run --release --manifest-path rust/Cargo.toml -p rgo-selfplay -- configs/self_play.toml
-```
-
-Publish completed models atomically as `models/<version>.onnx`. Self-play waits
-if the directory is empty, creates the configured chunks directory, and loads
-newer models at move boundaries. Ctrl-C (or SIGTERM on Unix) requests a graceful
-finish; a second shutdown signal forces immediate exit, including during blocked
-model startup. Configuration and runtime errors print a diagnostic and exit with
-a nonzero status. See
-[configuration details](configs/README.md).
+A finish command or closed stdin stops new games and drains active games and
+chunks. SIGINT or SIGTERM on Unix also requests a graceful finish; a second
+shutdown signal forces immediate exit, including during blocked model startup.
+The client/server supervisor is still to be implemented. Integration tests
+launch the worker as a child and exercise its control protocol. See
+[configuration and the pipe protocol](configs/README.md).
 
 ## Source map
 
 | Location | Responsibility |
 |---|---|
+| `rust/artifacts/src/lib.rs` | Shared model/chunk identities and canonical path helpers |
 | `rust/engine/src/lib.rs` | Reusable engine library; game, inference, and search modules |
 | `rust/selfplay/src/main.rs` | Configuration loading, directory provisioning, runtime startup, and shutdown signals |
-| `rust/selfplay/src/` | Self-play workers, orchestration, checkpoint watching, configuration, and training chunks |
+| `rust/selfplay/src/` | Self-play workers, orchestration, client pipe protocol, configuration, and training chunks |
 | `rust/engine/src/game/board.rs` | Coordinates, colors, chains, local legality, move application, and position hashing |
 | `rust/engine/src/game/board/scoring.rs` | Read-only area scoring and pass-alive analysis |
 | `rust/engine/src/game/game_state.rs` | Turns, rules, positional-superko history, scratch reset, and shared current-state hashing |
@@ -81,8 +86,8 @@ changes may still require changes to the core mechanics.
 
 Large test suites live in child `tests.rs` modules; shorter suites remain inline.
 Python model/trainer directories are placeholders with no implementation yet.
-Client/server orchestration will be built on top of standalone self-play and
-training components.
+Client/server orchestration will supervise the self-play and training components
+through their local process interfaces.
 
 ## Documentation
 

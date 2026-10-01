@@ -31,7 +31,7 @@ fn blocked_startup_child() {
     let (_release_startup_tx, release_startup_rx) = mpsc::channel::<()>();
     build_runtime()
         .unwrap()
-        .block_on(with_shutdown(|mut finish_rx| async move {
+        .block_on(with_shutdown(|_finish_tx, mut finish_rx| async move {
             tokio::spawn(async move {
                 finish_rx.changed().await.unwrap();
                 assert!(*finish_rx.borrow());

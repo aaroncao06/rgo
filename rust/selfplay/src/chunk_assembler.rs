@@ -1,6 +1,6 @@
 use tokio::sync::{mpsc, oneshot};
 
-use super::training_data::{ChunkEncoder, TrainingSample};
+use super::training_data::{ChunkEncoder, EncodedChunk, TrainingSample};
 
 pub(super) struct CompletedGame {
     pub(super) samples: Vec<TrainingSample>,
@@ -9,6 +9,7 @@ pub(super) struct CompletedGame {
 
 pub(super) struct TrainingChunk {
     pub(super) bytes: Vec<u8>,
+    pub(super) records: usize,
     pub(super) recycle_tx: oneshot::Sender<Vec<u8>>,
 }
 
@@ -28,7 +29,7 @@ pub(super) enum ChunkMode {
 
 struct EncodedStep {
     active_chunk: Option<ChunkEncoder>,
-    completed_chunk: Option<Vec<u8>>,
+    completed_chunk: Option<EncodedChunk>,
     game: CompletedGame,
 }
 
@@ -104,7 +105,7 @@ impl ChunkAssembler {
         }
 
         let bytes = self.acquire_buffer();
-        let (game, bytes) = tokio::task::spawn_blocking(move || {
+        let (game, chunk) = tokio::task::spawn_blocking(move || {
             let mut encoder = ChunkEncoder::with_buffer(game.samples.len(), bytes);
             for sample in &game.samples {
                 encoder.push(sample);
@@ -116,7 +117,7 @@ impl ChunkAssembler {
         .expect("chunk encoding task panicked");
 
         let _ = game.recycle_tx.send(game.samples);
-        self.send_chunk(bytes).await
+        self.send_chunk(chunk).await
     }
 
     async fn append_game_fixed(
@@ -191,7 +192,7 @@ impl ChunkAssembler {
             .expect("the previous send must leave a spare byte buffer")
     }
 
-    async fn send_chunk(&mut self, bytes: Vec<u8>) -> Result<(), ChunkAssemblerError> {
+    async fn send_chunk(&mut self, chunk: EncodedChunk) -> Result<(), ChunkAssemblerError> {
         if let Some(previous) = self.in_flight.take() {
             debug_assert!(self.spare_bytes.is_none());
             self.spare_bytes = Some(
@@ -207,7 +208,11 @@ impl ChunkAssembler {
         }
         let (recycle_tx, recycle_rx) = oneshot::channel();
         self.chunks_tx
-            .send(TrainingChunk { bytes, recycle_tx })
+            .send(TrainingChunk {
+                bytes: chunk.bytes,
+                records: chunk.records,
+                recycle_tx,
+            })
             .await
             .map_err(|_| ChunkAssemblerError::OutputClosed)?;
         self.in_flight = Some(recycle_rx);
@@ -222,10 +227,10 @@ impl ChunkAssembler {
             return Ok(());
         }
 
-        let bytes = tokio::task::spawn_blocking(move || active_chunk.finish())
+        let chunk = tokio::task::spawn_blocking(move || active_chunk.finish())
             .await
             .expect("chunk encoding task panicked");
-        self.send_chunk(bytes).await
+        self.send_chunk(chunk).await
     }
 }
 
@@ -252,7 +257,9 @@ mod tests {
     }
 
     fn record_count(chunk: &TrainingChunk) -> u32 {
-        u32::from_le_bytes(chunk.bytes[16..20].try_into().unwrap())
+        let count = u32::from_le_bytes(chunk.bytes[16..20].try_into().unwrap());
+        assert_eq!(chunk.records, count as usize);
+        count
     }
 
     #[test]
@@ -268,8 +275,12 @@ mod tests {
         assert_eq!(step.game.samples.len(), 3);
         assert!(step.active_chunk.is_none());
         let chunk = step.completed_chunk.expect("one full chunk");
-        assert_eq!(u32::from_le_bytes(chunk[16..20].try_into().unwrap()), 2);
-        assert!(verify_chunk_checksum(&chunk));
+        assert_eq!(chunk.records, 2);
+        assert_eq!(
+            u32::from_le_bytes(chunk.bytes[16..20].try_into().unwrap()),
+            2
+        );
+        assert!(verify_chunk_checksum(&chunk.bytes));
     }
 
     #[tokio::test]
@@ -294,6 +305,7 @@ mod tests {
 
             // The input channel remains open: publication cannot rely on shutdown.
             let chunk = chunks_rx.recv().await.unwrap();
+            assert_eq!(record_count(&chunk) as usize, game_length);
             assert_eq!(chunk.bytes, expected_bytes);
             let mut bytes = chunk.bytes;
             bytes.clear();

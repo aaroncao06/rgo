@@ -1,31 +1,25 @@
 //! Local self-play task lifecycle. A caller publishes its latest model
 //! version; this module loads and replaces model runtimes at move boundaries.
 
-use std::{path::PathBuf, thread};
+use std::thread;
 
 use tokio::{
     sync::{mpsc, watch},
-    task::{JoinHandle, JoinSet},
+    task::JoinHandle,
 };
 
 use super::{
-    chunk_assembler::{
-        ChunkAssembler, ChunkAssemblerError, ChunkMode, CompletedGame, TrainingChunk,
-    },
+    chunk_assembler::{ChunkAssembler, ChunkAssemblerError, CompletedGame, TrainingChunk},
     chunk_sink::{FileChunkSink, FileChunkSinkError},
-    params::SelfPlayParams,
+    config::SelfPlayConfig,
+    control::EventPublisher,
     worker::{SelfPlayError, WorkerModelControl},
 };
-use crate::{
-    inference::runtime::{
-        ModelHandle, ModelLoadError, ModelRuntime, ModelRuntimeConfig, ModelVersion,
-    },
-    search::params::SearchParams,
+use crate::inference::runtime::{
+    ModelHandle, ModelLoadError, ModelRuntime, ModelRuntimeConfig, ModelVersion,
 };
 
-mod checkpoint_watcher;
 mod worker_group;
-use checkpoint_watcher::CheckpointWatchError;
 use worker_group::{WorkerEvent, WorkerGroup, WorkerSpec};
 
 #[derive(Debug)]
@@ -35,8 +29,6 @@ pub(super) enum SelfPlayRunError {
     Sink(FileChunkSinkError),
     Task(tokio::task::JoinError),
     ModelLoad(ModelLoadError),
-    CheckpointWatch(CheckpointWatchError),
-    CheckpointWatcherStopped,
     ModelSourceClosed,
     FinishSourceClosed,
     LatestModelCleared,
@@ -57,23 +49,16 @@ pub(super) struct SelfPlayOrchestrator {
 }
 
 impl SelfPlayOrchestrator {
-    pub(super) fn new(
-        search_params: SearchParams,
-        self_play_params: SelfPlayParams,
-        runtime_config: ModelRuntimeConfig,
-        worker_threads: usize,
-        workers_per_thread: usize,
-        chunk_mode: ChunkMode,
-        output_dir: PathBuf,
-    ) -> Self {
-        assert!(
-            worker_threads > 0,
-            "self-play needs at least one worker thread"
-        );
-        assert!(
-            workers_per_thread > 0,
-            "worker threads need at least one worker"
-        );
+    pub(super) fn new(config: SelfPlayConfig, events: EventPublisher) -> Self {
+        let SelfPlayConfig {
+            search: search_params,
+            self_play: self_play_params,
+            inference: runtime_config,
+            worker_threads,
+            workers_per_thread,
+            chunk: chunk_mode,
+            output_dir,
+        } = config;
         let worker_count = worker_threads
             .checked_mul(workers_per_thread)
             .expect("self-play worker count overflow");
@@ -115,41 +100,10 @@ impl SelfPlayOrchestrator {
             runtime_config,
             worker_groups,
             assembler: ChunkAssembler::new(chunk_mode, completed_games_rx, chunks_tx),
-            sink: FileChunkSink::new(output_dir, chunks_rx),
+            sink: FileChunkSink::new(output_dir, chunks_rx, events),
             pause_tx,
             paused_rx,
             resume_txs,
-        }
-    }
-
-    /// Discover published models in the configured local directory while running.
-    /// Use `run` instead when an external coordinator supplies model versions.
-    pub(super) async fn run_local(
-        self,
-        finish_games_rx: watch::Receiver<bool>,
-    ) -> Result<(), SelfPlayRunError> {
-        let (latest_tx, latest_rx) = watch::channel(None);
-        // Retain our sender until run ends, so a watcher error is reported with
-        // its cause rather than racing an incidental ModelSourceClosed error.
-        let mut watcher_tasks = JoinSet::new();
-        watcher_tasks.spawn(checkpoint_watcher::run(
-            self.runtime_config.model_dir.clone(),
-            latest_tx.clone(),
-        ));
-        // JoinSet aborts its watcher if this future is cancelled or returns early.
-        tokio::select! {
-            biased;
-            result = self.run(latest_rx, finish_games_rx) => {
-                watcher_tasks.abort_all();
-                while watcher_tasks.join_next().await.is_some() {}
-                result
-            }
-            result = watcher_tasks.join_next() => {
-                result.expect("watcher task exists")
-                    .map_err(SelfPlayRunError::Task)?
-                    .map_err(SelfPlayRunError::CheckpointWatch)?;
-                Err(SelfPlayRunError::CheckpointWatcherStopped)
-            }
         }
     }
 
@@ -205,7 +159,7 @@ impl SelfPlayOrchestrator {
         max_games_per_worker: Option<usize>,
         mut latest_model_version_rx: watch::Receiver<Option<ModelVersion>>,
         mut finish_games_rx: watch::Receiver<bool>,
-        mut load_model: F,
+        mut load_model: F, // can pass in dummy loaders for testing
     ) -> Result<(), SelfPlayRunError>
     where
         F: FnMut(ModelVersion, &ModelRuntimeConfig) -> Result<ModelHandle, ModelLoadError>,
@@ -496,13 +450,15 @@ fn record_worker_event(
 mod tests {
     use std::{
         io,
+        path::PathBuf,
         sync::{
             Arc,
             atomic::{AtomicU64, Ordering},
         },
     };
 
-    use super::super::params::SearchBudgetPolicy;
+    use super::super::chunk_assembler::ChunkMode;
+    use super::super::params::{SearchBudgetPolicy, SelfPlayParams};
     use super::*;
     use crate::{
         inference::{
@@ -512,7 +468,7 @@ mod tests {
             policy::{PASS_POLICY_INDEX, POLICY_SIZE},
             runtime::{start_test_runtime, test_backend_factory},
         },
-        search::worker::SearchBudget,
+        search::{params::SearchParams, worker::SearchBudget},
         training_data::verify_chunk_checksum,
     };
 
@@ -655,13 +611,16 @@ mod tests {
             ..SelfPlayParams::default()
         };
         SelfPlayOrchestrator::new(
-            search_params,
-            params,
-            cpu_runtime_config(),
-            worker_threads,
-            workers_per_thread,
-            mode,
-            output_dir,
+            SelfPlayConfig {
+                search: search_params,
+                self_play: params,
+                inference: cpu_runtime_config(),
+                worker_threads,
+                workers_per_thread,
+                chunk: mode,
+                output_dir,
+            },
+            EventPublisher::discard(),
         )
     }
 
@@ -871,36 +830,6 @@ mod tests {
         let (result, ()) = tokio::join!(run, request_finish);
         result.unwrap();
         assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
-    }
-
-    #[tokio::test]
-    async fn local_watcher_stops_when_finished_before_the_first_model() {
-        let dir = TestDir::new();
-        let mut orchestrator = orchestrator(dir.0.clone(), ChunkMode::PerGame, 1);
-        orchestrator.runtime_config.model_dir = dir.0.clone();
-        let (finish_tx, finish_rx) = watch::channel(false);
-        let run = orchestrator.run_local(finish_rx);
-        let finish = async {
-            tokio::task::yield_now().await;
-            finish_tx.send(true).unwrap();
-        };
-        let (result, ()) = tokio::join!(run, finish);
-        result.unwrap();
-        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
-    }
-
-    #[tokio::test]
-    async fn local_watcher_startup_failure_is_reported_with_its_cause() {
-        let dir = TestDir::new();
-        let mut orchestrator = orchestrator(dir.0.clone(), ChunkMode::PerGame, 1);
-        orchestrator.runtime_config.model_dir = dir.0.join("missing");
-        let (_finish_tx, finish_rx) = watch::channel(false);
-        assert!(matches!(
-            orchestrator.run_local(finish_rx).await,
-            Err(SelfPlayRunError::CheckpointWatch(
-                CheckpointWatchError::Notification(_)
-            ))
-        ));
     }
 
     #[tokio::test]

@@ -11,8 +11,9 @@ use crate::inference::{
     symmetry::Symmetry,
 };
 use rand::{RngExt, SeedableRng, rngs::SmallRng};
+pub use rgo_artifacts::ModelVersion;
+use rgo_artifacts::model_path;
 use std::{
-    path::{Path, PathBuf},
     sync::{Arc, mpsc},
     thread::JoinHandle,
 };
@@ -23,8 +24,6 @@ mod queue;
 use cache::{EvaluationCache, EvaluationKey};
 pub use params::{ExecutorConfig, ModelRuntimeConfig};
 use queue::{BatchQueue, EvalSlot};
-
-pub type ModelVersion = u64;
 
 pub struct ModelRuntime {
     // each model runtime owns its own queue and cache and executors. makes it easier to switch out and make new ones
@@ -309,11 +308,6 @@ impl Drop for ModelRuntime {
             let _ = executor_thread.join();
         }
     }
-}
-
-/// Naming convention for immutable published ONNX models.
-fn model_path(model_dir: &Path, version: ModelVersion) -> PathBuf {
-    model_dir.join(format!("{version}.onnx"))
 }
 
 #[cfg(test)]

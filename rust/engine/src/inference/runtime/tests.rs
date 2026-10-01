@@ -26,14 +26,6 @@ fn onnx_runtime_config() -> ModelRuntimeConfig {
     }
 }
 
-#[test]
-fn model_path_uses_the_published_version_in_the_configured_directory() {
-    assert_eq!(
-        model_path(Path::new("models"), 42),
-        Path::new("models").join("42.onnx")
-    );
-}
-
 struct TestModelDir(PathBuf);
 
 impl TestModelDir {

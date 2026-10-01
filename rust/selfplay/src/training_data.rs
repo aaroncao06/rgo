@@ -30,6 +30,11 @@ pub(super) struct TrainingSample {
     pub(super) value_target: ValueTarget,
 }
 
+pub(super) struct EncodedChunk {
+    pub(super) bytes: Vec<u8>,
+    pub(super) records: usize,
+}
+
 /// Builds one versioned chunk directly in its final byte representation.
 ///
 /// Full chunks hash each record as it is encoded. Only the final partial chunk
@@ -97,7 +102,7 @@ impl ChunkEncoder {
         self.record_count += 1;
     }
 
-    pub(super) fn finish(mut self) -> Vec<u8> {
+    pub(super) fn finish(mut self) -> EncodedChunk {
         debug_assert!(self.record_count > 0, "cannot finish an empty chunk");
         debug_assert_eq!(
             self.bytes.len(),
@@ -111,7 +116,10 @@ impl ChunkEncoder {
             Sha256::digest(&self.bytes)
         };
         self.bytes.extend_from_slice(&checksum);
-        self.bytes
+        EncodedChunk {
+            bytes: self.bytes,
+            records: self.record_count,
+        }
     }
 }
 
@@ -123,7 +131,7 @@ pub(super) fn encode_chunk(samples: &[TrainingSample]) -> Vec<u8> {
     for sample in samples {
         encoder.push(sample);
     }
-    encoder.finish()
+    encoder.finish().bytes
 }
 
 pub(super) fn verify_chunk_checksum(bytes: &[u8]) -> bool {

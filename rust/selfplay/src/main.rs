@@ -1,11 +1,10 @@
-//! Standalone self-play application built on the reusable engine.
+//! Self-play worker process supervised by the client over local pipes.
 
 use rgo_engine::{game, inference, search};
 use std::{env, fs, future::Future, io, path::Path, process};
 use tokio::{sync::watch, task::JoinSet};
 
 use config::SelfPlayConfig;
-use orchestrator::SelfPlayOrchestrator;
 
 /// Change this one value to reproduce or vary all self-play randomness.
 const RNG_SEED: u64 = 0;
@@ -13,12 +12,13 @@ const RNG_SEED: u64 = 0;
 mod chunk_assembler;
 mod chunk_sink;
 mod config;
+mod control;
 mod orchestrator;
 mod params;
 mod training_data;
 mod worker;
 
-const USAGE: &str = "Usage: rgo-selfplay <config.toml>";
+const USAGE: &str = "Usage: rgo-selfplay <config.toml> (client-supervised worker)";
 
 fn main() {
     let mut args = env::args_os().skip(1);
@@ -78,25 +78,14 @@ async fn run(config: SelfPlayConfig) -> Result<(), String> {
             config.output_dir.display()
         )
     })?;
-    with_shutdown(|finish_rx| async move {
+    with_shutdown(|finish_tx, finish_rx| async move {
         eprintln!(
-            "Starting {} self-play workers; watching {}; writing chunks to {}. Ctrl-C requests a graceful shutdown.",
+            "Starting {} self-play workers; receiving model commands for {}; writing chunks to {}.",
             config.worker_threads * config.workers_per_thread,
             config.inference.model_dir.display(),
             config.output_dir.display(),
         );
-        SelfPlayOrchestrator::new(
-            config.search,
-            config.self_play,
-            config.inference,
-            config.worker_threads,
-            config.workers_per_thread,
-            config.chunk,
-            config.output_dir,
-        )
-        .run_local(finish_rx)
-        .await
-        .map_err(|error| format!("self-play failed: {error:?}"))
+        control::run_client_session(config, finish_tx, finish_rx).await
     })
     .await?;
     eprintln!("Self-play stopped; training chunks drained.");
@@ -104,19 +93,20 @@ async fn run(config: SelfPlayConfig) -> Result<(), String> {
 }
 
 async fn with_shutdown<F: Future<Output = Result<(), String>>>(
-    run: impl FnOnce(watch::Receiver<bool>) -> F,
+    run: impl FnOnce(watch::Sender<bool>, watch::Receiver<bool>) -> F,
 ) -> Result<(), String> {
     // Register before starting orchestration. The signal task runs on the
     // runtime worker, independently of synchronous model lifecycle operations.
     let mut signals = ShutdownSignals::new()
         .map_err(|error| format!("could not register shutdown signals: {error}"))?;
     let (finish_tx, finish_rx) = watch::channel(false);
+    let signal_finish_tx = finish_tx.clone();
     let mut shutdown_tasks = JoinSet::<()>::new();
     shutdown_tasks.spawn(async move {
         signals.recv().await.unwrap_or_else(|error| {
             fatal(format!("could not receive shutdown signal: {error}"))
         });
-        let _ = finish_tx.send(true);
+        let _ = signal_finish_tx.send(true);
         eprintln!("Finishing active games and draining training chunks; a second shutdown signal forces exit.");
         signals.recv().await.unwrap_or_else(|error| {
             fatal(format!("could not receive shutdown signal: {error}"))
@@ -125,7 +115,7 @@ async fn with_shutdown<F: Future<Output = Result<(), String>>>(
     });
     // JoinSet aborts the signal task on success or error, keeping the sender
     // alive throughout orchestration without leaving a detached task behind.
-    run(finish_rx).await
+    run(finish_tx, finish_rx).await
 }
 
 /// Provision directory entries durably before the file sink publishes chunks.
