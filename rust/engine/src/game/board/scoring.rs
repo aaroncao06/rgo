@@ -1,9 +1,9 @@
 //! Read-only area scoring and pass-alive analysis.
 
-use super::{ARRAY_LEN, BOARD_SIZE, Board, Color, Loc, Player};
+use super::{ARRAY_LEN, Board, Color, Loc, MAX_BOARD_SIZE, Player};
 
-const MAX_PLAYER_HEADS: usize = (BOARD_SIZE * BOARD_SIZE + 1) / 2;
-const MAX_REGIONS: usize = (BOARD_SIZE * BOARD_SIZE + 1) / 2 + 1;
+const MAX_PLAYER_HEADS: usize = (MAX_BOARD_SIZE * MAX_BOARD_SIZE + 1) / 2;
+const MAX_REGIONS: usize = (MAX_BOARD_SIZE * MAX_BOARD_SIZE + 1) / 2 + 1;
 const VITAL_FOR_CHAIN_HEADS_MAX_LEN: usize = MAX_REGIONS * 4; // max number of (region, chain-head) vital relations for a player
 
 impl Board {
@@ -37,13 +37,13 @@ impl Board {
         if self.colors[loc.index()] != Color::Empty || area[loc.index()] == color {
             return false;
         }
-        let head = Loc::adjacent_indices(loc.index())
+        let head = Board::adjacent_indices(loc.index())
             .into_iter()
             .find_map(|i| {
                 (self.colors[i] == color && area[i] == Color::Empty).then_some(self.chain_head[i])
             });
         head.is_some_and(|head| {
-            Loc::adjacent_indices(loc.index())
+            Board::adjacent_indices(loc.index())
                 .into_iter()
                 .any(|i| self.colors[i] == color && self.chain_head[i] != head)
         })
@@ -68,7 +68,7 @@ impl Board {
             multi_stone_suicide_legal,
             &mut result,
         );
-        for loc in Loc::board_iter() {
+        for loc in self.locs() {
             let i = loc.index();
             if result[i].is_empty() {
                 result[i] = self.colors[i];
@@ -109,7 +109,7 @@ impl Board {
         let mut player_has_stones = false;
 
         //BUILD REGIONS
-        for loc in Loc::board_iter() {
+        for loc in self.locs() {
             let i = loc.index();
             if region_idx_by_loc[i] != -1 {
                 continue;
@@ -132,7 +132,7 @@ impl Board {
 
             // initialize candidate vital chain heads
             let mut initial_len = 0;
-            for adj_i in Loc::adjacent_indices(i) {
+            for adj_i in Board::adjacent_indices(i) {
                 if self.colors[adj_i] == player_color {
                     let adj_chain_head = self.chain_head[adj_i];
 
@@ -180,7 +180,7 @@ impl Board {
 
                 //count internal cells that dont touch the main player
                 if num_internal_spaces_max_2[region_idx] < 2
-                    && !Loc::adjacent_indices(current_index)
+                    && !Board::adjacent_indices(current_index)
                         .into_iter()
                         .any(|adj_i| self.colors[adj_i] == player_color)
                 {
@@ -196,12 +196,12 @@ impl Board {
                 tail_loc = current_loc;
 
                 //enqueue neighbors if not yet enqued and not curretnn color
-                for adj_i in Loc::adjacent_indices(current_index) {
+                for adj_i in Board::adjacent_indices(current_index) {
                     if (self.colors[adj_i] == Color::Empty || self.colors[adj_i] == opponent_color)
                         && region_idx_by_loc[adj_i] == -1
                     {
                         region_idx_by_loc[adj_i] = region_idx as i16;
-                        build_region_queue[queue_tail] = Loc::from_index(adj_i);
+                        build_region_queue[queue_tail] = Board::loc_from_index(adj_i);
                         queue_tail += 1;
                     }
                 }
@@ -215,7 +215,7 @@ impl Board {
         //regions are built, initialize list of all player chain heads
         let mut all_player_heads = [Loc::NULL; MAX_PLAYER_HEADS]; // both alive and dead
         let mut num_player_heads = 0_usize;
-        for loc in Loc::board_iter() {
+        for loc in self.locs() {
             let i = loc.index();
             if self.colors[i] == player_color && self.chain_head[i] == loc {
                 all_player_heads[num_player_heads] = loc;
@@ -257,7 +257,7 @@ impl Board {
 
                 //walk chain
                 for killed_loc in self.chain_iter(head) {
-                    for adj_i in Loc::adjacent_indices(killed_loc.index()) {
+                    for adj_i in Board::adjacent_indices(killed_loc.index()) {
                         let stored_region_idx = region_idx_by_loc[adj_i];
                         // not a real region, can be walls or current player's stones
                         if stored_region_idx < 0 {

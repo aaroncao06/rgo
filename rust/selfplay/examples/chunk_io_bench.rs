@@ -32,7 +32,7 @@ impl Drop for Scratch {
 
 fn mock_chunk(records: usize) -> Vec<u8> {
     let mut sample = TrainingSample {
-        input: NNInput::encode(&GameState::new(Rules::TROMP_TAYLORISH)),
+        input: NNInput::encode(&GameState::new(Rules::TROMP_TAYLORISH_9)),
         policy_target: [1.0 / POLICY_SIZE as f32; POLICY_SIZE],
         value_target: ValueTarget {
             win_probability: 0.5,

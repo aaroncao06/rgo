@@ -13,6 +13,10 @@ use rand::{SeedableRng, rngs::SmallRng};
 
 mod endgame;
 
+fn loc(x: usize, y: usize) -> Loc {
+    crate::game::board::Board::new(9).loc(x, y).unwrap()
+}
+
 struct TestBackend {
     fail: bool,
     policy_logits: [f32; POLICY_SIZE],
@@ -188,14 +192,14 @@ fn graph_snapshot(worker: &SearchWorker<FixedArenaNodeStore>) -> Vec<NodeSnapsho
 
 fn focused_policy() -> [f32; POLICY_SIZE] {
     let mut logits = [-20.0; POLICY_SIZE];
-    logits[loc_to_policy(Loc::new(4, 4).unwrap())] = 20.0;
-    logits[loc_to_policy(Loc::new(3, 3).unwrap())] = 10.0;
+    logits[loc_to_policy(loc(4, 4))] = 20.0;
+    logits[loc_to_policy(loc(3, 3))] = 10.0;
     logits
 }
 
 #[tokio::test]
 async fn root_preprocessing_preserves_shared_cached_output() {
-    let state = GameState::new(Rules::TROMP_TAYLORISH);
+    let state = GameState::new(Rules::TROMP_TAYLORISH_9);
     // A second backend evaluation would fail, so the final evaluation must
     // retrieve the original shared output from the cache.
     let mut client = one_shot_inference_client(focused_policy());
@@ -228,8 +232,8 @@ async fn root_preprocessing_preserves_shared_cached_output() {
 
 #[tokio::test]
 async fn search_returns_move_and_policy_target_without_mutating_the_position() {
-    let preferred = Loc::new(4, 4).unwrap();
-    let mut state = GameState::new(Rules::TROMP_TAYLORISH);
+    let preferred = loc(4, 4);
+    let mut state = GameState::new(Rules::TROMP_TAYLORISH_9);
     assert!(state.play(Loc::PASS));
     let key = GraphKey::new(&state);
     for budget in [0, 1, 8] {
@@ -274,7 +278,7 @@ async fn search_returns_move_and_policy_target_without_mutating_the_position() {
 
 #[tokio::test]
 async fn search_stops_at_playout_guard_when_terminal_revisits_cannot_fill_the_store() {
-    let mut state = GameState::new(Rules::TROMP_TAYLORISH);
+    let mut state = GameState::new(Rules::TROMP_TAYLORISH_9);
     assert!(state.play(Loc::PASS));
 
     let mut pass_policy = [-1000.0; POLICY_SIZE];
@@ -297,7 +301,7 @@ async fn search_stops_at_playout_guard_when_terminal_revisits_cannot_fill_the_st
 #[tokio::test]
 async fn search_value_target_uses_current_player_and_converts_moments_to_stdev() {
     for player in [Player::Black, Player::White] {
-        let mut state = GameState::new(Rules::TROMP_TAYLORISH);
+        let mut state = GameState::new(Rules::TROMP_TAYLORISH_9);
         if player == Player::White {
             assert!(state.play(Loc::PASS));
         }
@@ -345,7 +349,7 @@ async fn search_propagates_inference_failure_without_sampling() {
     // Root Dirichlet noise is intentionally sampled before search in the
     // normal self-play path; disable it here to isolate failure behavior.
     worker.params.root_noise_enabled = false;
-    let state = GameState::new(Rules::TROMP_TAYLORISH);
+    let state = GameState::new(Rules::TROMP_TAYLORISH_9);
     let mut client = one_shot_inference_client(focused_policy());
     let mut rng = SmallRng::seed_from_u64(11);
     let mut untouched_rng = rng.clone();
@@ -364,13 +368,13 @@ async fn final_lcb_weights_use_edge_sample_size_for_transpositions() {
     let mut worker = worker();
     worker.params.chosen_move_temperature_early = 0.0;
     worker.params.chosen_move_temperature = 0.0;
-    let moves = [Loc::new(3, 3).unwrap(), Loc::new(4, 4).unwrap()];
+    let moves = [loc(3, 3), loc(4, 4)];
     let mut logits = [-1000.0; POLICY_SIZE];
     for loc in moves {
         logits[loc_to_policy(loc)] = 0.0;
     }
     let mut client = inference_client_with_policy(false, logits);
-    let state = GameState::new(Rules::TROMP_TAYLORISH);
+    let state = GameState::new(Rules::TROMP_TAYLORISH_9);
     worker.start_game(&state, &mut client).await.unwrap();
     for (i, loc) in moves.into_iter().enumerate() {
         let mut pointer = worker
@@ -422,15 +426,15 @@ async fn final_weights_reduce_overexploration_without_changing_graph_stats() {
     worker.params.use_lcb_for_selection = false;
     worker.params.cpuct_exploration = 1.0;
     worker.params.cpuct_exploration_log = 0.0;
-    let first_move = Loc::new(3, 3).unwrap();
-    let second_move = Loc::new(4, 4).unwrap();
+    let first_move = loc(3, 3);
+    let second_move = loc(4, 4);
     // Finite logits whose softmax underflows to zero on the other moves.
     let mut logits = [-1000.0; POLICY_SIZE];
     logits[loc_to_policy(first_move)] = 0.0;
     logits[loc_to_policy(second_move)] = 0.0;
     let mut client = inference_client_with_policy(false, logits);
     worker
-        .start_game(&GameState::new(Rules::TROMP_TAYLORISH), &mut client)
+        .start_game(&GameState::new(Rules::TROMP_TAYLORISH_9), &mut client)
         .await
         .unwrap();
     for (i, (loc, visits, utility)) in [(first_move, 60, -0.5), (second_move, 40, 0.5)]
@@ -476,10 +480,10 @@ fn new_worker_has_no_active_graph_or_scratch_state() {
 #[test]
 fn selection_chooses_the_highest_policy_unexpanded_move() {
     let mut worker = worker();
-    let game_state = GameState::new(Rules::TROMP_TAYLORISH);
-    let expected_move = Loc::new(4, 4).unwrap();
+    let game_state = GameState::new(Rules::TROMP_TAYLORISH_9);
+    let expected_move = loc(4, 4);
     let mut logits = [0.0; POLICY_SIZE];
-    logits[crate::inference::policy::loc_to_policy(expected_move)] = 5.0;
+    logits[loc_to_policy(expected_move)] = 5.0;
     let output = processed_output(logits, 0.0);
     worker
         .search_graph
@@ -495,7 +499,7 @@ fn selection_chooses_the_highest_policy_unexpanded_move() {
 #[test]
 fn selection_orients_child_utility_for_the_player_to_move() {
     let mut worker = worker();
-    let game_state = GameState::new(Rules::TROMP_TAYLORISH);
+    let game_state = GameState::new(Rules::TROMP_TAYLORISH_9);
     assert_eq!(game_state.next_player(), Player::Black);
     let parent_output = processed_output([0.0; POLICY_SIZE], 0.0);
     worker
@@ -503,8 +507,8 @@ fn selection_orients_child_utility_for_the_player_to_move() {
         .reset(&game_state, parent_output.clone(), 0.0, 16);
     let mut parent = initialized_node(parent_output, 0.0);
 
-    let white_favored_move = Loc::new(3, 3).unwrap();
-    let black_favored_move = Loc::new(4, 4).unwrap();
+    let white_favored_move = loc(3, 3);
+    let black_favored_move = loc(4, 4);
     let mut white_favored_child =
         initialized_node(processed_output([0.0; POLICY_SIZE], 9.0_f32.ln()), 0.8);
     let mut black_favored_child = initialized_node(
@@ -513,12 +517,12 @@ fn selection_orients_child_utility_for_the_player_to_move() {
     );
     parent.add_child(
         white_favored_move,
-        parent.policy_probs()[crate::inference::policy::loc_to_policy(white_favored_move)],
+        parent.policy_probs()[loc_to_policy(white_favored_move)],
         NonNull::from(white_favored_child.as_mut()),
     );
     parent.add_child(
         black_favored_move,
-        parent.policy_probs()[crate::inference::policy::loc_to_policy(black_favored_move)],
+        parent.policy_probs()[loc_to_policy(black_favored_move)],
         NonNull::from(black_favored_child.as_mut()),
     );
 
@@ -531,9 +535,9 @@ fn selection_orients_child_utility_for_the_player_to_move() {
 #[test]
 fn root_selection_forces_an_existing_child_below_its_desired_visits() {
     let mut worker = worker();
-    let game_state = GameState::new(Rules::TROMP_TAYLORISH);
-    let forced_move = Loc::new(3, 3).unwrap();
-    let otherwise_best_move = Loc::new(4, 4).unwrap();
+    let game_state = GameState::new(Rules::TROMP_TAYLORISH_9);
+    let forced_move = loc(3, 3);
+    let otherwise_best_move = loc(4, 4);
     let mut logits = [-20.0; POLICY_SIZE];
     logits[loc_to_policy(forced_move)] = 4.0;
     logits[loc_to_policy(otherwise_best_move)] = 0.0;
@@ -578,9 +582,9 @@ fn root_selection_forces_an_existing_child_below_its_desired_visits() {
 #[test]
 fn forced_root_visit_ties_follow_child_insertion_order() {
     let mut worker = worker();
-    let game_state = GameState::new(Rules::TROMP_TAYLORISH);
-    let first_move = Loc::new(4, 4).unwrap();
-    let second_move = Loc::new(3, 3).unwrap();
+    let game_state = GameState::new(Rules::TROMP_TAYLORISH_9);
+    let first_move = loc(4, 4);
+    let second_move = loc(3, 3);
     assert!(loc_to_policy(first_move) > loc_to_policy(second_move));
     let mut logits = [-20.0; POLICY_SIZE];
     logits[loc_to_policy(first_move)] = 0.0;
@@ -608,8 +612,8 @@ fn existing_child_wins_exact_tie_against_unexpanded_move() {
     worker.params.cpuct_exploration = 0.0;
     worker.params.cpuct_exploration_log = 0.0;
     worker.params.fpu_reduction_max = 0.0;
-    let game_state = GameState::new(Rules::TROMP_TAYLORISH);
-    let existing_move = Loc::new(4, 4).unwrap();
+    let game_state = GameState::new(Rules::TROMP_TAYLORISH_9);
+    let existing_move = loc(4, 4);
     let output = processed_output([0.0; POLICY_SIZE], 0.0);
     let mut parent = initialized_node(output.clone(), 0.0);
     let mut child = initialized_node(output, 0.0);
@@ -635,22 +639,14 @@ fn value_weighting_favors_the_better_child_and_preserves_total_weight() {
         bad_child.record_visit(0.0, 0.0, 0.0, -1.0);
     }
 
-    let good_edge = parent.add_child(
-        Loc::new(3, 3).unwrap(),
-        0.5,
-        NonNull::from(good_child.as_mut()),
-    );
-    let bad_edge = parent.add_child(
-        Loc::new(4, 4).unwrap(),
-        0.5,
-        NonNull::from(bad_child.as_mut()),
-    );
+    let good_edge = parent.add_child(loc(3, 3), 0.5, NonNull::from(good_child.as_mut()));
+    let bad_edge = parent.add_child(loc(4, 4), 0.5, NonNull::from(bad_child.as_mut()));
     for _ in 0..10 {
         parent.edge_mut(good_edge).record_visit();
         parent.edge_mut(bad_edge).record_visit();
     }
 
-    worker.recompute_node_stats(&mut parent, Player::White);
+    worker.recompute_node_stats(&mut parent, Player::White, 9);
 
     assert_eq!(parent.visits(), 2); // One completed playout, not a sum of child visits.
     assert!((parent.weight_sum() - 21.0).abs() < 1e-12);
@@ -673,7 +669,7 @@ fn transposed_child_squared_weights_scale_by_squared_edge_fraction() {
         for _ in 0..5 {
             parent.edge_mut(edge).record_visit();
         }
-        worker.recompute_node_stats(parent, Player::White);
+        worker.recompute_node_stats(parent, Player::White, 9);
 
         assert_eq!(parent.visits(), 2);
         assert!((parent.weight_sum() - 6.0).abs() < 1e-12);
@@ -686,9 +682,9 @@ fn transposed_child_squared_weights_scale_by_squared_edge_fraction() {
 #[tokio::test]
 async fn graph_cycles_end_the_playout_and_back_up_without_inference() {
     for self_loop in [false, true] {
-        let root_move = Loc::new(0, 0).unwrap();
-        let first_move = Loc::new(1, 0).unwrap();
-        let second_move = Loc::new(2, 0).unwrap();
+        let root_move = loc(0, 0);
+        let first_move = loc(1, 0);
+        let second_move = loc(2, 0);
         let policy = |loc| {
             let mut logits = [-20.0; POLICY_SIZE];
             logits[loc_to_policy(loc)] = 20.0;
@@ -697,7 +693,7 @@ async fn graph_cycles_end_the_playout_and_back_up_without_inference() {
         let mut client = one_shot_inference_client(policy(root_move));
         let mut worker = worker();
         worker
-            .start_game(&GameState::new(Rules::TROMP_TAYLORISH), &mut client)
+            .start_game(&GameState::new(Rules::TROMP_TAYLORISH_9), &mut client)
             .await
             .unwrap();
         let mut first = worker
@@ -773,12 +769,12 @@ async fn graph_cycles_end_the_playout_and_back_up_without_inference() {
 
 #[tokio::test]
 async fn transposed_child_catches_up_before_requesting_more_inference() {
-    let move_loc = Loc::new(4, 4).unwrap();
+    let move_loc = loc(4, 4);
     let mut logits = [-20.0; POLICY_SIZE];
     logits[loc_to_policy(move_loc)] = 20.0;
     let mut client = one_shot_inference_client(logits);
     let mut worker = worker();
-    let root_state = GameState::new(Rules::TROMP_TAYLORISH);
+    let root_state = GameState::new(Rules::TROMP_TAYLORISH_9);
     let mut child_state = root_state.clone();
     let mut child_key = GraphKey::new(&root_state);
     assert!(child_state.play(move_loc));
@@ -832,7 +828,7 @@ async fn transposed_child_catches_up_before_requesting_more_inference() {
 async fn start_game_installs_an_evaluated_root_and_scratch_state() {
     let mut worker = worker();
     let mut client = inference_client(false);
-    let game_state = GameState::new(Rules::TROMP_TAYLORISH);
+    let game_state = GameState::new(Rules::TROMP_TAYLORISH_9);
     let expected_key = GraphKey::new(&game_state);
 
     worker.start_game(&game_state, &mut client).await.unwrap();
@@ -851,7 +847,7 @@ async fn playout_expands_and_evaluates_a_missing_child() {
     let mut worker = worker();
     let mut client = inference_client(false);
     worker
-        .start_game(&GameState::new(Rules::TROMP_TAYLORISH), &mut client)
+        .start_game(&GameState::new(Rules::TROMP_TAYLORISH_9), &mut client)
         .await
         .unwrap();
 
@@ -866,13 +862,13 @@ async fn playout_expands_and_evaluates_a_missing_child() {
 
 #[tokio::test]
 async fn consecutive_playouts_descend_and_back_up_through_existing_edges() {
-    let preferred_move = Loc::new(4, 4).unwrap();
+    let preferred_move = loc(4, 4);
     let mut logits = [0.0; POLICY_SIZE];
     logits[loc_to_policy(preferred_move)] = 20.0;
     let mut client = inference_client_with_policy(false, logits);
     let mut worker = worker();
     worker
-        .start_game(&GameState::new(Rules::TROMP_TAYLORISH), &mut client)
+        .start_game(&GameState::new(Rules::TROMP_TAYLORISH_9), &mut client)
         .await
         .unwrap();
 
@@ -896,7 +892,7 @@ async fn integer_terminal_scores_use_katago_gridded_second_moment() {
     for komi in [-7.0, 0.0, 7.0] {
         let mut root_state = GameState::new(Rules {
             komi,
-            ..Rules::TROMP_TAYLORISH
+            ..Rules::TROMP_TAYLORISH_9
         });
         assert!(root_state.play(Loc::PASS));
         let mut logits = [-20.0; POLICY_SIZE];
@@ -926,6 +922,7 @@ async fn integer_terminal_scores_use_katago_gridded_second_moment() {
                 score * score + 0.25,
                 worker.recent_score_center,
                 worker.params,
+                root_state.board().size(),
             );
             assert!((terminal.white_utility() - expected_utility).abs() < 1e-12);
         }
@@ -934,7 +931,7 @@ async fn integer_terminal_scores_use_katago_gridded_second_moment() {
 
 #[tokio::test]
 async fn terminal_leaf_uses_exact_score_without_inference() {
-    let mut root_state = GameState::new(Rules::TROMP_TAYLORISH);
+    let mut root_state = GameState::new(Rules::TROMP_TAYLORISH_9);
     assert!(root_state.play(Loc::PASS));
     let mut logits = [0.0; POLICY_SIZE];
     logits[loc_to_policy(Loc::PASS)] = 20.0;
@@ -962,7 +959,10 @@ async fn playout_inference_failure_does_not_attach_an_unevaluated_child() {
     let mut worker = worker();
     let mut working_client = inference_client(false);
     worker
-        .start_game(&GameState::new(Rules::TROMP_TAYLORISH), &mut working_client)
+        .start_game(
+            &GameState::new(Rules::TROMP_TAYLORISH_9),
+            &mut working_client,
+        )
         .await
         .unwrap();
 
@@ -989,7 +989,7 @@ async fn deep_inference_failure_preserves_graph_and_retry_backs_up_once() {
     let mut worker = worker();
     let mut client = inference_client_with_policy(false, focused_policy());
     worker
-        .start_game(&GameState::new(Rules::TROMP_TAYLORISH), &mut client)
+        .start_game(&GameState::new(Rules::TROMP_TAYLORISH_9), &mut client)
         .await
         .unwrap();
     for _ in 0..2 {
@@ -1037,7 +1037,7 @@ async fn full_store_preserves_graph_and_reset_reuses_capacity() {
     );
     let mut client = inference_client_with_policy(false, focused_policy());
     worker
-        .start_game(&GameState::new(Rules::TROMP_TAYLORISH), &mut client)
+        .start_game(&GameState::new(Rules::TROMP_TAYLORISH_9), &mut client)
         .await
         .unwrap();
     worker.playout(&mut client).await.unwrap();
@@ -1053,7 +1053,7 @@ async fn full_store_preserves_graph_and_reset_reuses_capacity() {
     assert_eq!(graph_snapshot(&worker), before);
 
     worker
-        .reset_graph(&GameState::new(Rules::TROMP_TAYLORISH), 1, &mut client)
+        .reset_graph(&GameState::new(Rules::TROMP_TAYLORISH_9), 1, &mut client)
         .await
         .unwrap();
     assert_eq!(worker.search_graph.node_store.len(), 0);
@@ -1071,12 +1071,12 @@ async fn full_store_preserves_graph_and_reset_reuses_capacity() {
 async fn reset_graph_borrows_the_callers_state_and_keeps_independent_snapshots() {
     let mut worker = worker();
     let mut client = inference_client(false);
-    let mut game_state = GameState::new(Rules::TROMP_TAYLORISH);
+    let mut game_state = GameState::new(Rules::TROMP_TAYLORISH_9);
     let initial_key = GraphKey::new(&game_state);
     worker.start_game(&game_state, &mut client).await.unwrap();
 
     // The caller retains ownership and can advance without changing the root.
-    assert!(game_state.play(Loc::new(4, 4).unwrap()));
+    assert!(game_state.play(loc(4, 4)));
     assert_eq!(
         GraphKey::new(&worker.search_graph.root.as_ref().unwrap().game_state),
         initial_key
@@ -1109,7 +1109,7 @@ async fn resetting_graph_clears_stored_nodes_and_replaces_the_root() {
     let mut worker = worker();
     let mut client = inference_client(false);
     worker
-        .start_game(&GameState::new(Rules::TROMP_TAYLORISH), &mut client)
+        .start_game(&GameState::new(Rules::TROMP_TAYLORISH_9), &mut client)
         .await
         .unwrap();
     worker
@@ -1118,8 +1118,8 @@ async fn resetting_graph_clears_stored_nodes_and_replaces_the_root() {
         .insert(GraphKey::from_raw(1))
         .unwrap();
 
-    let mut next_state = GameState::new(Rules::TROMP_TAYLORISH);
-    assert!(next_state.play(Loc::new(4, 4).unwrap()));
+    let mut next_state = GameState::new(Rules::TROMP_TAYLORISH_9);
+    assert!(next_state.play(loc(4, 4)));
     let expected_key = GraphKey::new(&next_state);
     worker
         .reset_graph(&next_state, 16, &mut client)
@@ -1135,7 +1135,10 @@ async fn inference_failure_preserves_the_existing_graph() {
     let mut worker = worker();
     let mut working_client = inference_client_with_policy(false, focused_policy());
     worker
-        .start_game(&GameState::new(Rules::TROMP_TAYLORISH), &mut working_client)
+        .start_game(
+            &GameState::new(Rules::TROMP_TAYLORISH_9),
+            &mut working_client,
+        )
         .await
         .unwrap();
     // Use a nonzero center so an accidental reset to zero is observable.
@@ -1150,8 +1153,8 @@ async fn inference_failure_preserves_the_existing_graph() {
     let original_key = worker.search_graph.root.as_ref().unwrap().key;
 
     let mut failing_client = inference_client(true);
-    let mut replacement = GameState::new(Rules::TROMP_TAYLORISH);
-    assert!(replacement.play(Loc::new(4, 4).unwrap()));
+    let mut replacement = GameState::new(Rules::TROMP_TAYLORISH_9);
+    assert!(replacement.play(loc(4, 4)));
     let result = worker
         .reset_graph(&replacement, 16, &mut failing_client)
         .await;
@@ -1173,4 +1176,8 @@ async fn inference_failure_preserves_the_existing_graph() {
     }
     assert!(worker.playout_path.is_empty());
     assert!(worker.visited_nodes.is_empty());
+}
+
+fn loc_to_policy(loc: Loc) -> usize {
+    crate::inference::policy::loc_to_policy(&crate::game::board::Board::new(9), loc)
 }

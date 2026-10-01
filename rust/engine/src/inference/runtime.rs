@@ -140,6 +140,11 @@ impl InferenceClient {
         game_state: &GameState,
         include_ownership: bool,
     ) -> Result<Arc<NNOutput>, InferenceError> {
+        if game_state.board().size() != super::policy::MODEL_BOARD_SIZE {
+            return Err(InferenceError::UnsupportedBoardSize {
+                board_size: game_state.board().size(),
+            });
+        }
         // Randomized and non-randomized clients intentionally share this cache.
         // Every entry is restored to canonical coordinates before insertion, so
         // either kind of evaluation is a valid prediction for the same position;

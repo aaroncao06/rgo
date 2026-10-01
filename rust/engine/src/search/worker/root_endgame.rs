@@ -25,7 +25,7 @@ impl SearchRoot {
             return 0.0;
         };
         let player = self.game_state.next_player();
-        let white_ownership = f64::from(ownership[loc_to_policy(loc)]);
+        let white_ownership = f64::from(ownership[loc_to_policy(board, loc)]);
         let player_ownership = match player {
             Player::White => white_ownership,
             Player::Black => -white_ownership,
@@ -63,6 +63,7 @@ impl<N: NodeStore> SearchWorker<N> {
             root.ending_white_score_bonus(loc, self.params),
             self.recent_score_center,
             self.params,
+            root.game_state.board().size(),
         )
     }
 }

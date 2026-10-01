@@ -1,6 +1,6 @@
-use super::policy::{BOARD_POLICY_SIZE, loc_to_policy};
+use super::policy::{BOARD_POLICY_SIZE, MODEL_BOARD_SIZE, loc_to_policy};
 use super::symmetry::Symmetry;
-use crate::game::board::{Color, Loc};
+use crate::game::board::Color;
 use crate::game::game_state::GameState;
 
 pub const NUM_SPATIAL_FEATURES: usize = 3; // player masks, superko banned
@@ -16,6 +16,11 @@ pub struct NNInput {
 
 impl NNInput {
     pub fn encode(game_state: &GameState) -> Self {
+        assert_eq!(
+            game_state.board().size(),
+            MODEL_BOARD_SIZE,
+            "the current model requires a 9x9 board"
+        );
         let current_player = game_state.next_player();
         let current_color = Color::from(current_player);
         let opponent_color = Color::from(current_player.opponent());
@@ -30,9 +35,9 @@ impl NNInput {
 
         // encode spatial maps
         let mut spatial = [0_f32; NUM_SPATIAL_FEATURES * BOARD_POLICY_SIZE];
-        for loc in Loc::board_iter() {
+        for loc in game_state.board().locs() {
             let color = game_state.board().color_at(loc);
-            let policy_idx = loc_to_policy(loc);
+            let policy_idx = loc_to_policy(game_state.board(), loc);
 
             if color == current_color {
                 spatial[policy_idx] = 1_f32;
@@ -58,18 +63,21 @@ impl NNInput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::game::board::Player;
+    use crate::game::board::{Loc, Player};
     use crate::game::rules::Rules;
 
     fn rules() -> Rules {
         Rules {
+            board_size: 9,
             komi: 7.5,
             multi_stone_suicide_legal: true,
         }
     }
 
     fn loc(x: usize, y: usize) -> Loc {
-        Loc::new(x, y).expect("test coordinates must be on the board")
+        crate::game::board::Board::new(9)
+            .loc(x, y)
+            .expect("test coordinates must be on the board")
     }
 
     #[test]
@@ -91,7 +99,7 @@ mod tests {
 
         assert!(game_state.play(black_stone));
         let white_turn_inputs = NNInput::encode(&game_state);
-        let black_pos = loc_to_policy(black_stone);
+        let black_pos = loc_to_policy(game_state.board(), black_stone);
         assert_eq!(
             white_turn_inputs.spatial[BOARD_POLICY_SIZE + black_pos],
             1.0
@@ -102,7 +110,7 @@ mod tests {
         assert_eq!(game_state.next_player(), Player::Black);
 
         let inputs = NNInput::encode(&game_state);
-        let white_pos = loc_to_policy(white_stone);
+        let white_pos = loc_to_policy(game_state.board(), white_stone);
 
         assert_eq!(inputs.spatial[black_pos], 1.0);
         assert_eq!(inputs.spatial[BOARD_POLICY_SIZE + white_pos], 1.0);
@@ -131,7 +139,7 @@ mod tests {
         }
 
         let inputs = NNInput::encode(&game_state);
-        let recapture_pos = loc_to_policy(recapture);
+        let recapture_pos = loc_to_policy(game_state.board(), recapture);
 
         assert!(game_state.is_superko_banned(recapture));
         assert_eq!(inputs.spatial[2 * BOARD_POLICY_SIZE + recapture_pos], 1.0);

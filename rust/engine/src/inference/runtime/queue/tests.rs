@@ -6,7 +6,7 @@ use crate::{
 use std::{sync::mpsc, thread, time::Duration};
 
 fn test_input() -> NNInput {
-    NNInput::encode(&GameState::new(Rules::TROMP_TAYLORISH))
+    NNInput::encode(&GameState::new(Rules::TROMP_TAYLORISH_9))
 }
 
 fn test_output() -> Arc<NNOutput> {

@@ -25,6 +25,7 @@ fn example_reuses_algorithm_defaults() {
         SearchParams::default().cpuct_exploration
     );
     assert!(config.self_play.randomize_inference_symmetry);
+    assert_eq!(config.self_play.rules.board_size, 9);
 }
 
 #[test]
@@ -36,8 +37,28 @@ fn partial_algorithm_overrides_preserve_other_defaults() {
     assert!(!config.self_play.randomize_inference_symmetry);
     assert_eq!(config.self_play.rules.komi, 6.5);
     assert!(config.self_play.rules.multi_stone_suicide_legal);
+    assert_eq!(config.self_play.rules.board_size, 9);
     assert_eq!(config.search.cpuct_exploration, 1.2);
     assert_eq!(config.search.lcb_stdevs, SearchParams::default().lcb_stdevs);
+}
+
+#[test]
+fn board_size_must_fit_storage_and_the_current_model() {
+    SelfPlayConfig::from_toml(&format!("{EXAMPLE}\n[self_play.rules]\nboard_size = 9\n")).unwrap();
+    for size in [0, 10, usize::MAX] {
+        assert!(matches!(
+            SelfPlayConfig::from_toml(&format!(
+                "{EXAMPLE}\n[self_play.rules]\nboard_size = {size}\n"
+            )),
+            Err(ConfigError::Invalid(_)) | Err(ConfigError::Parse(_))
+        ));
+    }
+    assert!(matches!(
+        SelfPlayConfig::from_toml(&format!("{EXAMPLE}\n[self_play.rules]\nboard_size = 5\n")),
+        Err(ConfigError::Invalid(
+            "the current self-play model requires a 9x9 board"
+        ))
+    ));
 }
 
 #[test]

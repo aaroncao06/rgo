@@ -7,7 +7,7 @@ use super::{
 };
 use crate::{
     game::{
-        board::{BOARD_SIZE, Loc, Player},
+        board::{Board, Loc, Player},
         game_state::GameState,
     },
     inference::policy::{loc_to_policy, policy_to_loc},
@@ -28,22 +28,21 @@ impl<N: NodeStore> SearchWorker<N> {
         } else {
             policy_weights.clone()
         };
-        let turn_number = self
+        let game_state = &self
             .search_graph
             .root
             .as_ref()
             .expect("search result requires an active game")
-            .game_state
-            .turn_number();
+            .game_state;
         let temperature = move_selection::temperature(
-            turn_number,
-            BOARD_SIZE,
+            game_state.turn_number(),
+            game_state.board().size(),
             self.params.chosen_move_temperature_early,
             self.params.chosen_move_temperature,
             self.params.chosen_move_temperature_halflife,
         );
         let selected_move = moves[move_selection::sample_index(&move_weights, temperature, rng)];
-        let policy_target = normalized_policy_target(&moves, &policy_weights);
+        let policy_target = normalized_policy_target(game_state.board(), &moves, &policy_weights);
         let root = self
             .search_graph
             .root
@@ -97,7 +96,7 @@ impl<N: NodeStore> SearchWorker<N> {
             // KataGo's stable reference child: discount its newest visit and
             // add a small policy contribution to stabilize low-budget searches.
             let goodness = weight * (visits - 1.0).max(0.0) / visits.max(1.0)
-                + 2.0 * f64::from(policy[loc_to_policy(loc)]);
+                + 2.0 * f64::from(policy[loc_to_policy(root.game_state.board(), loc)]);
             if goodness > best_goodness {
                 best_goodness = goodness;
                 best_index = i;
@@ -114,7 +113,7 @@ impl<N: NodeStore> SearchWorker<N> {
                 best_child.white_utility()
                     + self.root_ending_utility_bonus(best_child, best_edge.move_loc()),
                 player,
-                f64::from(policy[loc_to_policy(best_edge.move_loc())]),
+                f64::from(policy[loc_to_policy(root.game_state.board(), best_edge.move_loc())]),
                 reference_weight,
                 explore_scaling,
             );
@@ -134,7 +133,7 @@ impl<N: NodeStore> SearchWorker<N> {
                     weights[i] = move_selection::reduced_weight(
                         weights[i],
                         self_utility,
-                        f64::from(policy[loc_to_policy(edge.move_loc())]),
+                        f64::from(policy[loc_to_policy(root.game_state.board(), edge.move_loc())]),
                         explore_scaling,
                         best_selection,
                     );
@@ -146,7 +145,7 @@ impl<N: NodeStore> SearchWorker<N> {
         } else {
             // Zero-budget search still has a root evaluation: use its legal policy.
             for (i, &probability) in policy.iter().enumerate() {
-                let loc = policy_to_loc(i);
+                let loc = policy_to_loc(root.game_state.board(), i);
                 if root.game_state.is_legal(loc) && root.is_allowed_move(loc, self.params) {
                     moves.push(loc);
                     weights.push(f64::from(probability));
@@ -157,7 +156,7 @@ impl<N: NodeStore> SearchWorker<N> {
             for (loc, weight) in moves.iter().zip(&mut weights) {
                 *weight =
                     if root.game_state.is_legal(*loc) && root.is_allowed_move(*loc, self.params) {
-                        f64::from(policy[loc_to_policy(*loc)])
+                        f64::from(policy[loc_to_policy(root.game_state.board(), *loc)])
                     } else {
                         0.0
                     };
@@ -184,7 +183,7 @@ impl<N: NodeStore> SearchWorker<N> {
         let params = self.params;
         let temperature = move_selection::temperature(
             game_state.turn_number(),
-            BOARD_SIZE,
+            game_state.board().size(),
             params.root_policy_temperature_early,
             params.root_policy_temperature,
             params.chosen_move_temperature_halflife,
@@ -263,6 +262,7 @@ impl<N: NodeStore> SearchWorker<N> {
 }
 
 fn normalized_policy_target(
+    board: &Board,
     moves: &[Loc],
     weights: &[f64],
 ) -> [f32; crate::inference::policy::POLICY_SIZE] {
@@ -271,7 +271,7 @@ fn normalized_policy_target(
     debug_assert!(weight_sum > 0.0);
     let mut target = [0.0; crate::inference::policy::POLICY_SIZE];
     for (&move_loc, &weight) in moves.iter().zip(weights) {
-        target[loc_to_policy(move_loc)] = (weight / weight_sum) as f32;
+        target[loc_to_policy(board, move_loc)] = (weight / weight_sum) as f32;
     }
     target
 }

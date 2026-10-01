@@ -12,9 +12,8 @@ use super::{
     backend::{InferenceBackend, InferenceError},
     inputs::{NNInput, NUM_GLOBAL_FEATURES, NUM_SPATIAL_FEATURES},
     outputs::NNOutput,
-    policy::{BOARD_POLICY_SIZE, POLICY_SIZE},
+    policy::{BOARD_POLICY_SIZE, MODEL_BOARD_SIZE, POLICY_SIZE},
 };
-use crate::game::board::BOARD_SIZE;
 
 /// Select an execution provider, not exclusive ownership of a device.
 #[derive(Debug, Clone, Copy, serde::Deserialize)]
@@ -106,7 +105,7 @@ impl OnnxBackend {
         let n = inputs.len();
         let include_ownership = inputs.iter().any(|input| input.include_ownership);
         let tensors = ort::inputs![
-            "spatial" => TensorRef::from_array_view(([n, NUM_SPATIAL_FEATURES, BOARD_SIZE, BOARD_SIZE], self.spatial.as_slice()))?,
+            "spatial" => TensorRef::from_array_view(([n, NUM_SPATIAL_FEATURES, MODEL_BOARD_SIZE, MODEL_BOARD_SIZE], self.spatial.as_slice()))?,
             "global" => TensorRef::from_array_view(([n, NUM_GLOBAL_FEATURES], self.global.as_slice()))?,
         ];
         let batch = if include_ownership {
@@ -122,7 +121,7 @@ impl OnnxBackend {
             Some(tensor(
                 &batch,
                 "ownership_logits",
-                &[n, 1, BOARD_SIZE, BOARD_SIZE],
+                &[n, 1, MODEL_BOARD_SIZE, MODEL_BOARD_SIZE],
             )?)
         } else {
             None
@@ -165,7 +164,10 @@ fn validate_contract(session: &Session) -> ort::Result<()> {
     validate_ports(
         session.inputs(),
         &[
-            ("spatial", &[NUM_SPATIAL_FEATURES, BOARD_SIZE, BOARD_SIZE]),
+            (
+                "spatial",
+                &[NUM_SPATIAL_FEATURES, MODEL_BOARD_SIZE, MODEL_BOARD_SIZE],
+            ),
             ("global", &[NUM_GLOBAL_FEATURES]),
         ],
     )?;
@@ -174,7 +176,7 @@ fn validate_contract(session: &Session) -> ort::Result<()> {
         &[
             ("policy_logits", &[POLICY_SIZE]),
             ("value", &[3]),
-            ("ownership_logits", &[1, BOARD_SIZE, BOARD_SIZE]),
+            ("ownership_logits", &[1, MODEL_BOARD_SIZE, MODEL_BOARD_SIZE]),
         ],
     )
 }

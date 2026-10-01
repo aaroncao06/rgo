@@ -1,7 +1,6 @@
 //! Dihedral board symmetries at the neural-network boundary.
 
-use crate::game::board::BOARD_SIZE;
-use crate::inference::policy::BOARD_POLICY_SIZE;
+use crate::inference::policy::{BOARD_POLICY_SIZE, MODEL_BOARD_SIZE};
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,20 +34,20 @@ impl Symmetry {
     /// Map a canonical board index into the model's transformed coordinates.
     fn transform_index(self, index: usize) -> usize {
         debug_assert!(index < BOARD_POLICY_SIZE);
-        let mut x = index % BOARD_SIZE;
-        let mut y = index / BOARD_SIZE;
+        let mut x = index % MODEL_BOARD_SIZE;
+        let mut y = index / MODEL_BOARD_SIZE;
         let bits = self as u8;
 
         if bits & 0b001 != 0 {
-            y = BOARD_SIZE - 1 - y;
+            y = MODEL_BOARD_SIZE - 1 - y;
         }
         if bits & 0b010 != 0 {
-            x = BOARD_SIZE - 1 - x;
+            x = MODEL_BOARD_SIZE - 1 - x;
         }
         if bits & 0b100 != 0 {
             std::mem::swap(&mut x, &mut y);
         }
-        x + y * BOARD_SIZE
+        x + y * MODEL_BOARD_SIZE
     }
 
     /// Transform each canonical spatial plane into model coordinates.

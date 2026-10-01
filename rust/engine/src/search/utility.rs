@@ -8,7 +8,7 @@ use score_value_table::{
     TABLE_ASSUMED_BOARD_SIZE, TABLE_MEAN_LEN, TABLE_MEAN_RADIUS, TABLE_STDEV_LEN,
 };
 
-use crate::{game::board::BOARD_SIZE, search::params::SearchParams};
+use crate::search::params::SearchParams;
 
 static EXPECTED_SCORE_VALUE_TABLE: OnceLock<Box<[f64]>> = OnceLock::new();
 
@@ -18,12 +18,13 @@ pub(super) fn white_utility(
     white_score_mean_sq: f64,
     recent_score_center: f64,
     params: SearchParams,
+    board_size: usize,
 ) -> f64 {
     debug_assert!((0.0..=1.0).contains(&white_win_probability));
 
     let win_loss_utility = (2.0 * white_win_probability - 1.0) * params.win_loss_utility_factor;
     let score_stdev = score_stdev(white_score_mean, white_score_mean_sq);
-    let sqrt_board_area = BOARD_SIZE as f64;
+    let sqrt_board_area = board_size as f64;
     let static_score_value =
         expected_white_score_value(white_score_mean, score_stdev, 0.0, 2.0, sqrt_board_area);
     let dynamic_score_value = expected_white_score_value(
@@ -39,9 +40,13 @@ pub(super) fn white_utility(
         + dynamic_score_value * params.dynamic_score_utility_factor
 }
 
-pub(super) fn recent_score_center(expected_score: f64, params: SearchParams) -> f64 {
+pub(super) fn recent_score_center(
+    expected_score: f64,
+    params: SearchParams,
+    board_size: usize,
+) -> f64 {
     let mut center = expected_score * (1.0 - params.dynamic_score_center_zero_weight);
-    let cap = BOARD_SIZE as f64 * params.dynamic_score_center_scale;
+    let cap = board_size as f64 * params.dynamic_score_center_scale;
     center = center.clamp(expected_score - cap, expected_score + cap);
     center
 }
@@ -54,12 +59,13 @@ pub(super) fn score_utility_diff(
     delta: f64,
     center: f64,
     params: SearchParams,
+    board_size: usize,
 ) -> f64 {
     if delta == 0.0 {
         return 0.0;
     }
     let stdev = score_stdev(mean, mean_sq);
-    let size = BOARD_SIZE as f64;
+    let size = board_size as f64;
     let static_diff = expected_white_score_value(mean + delta, stdev, 0.0, 2.0, size)
         - expected_white_score_value(mean, stdev, 0.0, 2.0, size);
     let dynamic_diff = expected_white_score_value(
@@ -135,14 +141,15 @@ mod tests {
             (mean + delta) * (mean + delta) + variance,
             center,
             params,
-        ) - white_utility(0.6, mean, mean * mean + variance, center, params);
+            9,
+        ) - white_utility(0.6, mean, mean * mean + variance, center, params, 9);
         assert!(
-            (score_utility_diff(mean, mean * mean + variance, delta, center, params) - expected)
+            (score_utility_diff(mean, mean * mean + variance, delta, center, params, 9) - expected)
                 .abs()
                 < 1e-14
         );
         assert_eq!(
-            score_utility_diff(mean, mean * mean + variance, 0.0, center, params),
+            score_utility_diff(mean, mean * mean + variance, 0.0, center, params, 9),
             0.0
         );
     }
@@ -175,16 +182,18 @@ mod tests {
     #[test]
     fn canonical_utility_combines_win_and_score_values() {
         let params = SearchParams::KATAGO_SELFPLAY8_MAIN_B18;
-        assert_close(white_utility(0.5, 0.0, 0.0, 0.0, params), 0.0);
-        assert!(white_utility(0.75, 5.0, 25.0, 0.0, params) > 0.5);
-        assert!(white_utility(0.25, -5.0, 25.0, 0.0, params) < -0.5);
+        assert_close(white_utility(0.5, 0.0, 0.0, 0.0, params, 9), 0.0);
+        assert!(white_utility(0.75, 5.0, 25.0, 0.0, params, 9) > 0.5);
+        assert!(white_utility(0.25, -5.0, 25.0, 0.0, params, 9) < -0.5);
     }
 
     #[test]
     fn recent_score_center_is_pulled_toward_zero_and_capped() {
         let params = SearchParams::KATAGO_SELFPLAY8_MAIN_B18;
-        assert_close(recent_score_center(8.0, params), 6.0);
-        assert_close(recent_score_center(40.0, params), 35.5);
-        assert_close(recent_score_center(-40.0, params), -35.5);
+        assert_close(recent_score_center(8.0, params, 9), 6.0);
+        assert_close(recent_score_center(40.0, params, 9), 35.5);
+        assert_close(recent_score_center(-40.0, params, 9), -35.5);
+        assert_close(recent_score_center(40.0, params, 5), 37.5);
+        assert_close(recent_score_center(-40.0, params, 5), -37.5);
     }
 }

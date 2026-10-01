@@ -80,6 +80,11 @@ inherit the defaults defined in Rust (`SelfPlayParams::default()` and
 `SearchParams::KATAGO_SELFPLAY8_MAIN_B18`). Unknown fields and invalid values are
 rejected before workers are started.
 
+`self_play.rules.board_size` defaults to 9. The engine has runtime square-board
+geometry within its storage capacity, but the current model supports only 9x9.
+Self-play rejects other board sizes before starting workers; tensor and chunk
+dimensions remain unchanged.
+
 Search validation checks numeric and probability/distribution requirements, not
 KataGo's recommended tuning bounds. Finite negative bonuses or exploration
 coefficients are allowed for experiments. Positive scales/denominators and valid

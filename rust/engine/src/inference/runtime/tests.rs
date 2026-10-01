@@ -75,7 +75,7 @@ async fn load_starts_configured_onnx_executors_and_evaluates() {
     let models = TestModelDir::new();
     let handle = ModelRuntime::load(42, 2, &models.config()).unwrap();
     assert_eq!(handle.0.executor_threads.len(), 2);
-    let state = GameState::new(Rules::TROMP_TAYLORISH);
+    let state = GameState::new(Rules::TROMP_TAYLORISH_9);
     let mut client = InferenceClient::new(handle, None);
     assert_eq!(client.model_version(), 42);
     let output = client.evaluate(&state, true).await.unwrap();
@@ -149,7 +149,7 @@ fn load_validates_cache_dimensions_before_allocating() {
 }
 
 fn test_input() -> NNInput {
-    NNInput::encode(&GameState::new(Rules::TROMP_TAYLORISH))
+    NNInput::encode(&GameState::new(Rules::TROMP_TAYLORISH_9))
 }
 
 fn test_output() -> Arc<NNOutput> {
@@ -220,7 +220,22 @@ async fn executors_respect_individual_batch_limits_on_a_shared_queue() {
 }
 
 fn loc(x: usize, y: usize) -> Loc {
-    Loc::new(x, y).expect("test coordinates must be on the board")
+    crate::game::board::Board::new(9)
+        .loc(x, y)
+        .expect("test coordinates must be on the board")
+}
+
+#[tokio::test]
+async fn unsupported_board_size_is_rejected_before_submitting_inference() {
+    let state = GameState::new(Rules {
+        board_size: 5,
+        ..Rules::default()
+    });
+    let mut client = InferenceClient::unbound(None);
+    assert!(matches!(
+        client.evaluate(&state, false).await,
+        Err(InferenceError::UnsupportedBoardSize { board_size: 5 })
+    ));
 }
 
 struct TestBackend {
@@ -289,7 +304,7 @@ async fn root_requests_upgrade_cached_outputs_without_mutating_interior_outputs(
     .unwrap();
     let mut client = InferenceClient::new(handle, None);
     assert_eq!(client.model_version(), 17);
-    let state = GameState::new(Rules::TROMP_TAYLORISH);
+    let state = GameState::new(Rules::TROMP_TAYLORISH_9);
     let interior = client.evaluate(&state, false).await.unwrap();
     assert!(!interior.has_ownership());
     let root = client.evaluate(&state, true).await.unwrap();
@@ -340,7 +355,7 @@ async fn randomized_symmetry_is_restored_before_caching() {
         .unwrap();
 
     let black_stone = loc(1, 2);
-    let mut state = GameState::new(Rules::TROMP_TAYLORISH);
+    let mut state = GameState::new(Rules::TROMP_TAYLORISH_9);
     assert!(state.play(black_stone));
     assert!(state.play(loc(7, 6)));
 
@@ -348,11 +363,12 @@ async fn randomized_symmetry_is_restored_before_caching() {
     let first = client.evaluate(&state, true).await.unwrap();
     let ownership = first.white_ownership().unwrap();
     for (board_index, &actual) in ownership.iter().enumerate() {
-        let expected = if board_index == crate::inference::policy::loc_to_policy(black_stone) {
-            -1.0_f32.tanh()
-        } else {
-            0.0
-        };
+        let expected =
+            if board_index == crate::inference::policy::loc_to_policy(state.board(), black_stone) {
+                -1.0_f32.tanh()
+            } else {
+                0.0
+            };
         assert!((actual - expected).abs() < 1e-6);
     }
 
@@ -465,7 +481,7 @@ async fn missing_requested_ownership_violates_backend_contract() {
     )
     .unwrap();
     let mut client = InferenceClient::new(handle, None);
-    let state = GameState::new(Rules::TROMP_TAYLORISH);
+    let state = GameState::new(Rules::TROMP_TAYLORISH_9);
     let _ = client.evaluate(&state, true).await;
 }
 
@@ -559,7 +575,7 @@ async fn model_runtime_evaluates_through_a_client() {
     let queue = model_handle.0.queue.clone();
     let mut client = InferenceClient::new(model_handle, None);
 
-    let game_state = GameState::new(Rules::TROMP_TAYLORISH);
+    let game_state = GameState::new(Rules::TROMP_TAYLORISH_9);
     let output = client.evaluate(&game_state, false).await.unwrap();
 
     assert!(output.is_processed());
@@ -579,7 +595,7 @@ async fn repeated_evaluation_uses_the_model_cache() {
     let model_handle =
         start_test_runtime(0, vec![test_backend_factory(backend, 4)], 1, 8, 2).unwrap();
     let mut client = InferenceClient::new(model_handle, None);
-    let game_state = GameState::new(Rules::TROMP_TAYLORISH);
+    let game_state = GameState::new(Rules::TROMP_TAYLORISH_9);
 
     let first = client.evaluate(&game_state, false).await.unwrap();
     let second = client.evaluate(&game_state, false).await.unwrap();
@@ -617,8 +633,8 @@ async fn multiple_clients_share_one_model_runtime() {
         start_test_runtime(0, vec![test_backend_factory(backend, 2)], 2, 8, 2).unwrap();
     let mut first_client = InferenceClient::new(model_handle.clone(), None);
     let mut second_client = InferenceClient::new(model_handle, None);
-    let first_game = GameState::new(Rules::TROMP_TAYLORISH);
-    let mut second_game = GameState::new(Rules::TROMP_TAYLORISH);
+    let first_game = GameState::new(Rules::TROMP_TAYLORISH_9);
+    let mut second_game = GameState::new(Rules::TROMP_TAYLORISH_9);
     assert!(second_game.play(loc(4, 4)));
 
     let (first_result, second_result) = tokio::join!(

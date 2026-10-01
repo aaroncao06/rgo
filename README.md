@@ -100,7 +100,7 @@ through their local process interfaces.
 - [Runtime design rationale](docs/11_KATAGO_KZERO_RUNTIME_REVIEW.md)
 - [Search formulas](docs/13_KATAGO_SEARCH_UTILITY_AND_SELECTION.md) and
   [implemented/deferred search features](docs/search_feature_review.md)
-- Future work: [experiments](docs/12_DEFERRED_EXPERIMENTS.md),
+- Future work: [deferred work and experiments](docs/12_DEFERRED_EXPERIMENTS.md),
   [distributed orchestration](docs/distributed_selfplay_training.md),
   [interactive application](docs/10_INTERACTIVE_APP.md), and
   [bidirectional-search research](docs/99_BIDIRECTIONAL_SEARCH_RESEARCH.md)

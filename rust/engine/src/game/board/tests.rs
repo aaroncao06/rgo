@@ -1,7 +1,11 @@
 use super::*;
 
+const TEST_BOARD_SIZE: usize = 9;
+
 fn loc(x: usize, y: usize) -> Loc {
-    Loc::new(x, y).expect("test coordinates must be on the board")
+    crate::game::board::Board::new(9)
+        .loc(x, y)
+        .expect("test coordinates must be on the board")
 }
 
 fn play(board: &mut Board, x: usize, y: usize, player: Player) {
@@ -9,12 +13,12 @@ fn play(board: &mut Board, x: usize, y: usize, player: Player) {
 }
 
 fn assert_position_hash_matches_recomputation(board: &Board) {
-    let mut recomputed = 0;
+    let mut recomputed = super::board_size_hash(board.size());
 
     for i in 0..ARRAY_LEN {
         let color = board.colors[i];
         if color == Color::Black || color == Color::White {
-            recomputed ^= super::stone_hash(Loc::from_index(i), color);
+            recomputed ^= super::stone_hash(Board::loc_from_index(i), color);
         }
     }
 
@@ -24,7 +28,7 @@ fn assert_position_hash_matches_recomputation(board: &Board) {
 fn assert_chain_metadata_matches_recomputation(board: &Board) {
     let mut visited = [false; ARRAY_LEN];
 
-    for start in Loc::board_iter() {
+    for start in board.locs() {
         let start_i = start.index();
         let color = board.colors[start_i];
         if visited[start_i] || (color != Color::Black && color != Color::White) {
@@ -45,10 +49,10 @@ fn assert_chain_metadata_matches_recomputation(board: &Board) {
             let current_i = current.index();
             component[current_i] = true;
 
-            for adj_i in Loc::adjacent_indices(current_i) {
+            for adj_i in Board::adjacent_indices(current_i) {
                 if board.colors[adj_i] == color && !visited[adj_i] {
                     visited[adj_i] = true;
-                    queue[queue_tail] = Loc::from_index(adj_i);
+                    queue[queue_tail] = Board::loc_from_index(adj_i);
                     queue_tail += 1;
                 } else if board.colors[adj_i] == Color::Empty {
                     liberties[adj_i] = true;
@@ -79,12 +83,12 @@ fn assert_chain_metadata_matches_recomputation(board: &Board) {
     }
 }
 
-fn board_from_ascii(rows: [&str; BOARD_SIZE]) -> Board {
-    let mut board = Board::new();
+fn board_from_ascii(rows: [&str; TEST_BOARD_SIZE]) -> Board {
+    let mut board = Board::new(9);
 
     for (stone, player) in [('x', Player::Black), ('o', Player::White)] {
         for (y, row) in rows.iter().enumerate() {
-            assert_eq!(row.len(), BOARD_SIZE);
+            assert_eq!(row.len(), TEST_BOARD_SIZE);
             for (x, cell) in row.bytes().enumerate() {
                 if cell == stone as u8 {
                     board.play_move_assume_legal(loc(x, y), player);
@@ -109,9 +113,9 @@ fn board_from_ascii(rows: [&str; BOARD_SIZE]) -> Board {
     board
 }
 
-fn assert_area_rows(area: &[Color; ARRAY_LEN], expected: [&str; BOARD_SIZE]) {
+fn assert_area_rows(area: &[Color; ARRAY_LEN], expected: [&str; TEST_BOARD_SIZE]) {
     for (y, row) in expected.iter().enumerate() {
-        assert_eq!(row.len(), BOARD_SIZE);
+        assert_eq!(row.len(), TEST_BOARD_SIZE);
         for (x, cell) in row.bytes().enumerate() {
             let expected_color = match cell {
                 b'X' => Color::Black,
@@ -125,21 +129,66 @@ fn assert_area_rows(area: &[Color; ARRAY_LEN], expected: [&str; BOARD_SIZE]) {
 }
 
 #[test]
-fn loc_round_trips_coordinates_and_knows_adjacency() {
-    let point = loc(4, 7);
+fn board_round_trips_coordinates_and_checks_bounds() {
+    let board = Board::new(9);
+    let point = board.loc(4, 7).unwrap();
+    assert_eq!(board.coords(point), Some((4, 7)));
+    assert!(board.loc(9, 0).is_none());
+    assert!(board.loc(0, 9).is_none());
+    assert!(board.loc(usize::MAX, 0).is_none());
+    assert_eq!(board.coords(Loc::PASS), None);
+    assert_eq!(board.coords(Loc::NULL), None);
+}
 
-    assert_eq!(point.x(), 4);
-    assert_eq!(point.y(), 7);
-    assert!(Loc::is_adjacent(point, loc(4, 6)));
-    assert!(Loc::is_adjacent(point, loc(5, 7)));
-    assert!(!Loc::is_adjacent(point, loc(5, 6)));
-    assert!(!Loc::is_adjacent(point, loc(6, 7)));
-    assert!(Loc::new(BOARD_SIZE, 0).is_none());
+#[test]
+fn active_geometry_and_wall_padding_follow_the_board_size() {
+    for size in 1..=MAX_BOARD_SIZE {
+        let board = Board::new(size);
+        assert_eq!(board.size(), size);
+        assert_eq!(board.locs().count(), size * size);
+        for (i, &color) in board.colors.iter().enumerate() {
+            let point = Board::loc_from_index(i);
+            let active = (1..=size).contains(&(i % STRIDE)) && (1..=size).contains(&(i / STRIDE));
+            assert_eq!(board.is_on_board(point), active);
+            assert_eq!(color, if active { Color::Empty } else { Color::Wall });
+        }
+        for point in board.locs() {
+            let (x, y) = board.coords(point).unwrap();
+            assert_eq!(board.loc(x, y), Some(point));
+            for neighbor in Board::adjacent_indices(point.index()) {
+                assert!(neighbor < ARRAY_LEN);
+            }
+        }
+        assert!(board.loc(size, 0).is_none());
+        assert!(board.loc(0, size).is_none());
+    }
+}
+
+#[test]
+fn capture_at_a_smaller_board_edge_preserves_chain_metadata() {
+    let mut board = Board::new(2);
+    let corner = board.loc(0, 0).unwrap();
+    board.play_move_assume_legal(corner, Player::Black);
+    assert_eq!(board.get_num_liberties(corner), 2);
+    for (x, y) in [(1, 0), (0, 1)] {
+        let point = board.loc(x, y).unwrap();
+        assert!(board.is_legal_ignoring_ko(point, Player::White, true));
+        board.play_move_assume_legal(point, Player::White);
+    }
+    assert_eq!(board.color_at(corner), Color::Empty);
+    assert_chain_metadata_matches_recomputation(&board);
+    assert_position_hash_matches_recomputation(&board);
+    let area = board.calculate_area(true);
+    assert!(
+        board
+            .locs()
+            .all(|point| area[point.index()] == Color::White)
+    );
 }
 
 #[test]
 fn new_board_is_empty_and_a_center_stone_has_four_liberties() {
-    let mut board = Board::new();
+    let mut board = Board::new(9);
     let center = loc(4, 4);
 
     assert!(board.is_empty());
@@ -154,7 +203,7 @@ fn new_board_is_empty_and_a_center_stone_has_four_liberties() {
 
 #[test]
 fn corner_stone_has_two_liberties() {
-    let mut board = Board::new();
+    let mut board = Board::new(9);
     let corner = loc(0, 0);
 
     play(&mut board, 0, 0, Player::Black);
@@ -206,7 +255,7 @@ fn repetition_region_counts_the_empty_component_after_suicide() {
 
 #[test]
 fn adjacent_friendly_stones_merge_into_one_chain() {
-    let mut board = Board::new();
+    let mut board = Board::new(9);
     let left = loc(4, 4);
     let right = loc(5, 4);
 
@@ -224,7 +273,7 @@ fn adjacent_friendly_stones_merge_into_one_chain() {
 
 #[test]
 fn one_move_merges_two_preexisting_friendly_chains() {
-    let mut board = Board::new();
+    let mut board = Board::new(9);
     let left = loc(3, 4);
     let bridge = loc(4, 4);
     let right = loc(5, 4);
@@ -253,7 +302,7 @@ fn one_move_merges_two_preexisting_friendly_chains() {
 
 #[test]
 fn touching_one_chain_from_two_directions_updates_its_liberty_once() {
-    let mut board = Board::new();
+    let mut board = Board::new(9);
     let played = loc(4, 4);
     let chain_stone = loc(3, 4);
 
@@ -271,7 +320,7 @@ fn touching_one_chain_from_two_directions_updates_its_liberty_once() {
 
 #[test]
 fn surrounding_a_stone_captures_it_and_frees_liberties() {
-    let mut board = Board::new();
+    let mut board = Board::new(9);
     let captured = loc(4, 4);
     let top = loc(4, 3);
     let capture = loc(4, 5);
@@ -294,7 +343,7 @@ fn surrounding_a_stone_captures_it_and_frees_liberties() {
 
 #[test]
 fn single_stone_ko_marks_the_captured_point() {
-    let mut board = Board::new();
+    let mut board = Board::new(9);
     let captured = loc(4, 4);
     let capture = loc(4, 5);
 
@@ -323,7 +372,7 @@ fn single_stone_ko_marks_the_captured_point() {
 
 #[test]
 fn assume_legal_applies_suicide_after_captures_are_resolved() {
-    let mut board = Board::new();
+    let mut board = Board::new(9);
     let suicide_point = loc(4, 4);
 
     play(&mut board, 4, 3, Player::White);
@@ -338,7 +387,7 @@ fn assume_legal_applies_suicide_after_captures_are_resolved() {
 
 #[test]
 fn legality_rejects_occupied_and_wall_locations() {
-    let mut board = Board::new();
+    let mut board = Board::new(9);
     let occupied = loc(4, 4);
 
     play(&mut board, 4, 4, Player::Black);
@@ -351,7 +400,7 @@ fn legality_rejects_occupied_and_wall_locations() {
 
 #[test]
 fn pass_is_legal_and_clears_simple_ko_without_changing_stones() {
-    let mut board = Board::new();
+    let mut board = Board::new(9);
     let stone = loc(4, 4);
 
     play(&mut board, 4, 4, Player::Black);
@@ -368,7 +417,7 @@ fn pass_is_legal_and_clears_simple_ko_without_changing_stones() {
 
 #[test]
 fn single_stone_suicide_is_illegal_under_both_suicide_settings() {
-    let mut board = Board::new();
+    let mut board = Board::new(9);
     let suicide_point = loc(4, 4);
 
     play(&mut board, 4, 3, Player::White);
@@ -385,7 +434,7 @@ fn single_stone_suicide_is_illegal_under_both_suicide_settings() {
 
 #[test]
 fn multi_stone_suicide_rule_changes_legality_and_removes_the_chain() {
-    let mut board = Board::new();
+    let mut board = Board::new(9);
     let existing_stone = loc(4, 4);
     let suicide_move = loc(4, 5);
 
@@ -408,41 +457,42 @@ fn multi_stone_suicide_rule_changes_legality_and_removes_the_chain() {
 
 #[test]
 fn randomized_play_preserves_incremental_chain_and_hash_invariants() {
-    let mut board = Board::new();
-    let mut player = Player::Black;
-    let mut random_state = 0x7267_6f5f_7465_7374_u64;
+    for size in 1..=MAX_BOARD_SIZE {
+        let mut board = Board::new(size);
+        let mut player = Player::Black;
+        let mut random_state = 0x7267_6f5f_7465_7374_u64;
 
-    for _ in 0..2_000 {
-        random_state = random_state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        let action = (random_state as usize) % (BOARD_SIZE * BOARD_SIZE + 1);
-        let move_loc = if action == BOARD_SIZE * BOARD_SIZE {
-            Loc::PASS
-        } else {
-            loc(action % BOARD_SIZE, action / BOARD_SIZE)
-        };
+        for _ in 0..2_000 {
+            random_state = random_state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let action = (random_state as usize) % (size * size + 1);
+            let move_loc = if action == size * size {
+                Loc::PASS
+            } else {
+                board.loc(action % size, action / size).unwrap()
+            };
 
-        if !board.is_legal(move_loc, player, true) {
-            continue;
+            if !board.is_legal(move_loc, player, true) {
+                continue;
+            }
+
+            let predicted_hash = board.get_position_hash_after_move(move_loc, player);
+            board.play_move_assume_legal(move_loc, player);
+
+            assert_eq!(board.position_hash(), predicted_hash);
+            assert_position_hash_matches_recomputation(&board);
+            assert_chain_metadata_matches_recomputation(&board);
+            player = player.opponent();
         }
-
-        let predicted_hash = board.get_position_hash_after_move(move_loc, player);
-        board.play_move_assume_legal(move_loc, player);
-
-        assert_eq!(board.position_hash(), predicted_hash);
-        assert_position_hash_matches_recomputation(&board);
-        assert_chain_metadata_matches_recomputation(&board);
-        player = player.opponent();
     }
 }
 
 #[test]
 fn position_hash_matches_recomputation_after_moves_and_pass() {
-    let mut board = Board::new();
+    let mut board = Board::new(9);
     let empty_hash = board.position_hash();
 
-    assert_eq!(empty_hash, 0);
     assert_position_hash_matches_recomputation(&board);
 
     board.play_move_assume_legal(Loc::PASS, Player::Black);
@@ -458,7 +508,7 @@ fn position_hash_matches_recomputation_after_moves_and_pass() {
 
 #[test]
 fn position_hash_matches_recomputation_after_multi_stone_capture_and_suicide() {
-    let mut capture_board = Board::new();
+    let mut capture_board = Board::new(9);
 
     play(&mut capture_board, 4, 4, Player::Black);
     play(&mut capture_board, 4, 5, Player::Black);
@@ -469,7 +519,7 @@ fn position_hash_matches_recomputation_after_multi_stone_capture_and_suicide() {
     assert_eq!(capture_board.colors[loc(4, 4).index()], Color::Empty);
     assert_eq!(capture_board.colors[loc(4, 5).index()], Color::Empty);
 
-    let mut suicide_board = Board::new();
+    let mut suicide_board = Board::new(9);
     for (x, y) in [(4, 3), (5, 4), (4, 5), (3, 4)] {
         play(&mut suicide_board, x, y, Player::White);
     }
@@ -484,7 +534,7 @@ fn position_hash_matches_recomputation_after_multi_stone_capture_and_suicide() {
 
 #[test]
 fn position_hash_after_move_matches_played_position() {
-    let mut capture_board = Board::new();
+    let mut capture_board = Board::new(9);
 
     play(&mut capture_board, 4, 4, Player::Black);
     play(&mut capture_board, 4, 5, Player::Black);
@@ -498,7 +548,7 @@ fn position_hash_after_move_matches_played_position() {
     captured.play_move_assume_legal(capture, Player::White);
     assert_eq!(capture_hash, captured.position_hash());
 
-    let mut suicide_board = Board::new();
+    let mut suicide_board = Board::new(9);
     for (x, y) in [(4, 3), (5, 4), (4, 5), (3, 4)] {
         play(&mut suicide_board, x, y, Player::White);
     }
@@ -517,17 +567,17 @@ fn position_hash_after_move_matches_played_position() {
 
 #[test]
 fn area_of_an_empty_board_is_neutral() {
-    let board = Board::new();
+    let board = Board::new(9);
     let area = board.calculate_area(true);
 
-    for point in Loc::board_iter() {
+    for point in board.locs() {
         assert_eq!(area[point.index()], Color::Empty);
     }
 }
 
 #[test]
 fn strict_area_rejects_a_chain_without_two_vital_regions() {
-    let mut board = Board::new();
+    let mut board = Board::new(9);
     let stone = loc(4, 4);
     play(&mut board, 4, 4, Player::Black);
 
@@ -540,7 +590,7 @@ fn strict_area_rejects_a_chain_without_two_vital_regions() {
 
 #[test]
 fn strict_area_keeps_a_two_eye_group_and_its_eyes() {
-    let mut board = Board::new();
+    let mut board = Board::new(9);
 
     // A connected Black group surrounding two separate one-point eyes.
     for (x, y) in [
@@ -572,7 +622,7 @@ fn strict_area_keeps_a_two_eye_group_and_its_eyes() {
 
 #[test]
 fn default_area_leaves_shared_exterior_neutral() {
-    let mut board = Board::new();
+    let mut board = Board::new(9);
 
     // Same two-eye Black group, plus a distant White stone. The exterior
     // region contains both colors, so neither side can claim it.
@@ -606,7 +656,7 @@ fn default_area_leaves_shared_exterior_neutral() {
 
 #[test]
 fn surrounded_pass_dead_stone_is_scored_for_the_surrounding_player() {
-    let mut board = Board::new();
+    let mut board = Board::new(9);
 
     // One connected Black chain surrounds two one-point eyes and a third
     // chamber containing a White stone with one remaining liberty.

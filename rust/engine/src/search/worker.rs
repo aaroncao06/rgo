@@ -225,14 +225,18 @@ impl<N: NodeStore> SearchWorker<N> {
         let root_output = inference_client
             .evaluate(root_game_state, self.params.root_ending_bonus_points != 0.0)
             .await?;
-        let score_center =
-            recent_score_center(f64::from(root_output.white_score_mean()), self.params);
+        let score_center = recent_score_center(
+            f64::from(root_output.white_score_mean()),
+            self.params,
+            root_game_state.board().size(),
+        );
         let root_utility = white_utility(
             f64::from(root_output.white_win_prob()),
             f64::from(root_output.white_score_mean()),
             f64::from(root_output.white_score_mean_sq()),
             score_center,
             self.params,
+            root_game_state.board().size(),
         );
 
         match self.scratch_game_state.as_mut() {
@@ -302,7 +306,7 @@ impl<N: NodeStore> SearchWorker<N> {
                 let node = unsafe { current_node.as_ref() };
                 let game_state = self.scratch_game_state();
                 let (move_loc, edge_index) = self.select_child(node, game_state, is_root);
-                let policy_prior = node.policy_probs()[loc_to_policy(move_loc)];
+                let policy_prior = node.policy_probs()[loc_to_policy(game_state.board(), move_loc)];
                 let existing_edge = edge_index.map(|edge_index| {
                     let edge = node.edge(edge_index);
                     (edge_index, edge.child(), edge.visits())
@@ -399,6 +403,7 @@ impl<N: NodeStore> SearchWorker<N> {
                             f64::from(output.white_score_mean_sq()),
                             self.recent_score_center,
                             self.params,
+                            self.scratch_game_state().board().size(),
                         );
                         let child = unsafe { child.as_mut() };
                         child.initialize_from_nn_eval(output, utility);
@@ -427,6 +432,7 @@ impl<N: NodeStore> SearchWorker<N> {
                             white_score_mean_sq,
                             self.recent_score_center,
                             self.params,
+                            self.scratch_game_state().board().size(),
                         );
                         unsafe { child.as_mut() }.record_visit(
                             white_win,
@@ -458,7 +464,11 @@ impl<N: NodeStore> SearchWorker<N> {
             let mut parent = step.parent;
             let parent = unsafe { parent.as_mut() };
             parent.edge_mut(step.edge_index).record_visit();
-            self.recompute_node_stats(parent, step.player);
+            self.recompute_node_stats(
+                parent,
+                step.player,
+                self.scratch_game_state().board().size(),
+            );
         }
     }
 }

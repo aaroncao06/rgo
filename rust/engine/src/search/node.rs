@@ -241,6 +241,10 @@ mod tests {
     use super::*;
     use crate::{game::board::Player, inference::policy::POLICY_SIZE};
 
+    fn loc(x: usize, y: usize) -> Loc {
+        crate::game::board::Board::new(9).loc(x, y).unwrap()
+    }
+
     fn processed_output() -> Arc<NNOutput> {
         let mut output = Arc::new(NNOutput::from_raw([0.0; POLICY_SIZE], 0.0, 0.0, 0.0));
         Arc::get_mut(&mut output)
@@ -303,8 +307,8 @@ mod tests {
         let mut second_child = Box::new(SearchNode::new());
         let first_ptr = NonNull::from(first_child.as_mut());
         let second_ptr = NonNull::from(second_child.as_mut());
-        let first_move = Loc::new(3, 4).unwrap();
-        let second_move = Loc::new(4, 4).unwrap();
+        let first_move = loc(3, 4);
+        let second_move = loc(4, 4);
 
         let first_index = parent.add_child(first_move, 0.6, first_ptr);
         let second_index = parent.add_child(second_move, 0.4, second_ptr);

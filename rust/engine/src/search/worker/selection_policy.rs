@@ -45,7 +45,7 @@ impl<N: NodeStore> SearchWorker<N> {
         let mut expanded = [false; POLICY_SIZE];
         for (edge_index, edge) in node.indexed_edges() {
             let move_loc = edge.move_loc();
-            let policy_index = loc_to_policy(move_loc);
+            let policy_index = loc_to_policy(game_state.board(), move_loc);
             expanded[policy_index] = true;
             if !game_state.is_legal(move_loc)
                 || root.is_some_and(|root| !root.is_allowed_move(move_loc, self.params))
@@ -96,7 +96,7 @@ impl<N: NodeStore> SearchWorker<N> {
             if expanded[policy_index] {
                 continue;
             }
-            let move_loc = policy_to_loc(policy_index);
+            let move_loc = policy_to_loc(game_state.board(), policy_index);
             if game_state.is_legal(move_loc)
                 && probability > best_new_policy
                 && root.is_none_or(|root| root.is_allowed_move(move_loc, self.params))
@@ -136,6 +136,7 @@ impl<N: NodeStore> SearchWorker<N> {
             f64::from(direct_output.white_score_mean_sq()),
             self.recent_score_center,
             self.params,
+            game_state.board().size(),
         );
         let backed_up_weight = visited_policy_mass
             .powf(self.params.fpu_parent_weight_by_visited_policy_pow)

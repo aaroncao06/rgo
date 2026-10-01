@@ -57,23 +57,25 @@ mod tests {
     use crate::game::rules::Rules;
 
     fn loc(x: usize, y: usize) -> Loc {
-        Loc::new(x, y).expect("test coordinates must be on the board")
+        crate::game::board::Board::new(9)
+            .loc(x, y)
+            .expect("test coordinates must be on the board")
     }
 
     #[test]
     fn new_key_is_deterministic_and_changes_with_state() {
-        let initial = GameState::new(Rules::TROMP_TAYLORISH);
-        let equivalent = GameState::new(Rules::TROMP_TAYLORISH);
+        let initial = GameState::new(Rules::TROMP_TAYLORISH_9);
+        let equivalent = GameState::new(Rules::TROMP_TAYLORISH_9);
         assert_eq!(GraphKey::new(&initial), GraphKey::new(&equivalent));
 
-        let mut moved = GameState::new(Rules::TROMP_TAYLORISH);
+        let mut moved = GameState::new(Rules::TROMP_TAYLORISH_9);
         assert!(moved.play(loc(4, 4)));
         assert_ne!(GraphKey::new(&initial), GraphKey::new(&moved));
     }
 
     #[test]
     fn advance_folds_history_for_a_pass() {
-        let mut game_state = GameState::new(Rules::TROMP_TAYLORISH);
+        let mut game_state = GameState::new(Rules::TROMP_TAYLORISH_9);
         let mut key = GraphKey::new(&game_state);
         let previous = key.raw();
 
@@ -87,7 +89,7 @@ mod tests {
 
     #[test]
     fn advance_drops_history_for_a_large_repetition_region() {
-        let mut game_state = GameState::new(Rules::TROMP_TAYLORISH);
+        let mut game_state = GameState::new(Rules::TROMP_TAYLORISH_9);
         let mut key = GraphKey::new(&game_state);
         let played = loc(4, 4);
 
@@ -107,7 +109,7 @@ mod tests {
         let recapture = loc(4, 4);
         let capture = loc(4, 5);
 
-        let mut with_repetition = GameState::new(Rules::TROMP_TAYLORISH);
+        let mut with_repetition = GameState::new(Rules::TROMP_TAYLORISH_9);
         for move_loc in [
             loc(4, 3),
             recapture,
@@ -122,7 +124,7 @@ mod tests {
             assert!(with_repetition.play(move_loc));
         }
 
-        let mut without_repetition = GameState::new(Rules::TROMP_TAYLORISH);
+        let mut without_repetition = GameState::new(Rules::TROMP_TAYLORISH_9);
         for move_loc in [
             loc(4, 3),
             loc(4, 6),
@@ -151,7 +153,7 @@ mod tests {
 
     #[test]
     fn null_move_starts_from_the_current_state_only() {
-        let game_state = GameState::new(Rules::TROMP_TAYLORISH);
+        let game_state = GameState::new(Rules::TROMP_TAYLORISH_9);
         let mut key = GraphKey::from_raw(123);
 
         key.advance(&game_state, Loc::NULL);

@@ -86,8 +86,9 @@ impl SelfPlayConfig {
             }
         }
         self.inference.validate()?;
-        if !self.self_play.rules.komi.is_finite() {
-            return Err("komi must be finite");
+        self.self_play.rules.validate()?;
+        if self.self_play.rules.board_size != crate::inference::policy::MODEL_BOARD_SIZE {
+            return Err("the current self-play model requires a 9x9 board");
         }
         self.self_play.search_budget_policy.validate()?;
         self.search.validate()?;

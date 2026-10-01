@@ -8,6 +8,7 @@ const SUPERKO_HASH_SEED: u64 = u64::from_be_bytes(*b"superko!");
 const SUICIDE_HASH_SEED: u64 = u64::from_be_bytes(*b"suicide."); // for the binary rule
 const KOMI_HASH_SEED: u64 = u64::from_be_bytes(*b"komi!!!!");
 const PASS_HASH_SEED: u64 = u64::from_be_bytes(*b"passes!!");
+const BOARD_SIZE_HASH_SEED: u64 = u64::from_be_bytes(*b"boardsz!");
 const SPLITMIX64_INCREMENT: u64 = 0x9E37_79B9_7F4A_7C15;
 
 const fn splitmix64_finalize(mut value: u64) -> u64 {
@@ -121,4 +122,8 @@ pub(crate) fn komi_hash(komi: f32) -> Hash128 {
 
 pub(super) fn pass_hash(count: u8) -> Hash128 {
     scalar_hash(PASS_HASH_SEED, count as u64)
+}
+
+pub(super) fn board_size_hash(size: usize) -> Hash128 {
+    scalar_hash(BOARD_SIZE_HASH_SEED, size as u64)
 }

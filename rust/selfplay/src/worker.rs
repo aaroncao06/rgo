@@ -216,8 +216,8 @@ fn build_training_samples(
     let final_state_hash = game_state.current_state_hash();
     let final_turn_number = game_state.turn_number();
     let rules = *game_state.rules();
-    let black_ownership = ownership_for_player(&final_ownership, Player::Black);
-    let white_ownership = ownership_for_player(&final_ownership, Player::White);
+    let black_ownership = ownership_for_player(game_state.board(), &final_ownership, Player::Black);
+    let white_ownership = ownership_for_player(game_state.board(), &final_ownership, Player::White);
 
     game_state.reset(rules);
     samples.clear();
@@ -259,12 +259,13 @@ fn build_training_samples(
 }
 
 fn ownership_for_player(
+    board: &crate::game::board::Board,
     final_ownership: &[Color; crate::game::board::ARRAY_LEN],
     player: Player,
 ) -> [u8; BOARD_POLICY_SIZE] {
     let mut ownership = [1; BOARD_POLICY_SIZE];
-    for loc in Loc::board_iter() {
-        ownership[loc_to_policy(loc)] = match (final_ownership[loc.index()], player) {
+    for loc in board.locs() {
+        ownership[loc_to_policy(board, loc)] = match (final_ownership[loc.index()], player) {
             (Color::Empty, _) => 1,
             (Color::Black, Player::Black) | (Color::White, Player::White) => 2,
             (Color::Black, Player::White) | (Color::White, Player::Black) => 0,
@@ -300,15 +301,15 @@ mod tests {
 
     #[test]
     fn finished_game_replay_builds_player_relative_training_samples() {
-        let rules = Rules::TROMP_TAYLORISH;
-        let center = Loc::new(4, 4).unwrap();
-        let moves = [center, Loc::PASS, Loc::PASS];
+        let rules = Rules::TROMP_TAYLORISH_9;
         let mut game_state = GameState::new(rules);
+        let center = game_state.board().loc(4, 4).unwrap();
+        let moves = [center, Loc::PASS, Loc::PASS];
         let mut records = Vec::new();
 
         for (turn, move_loc) in moves.into_iter().enumerate() {
             let mut policy_target = [0.0; POLICY_SIZE];
-            policy_target[loc_to_policy(move_loc)] = 1.0;
+            policy_target[loc_to_policy(game_state.board(), move_loc)] = 1.0;
             records.push(SelfPlayRecord {
                 player: game_state.next_player(),
                 selected_move: move_loc,
@@ -332,7 +333,7 @@ mod tests {
         assert_eq!(samples[1].input.global, [7.5, 0.0]);
         assert_eq!(samples[2].input.global, [-7.5, 1.0]);
 
-        let center_policy = loc_to_policy(center);
+        let center_policy = loc_to_policy(game_state.board(), center);
         assert_eq!(samples[0].input.spatial[center_policy], 0.0);
         assert_eq!(
             samples[1].input.spatial[BOARD_POLICY_SIZE + center_policy],

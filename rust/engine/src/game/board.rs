@@ -1,8 +1,8 @@
-use super::hash::{Hash128, stone_hash};
+use super::hash::{Hash128, board_size_hash, stone_hash};
 
-// can make these runtime-configurable in the future
-pub const BOARD_SIZE: usize = 9;
-pub(crate) const STRIDE: usize = BOARD_SIZE + 1; // first element of each row is the wall
+/// Storage capacity, independent of a game's active board size.
+pub const MAX_BOARD_SIZE: usize = 9;
+const STRIDE: usize = MAX_BOARD_SIZE + 1; // first element of each row is the wall
 pub const ARRAY_LEN: usize = STRIDE * STRIDE + STRIDE + 1; //need bottom row of walls and bottom corner
 
 mod scoring;
@@ -57,41 +57,8 @@ pub struct Loc(u16);
 impl Loc {
     pub(crate) const NULL: Self = Self(0);
     pub const PASS: Self = Self(1);
-    pub fn new(x: usize, y: usize) -> Option<Loc> {
-        if x < BOARD_SIZE && y < BOARD_SIZE {
-            Some(Self(((x + 1) + (y + 1) * STRIDE) as u16))
-        } else {
-            None
-        }
-    }
     pub fn index(self) -> usize {
         self.0 as usize // cant have u16
-    }
-    pub(crate) fn from_index(index: usize) -> Self {
-        debug_assert!(index < ARRAY_LEN);
-        Self(index as u16)
-    }
-    pub fn x(self) -> usize {
-        (self.0 as usize) % STRIDE - 1
-    }
-    pub fn y(self) -> usize {
-        (self.0 as usize) / STRIDE - 1
-    }
-    fn is_adjacent(loc1: Self, loc2: Self) -> bool {
-        let difference = loc1.index().abs_diff(loc2.index());
-        difference == 1 || difference == STRIDE
-    }
-    fn adjacent_indices(i: usize) -> [usize; 4] {
-        [i + 1, i - STRIDE, i - 1, i + STRIDE] // unit circle direction lol
-    }
-    pub fn board_iter() -> impl Iterator<Item = Loc> {
-        (1..=BOARD_SIZE).flat_map(|y| (1..=BOARD_SIZE).map(move |x| Loc((x + y * STRIDE) as u16)))
-    }
-    pub fn is_on_board(self) -> bool {
-        let i = self.index();
-        let padded_x = i % STRIDE;
-        let padded_y = i / STRIDE;
-        padded_x > 0 && padded_x <= BOARD_SIZE && padded_y > 0 && padded_y <= BOARD_SIZE
     }
 }
 
@@ -103,6 +70,7 @@ struct ChainData {
 
 #[derive(Clone)]
 pub struct Board {
+    size: usize,
     colors: [Color; ARRAY_LEN], // flat board array
     chain_data: [ChainData; ARRAY_LEN],
     chain_head: [Loc; ARRAY_LEN],
@@ -112,27 +80,69 @@ pub struct Board {
 }
 
 impl Board {
-    pub(super) fn new() -> Self {
-        let mut colors = [Color::Empty; ARRAY_LEN];
-        for i in 0..STRIDE {
-            colors[i] = Color::Wall;
-            colors[i + STRIDE * STRIDE] = Color::Wall;
-            colors[i * STRIDE] = Color::Wall;
+    pub fn new(size: usize) -> Self {
+        assert!(
+            (1..=MAX_BOARD_SIZE).contains(&size),
+            "board size must fit the board storage capacity"
+        );
+        let mut colors = [Color::Wall; ARRAY_LEN];
+        for y in 1..=size {
+            for x in 1..=size {
+                colors[x + y * STRIDE] = Color::Empty;
+            }
         }
-        colors[ARRAY_LEN - 1] = Color::Wall;
 
         let init_data = ChainData {
             num_locs: 0,
             num_liberties: 0,
         };
         Self {
+            size,
             colors,
             chain_data: [init_data; ARRAY_LEN],
             chain_head: [Loc::NULL; ARRAY_LEN],
             next_in_chain: [Loc::NULL; ARRAY_LEN],
             simple_ko: None,
-            position_hash: 0,
+            position_hash: board_size_hash(size),
         }
+    }
+    pub fn size(&self) -> usize {
+        self.size
+    }
+    pub fn loc(&self, x: usize, y: usize) -> Option<Loc> {
+        if x < self.size && y < self.size {
+            Some(self.loc_assume_on_board(x, y))
+        } else {
+            None
+        }
+    }
+    pub fn coords(&self, loc: Loc) -> Option<(usize, usize)> {
+        self.is_on_board(loc)
+            .then(|| self.coords_assume_on_board(loc))
+    }
+    pub(crate) fn loc_assume_on_board(&self, x: usize, y: usize) -> Loc {
+        debug_assert!(x < self.size && y < self.size);
+        Self::loc_from_index((x + 1) + (y + 1) * STRIDE)
+    }
+    pub(crate) fn coords_assume_on_board(&self, loc: Loc) -> (usize, usize) {
+        debug_assert!(self.is_on_board(loc));
+        (loc.index() % STRIDE - 1, loc.index() / STRIDE - 1)
+    }
+    pub fn is_on_board(&self, loc: Loc) -> bool {
+        let padded_x = loc.index() % STRIDE;
+        let padded_y = loc.index() / STRIDE;
+        padded_x > 0 && padded_x <= self.size && padded_y > 0 && padded_y <= self.size
+    }
+    pub fn locs(&self) -> impl Iterator<Item = Loc> + use<> {
+        let size = self.size;
+        (1..=size).flat_map(move |y| (1..=size).map(move |x| Self::loc_from_index(x + y * STRIDE)))
+    }
+    fn loc_from_index(index: usize) -> Loc {
+        debug_assert!(index < ARRAY_LEN);
+        Loc(index as u16)
+    }
+    fn adjacent_indices(i: usize) -> [usize; 4] {
+        [i + 1, i - STRIDE, i - 1, i + STRIDE]
     }
     pub fn color_at(&self, loc: Loc) -> Color {
         self.colors[loc.index()]
@@ -141,14 +151,14 @@ impl Board {
         self.simple_ko
     }
     pub(crate) fn is_adjacent_to_player(&self, loc: Loc, player: Player) -> bool {
-        Loc::adjacent_indices(loc.index())
+        Board::adjacent_indices(loc.index())
             .into_iter()
             .any(|i| self.colors[i] == Color::from(player))
     }
     pub(crate) fn would_capture(&self, loc: Loc, player: Player) -> bool {
-        Loc::adjacent_indices(loc.index()).into_iter().any(|i| {
+        Board::adjacent_indices(loc.index()).into_iter().any(|i| {
             self.colors[i] == Color::from(player.opponent())
-                && self.get_num_liberties(Loc::from_index(i)) == 1
+                && self.get_num_liberties(Board::loc_from_index(i)) == 1
         })
     }
     fn is_empty(&self) -> bool {
@@ -172,7 +182,7 @@ impl Board {
     fn is_liberty_of(&self, loc: Loc, head: Loc) -> bool {
         let i = loc.index();
         let owner = self.colors[head.index()];
-        Loc::adjacent_indices(i)
+        Board::adjacent_indices(i)
             .into_iter()
             .any(|adj_i| self.colors[adj_i] == owner && self.chain_head[adj_i] == head)
     }
@@ -184,7 +194,7 @@ impl Board {
         let owner = Color::from(player);
         let mut seen_heads = [Loc::NULL; 4]; //update distinct chains once
         let mut seen_len = 0;
-        for adj_i in Loc::adjacent_indices(i) {
+        for adj_i in Board::adjacent_indices(i) {
             if self.colors[adj_i] != owner {
                 continue;
             }
@@ -217,9 +227,9 @@ impl Board {
         loop {
             // need to add new liberty in before adding it to that chain group
             let i = cur.index();
-            for adj_i in Loc::adjacent_indices(i) {
+            for adj_i in Board::adjacent_indices(i) {
                 if self.colors[adj_i].is_empty()
-                    && !self.is_liberty_of(Loc::from_index(adj_i), large_head)
+                    && !self.is_liberty_of(Board::loc_from_index(adj_i), large_head)
                 {
                     self.chain_data[large_head.index()].num_liberties += 1;
                 }
@@ -298,8 +308,8 @@ impl Board {
         self.position_hash ^= stone_hash(loc, player_color);
 
         self.change_surrounding_liberties(loc, opponent_player, -1);
-        for adj_i in Loc::adjacent_indices(i) {
-            let adj_loc = Loc::from_index(adj_i);
+        for adj_i in Board::adjacent_indices(i) {
+            let adj_loc = Board::loc_from_index(adj_i);
             //merge chains
             if (self.colors[adj_i] == player_color)
                 && (self.chain_head[adj_i] != self.chain_head[i])
@@ -334,17 +344,17 @@ impl Board {
         let i = loc.index();
         let player_color = Color::from(player);
         let opponent_color = Color::from(player.opponent());
-        for adj_i in Loc::adjacent_indices(i) {
+        for adj_i in Board::adjacent_indices(i) {
             let adj_color = self.colors[adj_i];
             if adj_color.is_empty() {
                 return false;
             }
             if adj_color == player_color {
-                if self.get_num_liberties(Loc::from_index(adj_i)) > 1 {
+                if self.get_num_liberties(Board::loc_from_index(adj_i)) > 1 {
                     return false;
                 }
             } else if adj_color == opponent_color {
-                if self.get_num_liberties(Loc::from_index(adj_i)) == 1 {
+                if self.get_num_liberties(Board::loc_from_index(adj_i)) == 1 {
                     return false;
                 }
             }
@@ -360,7 +370,7 @@ impl Board {
         let i = loc.index();
         let player_color = Color::from(player);
         let opponent_color = Color::from(player.opponent());
-        for adj_i in Loc::adjacent_indices(i) {
+        for adj_i in Board::adjacent_indices(i) {
             let adj_color = self.colors[adj_i];
             if adj_color.is_empty() {
                 return false;
@@ -369,11 +379,11 @@ impl Board {
                 if multi_stone_suicide_legal {
                     return false;
                 }
-                if self.get_num_liberties(Loc::from_index(adj_i)) > 1 {
+                if self.get_num_liberties(Board::loc_from_index(adj_i)) > 1 {
                     return false;
                 }
             } else if adj_color == opponent_color {
-                if self.get_num_liberties(Loc::from_index(adj_i)) == 1 {
+                if self.get_num_liberties(Board::loc_from_index(adj_i)) == 1 {
                     return false;
                 }
             }
@@ -436,7 +446,7 @@ impl Board {
             let current = queue[queue_head];
             queue_head += 1;
 
-            for adj_i in Loc::adjacent_indices(current.index()) {
+            for adj_i in Board::adjacent_indices(current.index()) {
                 if self.colors[adj_i] == Color::Empty && !counted[adj_i] {
                     *count += 1;
                     counted[adj_i] = true;
@@ -444,7 +454,7 @@ impl Board {
                         return true;
                     }
 
-                    queue[queue_tail] = Loc::from_index(adj_i);
+                    queue[queue_tail] = Board::loc_from_index(adj_i);
                     queue_tail += 1;
                 }
             }
@@ -456,7 +466,7 @@ impl Board {
         if loc == Loc::NULL || loc == Loc::PASS {
             return true;
         }
-        debug_assert!(loc.is_on_board());
+        debug_assert!(self.is_on_board(loc));
 
         let mut count = 0;
         let loc_color = self.colors[loc.index()];
@@ -478,10 +488,10 @@ impl Board {
             !self.empty_region_pushes_count_over_bound(loc, &mut counted, &mut count, bound)
         } else {
             for chain_loc in self.chain_iter(loc) {
-                for adj_i in Loc::adjacent_indices(chain_loc.index()) {
+                for adj_i in Board::adjacent_indices(chain_loc.index()) {
                     if self.colors[adj_i] == Color::Empty
                         && self.empty_region_pushes_count_over_bound(
-                            Loc::from_index(adj_i),
+                            Board::loc_from_index(adj_i),
                             &mut counted,
                             &mut count,
                             bound,
@@ -518,7 +528,7 @@ impl Board {
         let mut suicide_len = 0;
 
         let mut suicide = true;
-        for adj_i in Loc::adjacent_indices(i) {
+        for adj_i in Board::adjacent_indices(i) {
             let adj_color = self.colors[adj_i];
             if adj_color == Color::Empty {
                 suicide = false;

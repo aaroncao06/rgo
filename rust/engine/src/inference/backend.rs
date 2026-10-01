@@ -9,6 +9,7 @@ use super::inputs::NNInput;
 
 #[derive(Debug, Clone)]
 pub enum InferenceError {
+    UnsupportedBoardSize { board_size: usize },
     ExecutionFailed,
     MismatchedBatchOutput,
     RuntimeClosed,
@@ -75,7 +76,7 @@ mod tests {
 
     #[test]
     fn dummy_backend_populates_empty_outputs_and_records_batch_sizes() {
-        let game_state = GameState::new(Rules::TROMP_TAYLORISH);
+        let game_state = GameState::new(Rules::TROMP_TAYLORISH_9);
         let inputs: [NNInput; 3] = std::array::from_fn(|_| NNInput::encode(&game_state));
         let mut backend = DummyInferenceBackend::default();
         let mut outputs = Vec::new();

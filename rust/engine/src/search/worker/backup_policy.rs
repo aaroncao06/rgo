@@ -24,7 +24,12 @@ pub(super) struct ChildContribution {
 }
 
 impl<N: NodeStore> SearchWorker<N> {
-    pub(super) fn recompute_node_stats(&mut self, node: &mut SearchNode, player: Player) {
+    pub(super) fn recompute_node_stats(
+        &mut self,
+        node: &mut SearchNode,
+        player: Player,
+        board_size: usize,
+    ) {
         let contributions = &mut self.child_contributions;
         contributions.clear();
         let mut total_child_weight = 0.0;
@@ -84,6 +89,7 @@ impl<N: NodeStore> SearchWorker<N> {
             direct_white_score_mean_sq,
             self.recent_score_center,
             self.params,
+            board_size,
         );
 
         let mut white_win_sum = direct_white_win;

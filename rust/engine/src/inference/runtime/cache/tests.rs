@@ -9,7 +9,7 @@ fn test_output() -> Arc<NNOutput> {
 }
 
 fn test_processed_output() -> Arc<NNOutput> {
-    let game_state = GameState::new(Rules::TROMP_TAYLORISH);
+    let game_state = GameState::new(Rules::TROMP_TAYLORISH_9);
     let mut output = test_output();
     Arc::get_mut(&mut output)
         .unwrap()
@@ -18,23 +18,25 @@ fn test_processed_output() -> Arc<NNOutput> {
 }
 
 fn loc(x: usize, y: usize) -> Loc {
-    Loc::new(x, y).expect("test coordinates must be on the board")
+    crate::game::board::Board::new(9)
+        .loc(x, y)
+        .expect("test coordinates must be on the board")
 }
 
 #[test]
 fn evaluation_key_is_deterministic_and_changes_with_position_and_passes() {
-    let initial = GameState::new(Rules::TROMP_TAYLORISH);
-    let equivalent = GameState::new(Rules::TROMP_TAYLORISH);
+    let initial = GameState::new(Rules::TROMP_TAYLORISH_9);
+    let equivalent = GameState::new(Rules::TROMP_TAYLORISH_9);
     assert_eq!(
         EvaluationKey::new(&initial),
         EvaluationKey::new(&equivalent)
     );
 
-    let mut moved = GameState::new(Rules::TROMP_TAYLORISH);
+    let mut moved = GameState::new(Rules::TROMP_TAYLORISH_9);
     assert!(moved.play(loc(4, 4)));
     assert_ne!(EvaluationKey::new(&initial), EvaluationKey::new(&moved));
 
-    let mut passed_twice = GameState::new(Rules::TROMP_TAYLORISH);
+    let mut passed_twice = GameState::new(Rules::TROMP_TAYLORISH_9);
     assert!(passed_twice.play(Loc::PASS));
     assert!(passed_twice.play(Loc::PASS));
     assert_eq!(
@@ -50,12 +52,13 @@ fn evaluation_key_is_deterministic_and_changes_with_position_and_passes() {
 
 #[test]
 fn evaluation_key_changes_with_komi_and_suicide_rule() {
-    let baseline = GameState::new(Rules::TROMP_TAYLORISH);
+    let baseline = GameState::new(Rules::TROMP_TAYLORISH_9);
     let different_komi = GameState::new(Rules {
+        board_size: 9,
         komi: 6.5,
         multi_stone_suicide_legal: true,
     });
-    let different_suicide_rule = GameState::new(Rules::OGS_CHINESE);
+    let different_suicide_rule = GameState::new(Rules::OGS_CHINESE_9);
 
     assert_ne!(
         EvaluationKey::new(&baseline),
@@ -68,11 +71,29 @@ fn evaluation_key_changes_with_komi_and_suicide_rule() {
 }
 
 #[test]
+fn evaluation_identity_distinguishes_board_sizes_with_the_same_stones() {
+    let mut larger = GameState::new(Rules::default());
+    let mut smaller = GameState::new(Rules {
+        board_size: 5,
+        ..Rules::default()
+    });
+    let point = larger.board().loc(0, 0).unwrap();
+    assert_ne!(
+        larger.board().position_hash(),
+        smaller.board().position_hash()
+    );
+    assert_ne!(EvaluationKey::new(&larger), EvaluationKey::new(&smaller));
+    assert!(larger.play(point));
+    assert!(smaller.play(point));
+    assert_ne!(EvaluationKey::new(&larger), EvaluationKey::new(&smaller));
+}
+
+#[test]
 fn evaluation_key_includes_superko_history_for_the_same_position() {
     let recapture = loc(4, 4);
     let capture = loc(4, 5);
 
-    let mut with_repetition = GameState::new(Rules::TROMP_TAYLORISH);
+    let mut with_repetition = GameState::new(Rules::TROMP_TAYLORISH_9);
     for move_loc in [
         loc(4, 3),
         recapture,
@@ -87,7 +108,7 @@ fn evaluation_key_includes_superko_history_for_the_same_position() {
         assert!(with_repetition.play(move_loc));
     }
 
-    let mut without_repetition = GameState::new(Rules::TROMP_TAYLORISH);
+    let mut without_repetition = GameState::new(Rules::TROMP_TAYLORISH_9);
     for move_loc in [
         loc(4, 3),
         loc(4, 6),

@@ -2,7 +2,7 @@ use super::*;
 use crate::inference::policy::BOARD_POLICY_SIZE;
 
 fn loc(x: usize, y: usize) -> Loc {
-    Loc::new(x, y).unwrap()
+    crate::game::board::Board::new(9).loc(x, y).unwrap()
 }
 
 fn root_worker(
@@ -30,7 +30,7 @@ fn bonus(worker: &SearchWorker<FixedArenaNodeStore>, loc: Loc) -> f64 {
 #[test]
 fn ending_bonus_thresholds_perspectives_and_disabled_cases() {
     for player in [Player::Black, Player::White] {
-        let mut state = GameState::new(Rules::TROMP_TAYLORISH);
+        let mut state = GameState::new(Rules::TROMP_TAYLORISH_9);
         if player == Player::White {
             assert!(state.play(Loc::PASS));
         }
@@ -60,7 +60,7 @@ fn ending_bonus_thresholds_perspectives_and_disabled_cases() {
     }
     let mut worker = worker();
     worker.search_graph.reset(
-        &GameState::new(Rules::TROMP_TAYLORISH),
+        &GameState::new(Rules::TROMP_TAYLORISH_9),
         processed_output([0.0; POLICY_SIZE], 0.0),
         0.0,
         16,
@@ -70,7 +70,7 @@ fn ending_bonus_thresholds_perspectives_and_disabled_cases() {
 
 #[test]
 fn ending_bonus_preserves_captures_cleanup_and_unsettled_connections() {
-    let mut state = GameState::new(Rules::TROMP_TAYLORISH);
+    let mut state = GameState::new(Rules::TROMP_TAYLORISH_9);
     assert!(state.play(loc(1, 0)));
     assert!(state.play(loc(0, 0)));
     let opponent_owned = root_worker(&state, [0.99; BOARD_POLICY_SIZE]);
@@ -79,7 +79,7 @@ fn ending_bonus_preserves_captures_cleanup_and_unsettled_connections() {
     let self_owned = root_worker(&state, [-0.99; BOARD_POLICY_SIZE]);
     assert_eq!(bonus(&self_owned, loc(0, 1)), 0.0); // Adjacent opponent cleanup.
 
-    let mut state = GameState::new(Rules::TROMP_TAYLORISH);
+    let mut state = GameState::new(Rules::TROMP_TAYLORISH_9);
     for point in [loc(3, 4), loc(5, 4)] {
         assert!(state.play(point));
         assert!(state.play(Loc::PASS));
@@ -97,7 +97,7 @@ fn ending_bonus_preserves_captures_cleanup_and_unsettled_connections() {
 
 #[test]
 fn active_simple_ko_disables_the_ending_bonus_for_all_moves() {
-    let mut state = GameState::new(Rules::TROMP_TAYLORISH);
+    let mut state = GameState::new(Rules::TROMP_TAYLORISH_9);
     for point in [
         loc(4, 3),
         loc(4, 4),
@@ -123,7 +123,7 @@ fn active_simple_ko_disables_the_ending_bonus_for_all_moves() {
 // Black has two eyes; White has a remote unsettled group and then passes four
 // times. Using real legal moves exercises history and pass-alive calculation.
 fn pass_alive_position() -> GameState {
-    let mut state = GameState::new(Rules::TROMP_TAYLORISH);
+    let mut state = GameState::new(Rules::TROMP_TAYLORISH_9);
     for (i, (x, y)) in [
         (3, 3),
         (4, 3),
@@ -179,7 +179,7 @@ fn root_pruning_filters_search_and_direct_policy_but_not_legality_or_interior() 
 
 #[test]
 fn ending_bonus_changes_root_selection_and_lcb_without_changing_graph_stats() {
-    let state = GameState::new(Rules::TROMP_TAYLORISH);
+    let state = GameState::new(Rules::TROMP_TAYLORISH_9);
     let bad = loc(3, 3);
     let good = loc(4, 4);
     let mut ownership = [0.0; BOARD_POLICY_SIZE];

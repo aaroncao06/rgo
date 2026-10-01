@@ -22,7 +22,7 @@ pub struct GameState {
 
 impl GameState {
     pub fn new(rules: Rules) -> Self {
-        let board = Board::new();
+        let board = Board::new(rules.board_size);
         let mut seen_position_hashes = HashSet::new();
         seen_position_hashes.insert(board.position_hash());
         let superko_banned = [false; ARRAY_LEN];
@@ -43,7 +43,7 @@ impl GameState {
 
     /// Starts a fresh game while retaining reusable history allocation.
     pub fn reset(&mut self, rules: Rules) {
-        self.board = Board::new();
+        self.board = Board::new(rules.board_size);
         self.rules = rules;
         self.next_player = Player::Black;
         self.turn_number = 0;
@@ -76,13 +76,13 @@ impl GameState {
     pub fn next_player(&self) -> Player {
         self.next_player
     }
-    /// Stones, player to move, current superko bans, and consecutive passes.
-    /// This common key component excludes rules, komi, and repetition history
+    /// Board size, stones, player to move, superko bans, and consecutive passes.
+    /// This common key component excludes komi, the suicide rule, and repetition history
     /// beyond the current ban mask. It is not a complete graph identity.
     pub fn current_state_hash(&self) -> Hash128 {
         let mut key = self.board.position_hash();
         key ^= player_hash(self.next_player);
-        for loc in Loc::board_iter() {
+        for loc in self.board.locs() {
             if self.is_superko_banned(loc) {
                 key ^= superko_hash(loc);
             }
@@ -105,12 +105,12 @@ impl GameState {
         self.passes_by_player[opponent_index] >= 4
     }
     pub(crate) fn is_superko_banned(&self, loc: Loc) -> bool {
-        debug_assert!(loc.is_on_board());
+        debug_assert!(self.board.is_on_board(loc));
         self.superko_banned[loc.index()]
     }
     fn rebuild_superko_banned(&mut self) {
         // Maintain separately from the legal mask.
-        for loc in Loc::board_iter() {
+        for loc in self.board.locs() {
             self.superko_banned[loc.index()] = self.board.is_legal_ignoring_ko(
                 loc,
                 self.next_player,
@@ -166,7 +166,7 @@ impl GameState {
             .board
             .calculate_area(self.rules.multi_stone_suicide_legal);
         let mut score = 0_i16;
-        for loc in Loc::board_iter() {
+        for loc in self.board.locs() {
             match area[loc.index()] {
                 Color::White => score += 1,
                 Color::Black => score -= 1,
@@ -193,13 +193,96 @@ mod tests {
 
     fn rules() -> Rules {
         Rules {
+            board_size: 9,
             komi: 7.5,
             multi_stone_suicide_legal: true,
         }
     }
 
     fn loc(x: usize, y: usize) -> Loc {
-        Loc::new(x, y).expect("test coordinates must be on the board")
+        crate::game::board::Board::new(9)
+            .loc(x, y)
+            .expect("test coordinates must be on the board")
+    }
+
+    #[test]
+    fn a_location_from_a_larger_board_is_rejected_without_changing_state() {
+        let mut state = GameState::new(Rules {
+            board_size: 5,
+            ..rules()
+        });
+        let outside = Board::new(9).loc(5, 0).unwrap();
+        let initial_hash = state.current_state_hash();
+        assert!(!state.board.is_on_board(outside));
+        assert_eq!(state.board.coords(outside), None);
+        assert_eq!(state.board.color_at(outside), Color::Wall);
+        assert!(!state.is_legal(outside));
+        assert!(!state.play(outside));
+        assert_eq!(state.current_state_hash(), initial_hash);
+        assert_eq!(state.turn_number(), 0);
+    }
+
+    #[test]
+    fn reset_and_reset_from_preserve_runtime_geometry_and_history() {
+        let mut state = GameState::new(rules());
+        let outside = state.board.loc(8, 8).unwrap();
+        assert!(state.play(outside));
+        let smaller_rules = Rules {
+            board_size: 3,
+            ..rules()
+        };
+        state.reset(smaller_rules);
+        assert_eq!(state.board.size(), 3);
+        assert_eq!(state.rules().board_size, 3);
+        assert!(!state.is_legal(outside));
+        assert_eq!(state.turn_number(), 0);
+        assert_eq!(state.seen_position_hashes.len(), 1);
+        let corner = state.board.loc(0, 0).unwrap();
+        assert!(state.play(corner));
+        assert!(state.play(Loc::PASS));
+
+        let mut scratch = GameState::new(rules());
+        scratch.reset_from(&state);
+        assert_eq!(scratch.board.size(), 3);
+        assert_eq!(scratch.rules().board_size, 3);
+        assert_eq!(scratch.current_state_hash(), state.current_state_hash());
+        assert_eq!(scratch.seen_position_hashes, state.seen_position_hashes);
+        assert!(!scratch.is_legal(outside));
+        assert!(scratch.play(Loc::PASS));
+        assert!(scratch.is_finished());
+        assert_eq!(
+            scratch.final_score_white_minus_black(),
+            -9.0 + smaller_rules.komi
+        );
+    }
+
+    #[test]
+    fn positional_superko_applies_on_a_smaller_board() {
+        let mut state = GameState::new(Rules {
+            board_size: 4,
+            ..rules()
+        });
+        for (x, y) in [
+            (1, 0),
+            (1, 1),
+            (0, 1),
+            (1, 3),
+            (2, 1),
+            (0, 2),
+            (3, 0),
+            (2, 2),
+            (1, 2),
+        ] {
+            let point = state.board.loc(x, y).unwrap();
+            assert!(state.play(point));
+        }
+        let recapture = state.board.loc(1, 1).unwrap();
+        assert!(
+            state
+                .board
+                .is_legal_ignoring_ko(recapture, Player::White, true)
+        );
+        assert!(!state.is_legal(recapture));
     }
 
     #[test]
@@ -218,7 +301,7 @@ mod tests {
         assert!(source.play(loc(4, 4)));
         assert!(source.play(Loc::PASS));
 
-        let mut scratch = GameState::new(Rules::OGS_CHINESE);
+        let mut scratch = GameState::new(Rules::OGS_CHINESE_9);
         assert!(scratch.play(loc(0, 0)));
         scratch.reset_from(&source);
 
@@ -240,7 +323,7 @@ mod tests {
 
     #[test]
     fn reset_starts_a_fresh_game_and_reuses_history_allocation() {
-        let mut state = GameState::new(Rules::OGS_CHINESE);
+        let mut state = GameState::new(Rules::OGS_CHINESE_9);
         assert!(state.play(loc(4, 4)));
         assert!(state.play(loc(3, 3)));
         assert!(state.play(Loc::PASS));
@@ -248,7 +331,10 @@ mod tests {
 
         state.reset(rules());
 
-        assert_eq!(state.board.position_hash(), Board::new().position_hash());
+        assert_eq!(
+            state.board.position_hash(),
+            Board::new(rules().board_size).position_hash()
+        );
         assert_eq!(state.rules.komi, rules().komi);
         assert_eq!(
             state.rules.multi_stone_suicide_legal,
@@ -460,7 +546,7 @@ mod tests {
             assert!(history.play(move_loc));
         }
 
-        for loc in Loc::board_iter() {
+        for loc in history.board.locs() {
             let locally_legal = history.board.is_legal_ignoring_ko(
                 loc,
                 history.next_player,

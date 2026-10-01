@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn chunk_encoding_has_a_versioned_header_and_fixed_size_records() {
         let sample = TrainingSample {
-            input: NNInput::encode(&GameState::new(Rules::TROMP_TAYLORISH)),
+            input: NNInput::encode(&GameState::new(Rules::TROMP_TAYLORISH_9)),
             policy_target: [0.25; POLICY_SIZE],
             value_target: ValueTarget {
                 win_probability: 0.75,
@@ -226,7 +226,7 @@ mod tests {
     #[test]
     fn chunk_checksum_rejects_corrupted_payload() {
         let sample = TrainingSample {
-            input: NNInput::encode(&GameState::new(Rules::TROMP_TAYLORISH)),
+            input: NNInput::encode(&GameState::new(Rules::TROMP_TAYLORISH_9)),
             policy_target: [0.25; POLICY_SIZE],
             value_target: ValueTarget {
                 win_probability: 0.75,
