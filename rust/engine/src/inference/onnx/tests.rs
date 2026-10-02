@@ -1,5 +1,6 @@
 use super::*;
-use crate::game::board::Player;
+use crate::game::board::{MAX_BOARD_POINTS, Player};
+use crate::inference::policy::MAX_POLICY_SIZE;
 
 fn backend() -> OnnxBackend {
     OnnxBackend::load(
@@ -13,7 +14,8 @@ fn backend() -> OnnxBackend {
 fn batches_raw_outputs_and_attaches_only_requested_ownership() {
     let inputs: Vec<_> = (0..3)
         .map(|i| NNInput {
-            spatial: [i as f32; NUM_SPATIAL_FEATURES * BOARD_POLICY_SIZE],
+            board_size: MAX_BOARD_SIZE,
+            spatial: [i as f32; NUM_SPATIAL_FEATURES * MAX_BOARD_POINTS],
             global: [i as f32, i as f32],
             include_ownership: i == 1,
         })
@@ -26,7 +28,7 @@ fn batches_raw_outputs_and_attaches_only_requested_ownership() {
         assert!(!output.is_processed());
         assert_eq!(output.has_ownership(), i == 1);
         let output = Arc::get_mut(output).unwrap();
-        output.process_in_place(Player::White, &[true; POLICY_SIZE]);
+        output.process_in_place(Player::White, &[true; MAX_POLICY_SIZE], MAX_BOARD_SIZE);
         assert!((output.white_score_mean() - i as f32 * 20.0).abs() < 1e-6);
         if let Some(ownership) = output.white_ownership() {
             assert!((ownership[0] - (i as f32).tanh()).abs() < 1e-6);
@@ -39,6 +41,55 @@ fn batches_raw_outputs_and_attaches_only_requested_ownership() {
     assert!(!outputs[0].has_ownership());
 }
 
+#[test]
+fn smaller_boards_pack_inputs_expand_policy_and_keep_ownership_compact() {
+    use crate::game::{game_state::GameState, rules::Rules};
+    let mut backend = backend();
+    let mut outputs = Vec::new();
+    // Change shape repeatedly on the same loaded model and reusable buffers.
+    for board_size in [9, 3, 5, 1, 9] {
+        let state = GameState::new(Rules {
+            board_size,
+            ..Rules::default()
+        });
+        let mut input = NNInput::encode(&state);
+        input.include_ownership = true;
+        // Padding must never enter the model, even if its storage is nonzero.
+        input.spatial.fill(1000.0);
+        for y in 0..board_size {
+            for x in 0..board_size {
+                input.spatial[x + y * MAX_BOARD_SIZE] = (x + y * board_size) as f32 / 100.0;
+            }
+        }
+        outputs.clear();
+        backend.evaluate_batch(&[input], &mut outputs).unwrap();
+        assert_eq!(
+            backend.spatial.len(),
+            NUM_SPATIAL_FEATURES * board_size * board_size
+        );
+        let output = Arc::get_mut(&mut outputs[0]).unwrap();
+        let legal = crate::inference::policy::legal_mask(&state);
+        output.process_in_place(Player::White, &legal, board_size);
+        let policy = output.policy_probs();
+        assert_eq!(policy.len(), board_size * board_size + 1);
+        let ownership = output.white_ownership().unwrap();
+        assert_eq!(ownership.len(), board_size * board_size);
+        for y in 0..board_size {
+            for x in 0..board_size {
+                let i = x + y * board_size;
+                let logit = (x + y * board_size) as f32 / 100.0;
+                if legal[i] {
+                    assert!(
+                        (policy[i] / policy[board_size * board_size] - logit.exp()).abs() < 1e-5
+                    );
+                }
+                assert!((ownership[x + y * board_size] - logit.tanh()).abs() < 1e-6);
+            }
+        }
+        assert!((policy.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+    }
+}
+
 #[cfg(debug_assertions)]
 #[test]
 fn debug_checks_reject_nonfinite_model_outputs() {
@@ -47,8 +98,9 @@ fn debug_checks_reject_nonfinite_model_outputs() {
     for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
         for invalid_policy in [true, false] {
             let input = NNInput {
+                board_size: MAX_BOARD_SIZE,
                 spatial: [if invalid_policy { invalid } else { 0.0 };
-                    NUM_SPATIAL_FEATURES * BOARD_POLICY_SIZE],
+                    NUM_SPATIAL_FEATURES * MAX_BOARD_POINTS],
                 global: [if invalid_policy { 0.0 } else { invalid }; NUM_GLOBAL_FEATURES],
                 include_ownership: true,
             };
@@ -74,6 +126,24 @@ fn rejects_incompatible_contract_metadata() {
 fn rejects_incompatible_input_shape() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/wrong_shape.onnx");
     assert!(OnnxBackend::load(&path, InferenceDevice::Cpu { intra_threads: 1 }).is_err());
+}
+
+#[test]
+fn rejects_runtime_output_shapes_that_omit_pass() {
+    use crate::game::{game_state::GameState, rules::Rules};
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/wrong_output.onnx");
+    let mut backend = OnnxBackend::load(&path, InferenceDevice::Cpu { intra_threads: 1 }).unwrap();
+    let input = NNInput::encode(&GameState::new(Rules {
+        board_size: 5,
+        ..Rules::default()
+    }));
+    let mut outputs = Vec::new();
+    let error = backend.evaluate_batch(&[input], &mut outputs).unwrap_err();
+    let InferenceError::Onnx(error) = error else {
+        panic!("expected shape error")
+    };
+    assert!(error.to_string().contains("invalid shape in policy_logits"));
+    assert!(outputs.is_empty());
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -107,6 +177,7 @@ fn invalid_device_settings_return_errors_before_loading() {
 fn preserves_policy_order_including_pass() {
     let mut backend = backend();
     let input = NNInput {
+        board_size: MAX_BOARD_SIZE,
         spatial: std::array::from_fn(|i| i as f32 / 100.0),
         global: [0.0; NUM_GLOBAL_FEATURES],
         include_ownership: false,
@@ -114,9 +185,13 @@ fn preserves_policy_order_including_pass() {
     let mut outputs = Vec::new();
     backend.evaluate_batch(&[input], &mut outputs).unwrap();
     let output = Arc::get_mut(&mut outputs[0]).unwrap();
-    output.process_in_place(Player::White, &[true; POLICY_SIZE]);
+    output.process_in_place(Player::White, &[true; MAX_POLICY_SIZE], MAX_BOARD_SIZE);
     let probabilities = output.policy_probs();
-    for i in 0..POLICY_SIZE {
+    for i in 0..MAX_BOARD_POINTS {
         assert!((probabilities[i] / probabilities[0] - (i as f32 / 100.0).exp()).abs() < 1e-5);
     }
+    assert_eq!(
+        probabilities[MAX_BOARD_SIZE * MAX_BOARD_SIZE],
+        probabilities[0]
+    );
 }

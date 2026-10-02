@@ -1,19 +1,26 @@
 use super::*;
 use crate::{
     game::{board::Loc, rules::Rules},
-    inference::policy::{POLICY_SIZE, legal_mask},
+    inference::policy::{MAX_POLICY_SIZE, legal_mask},
 };
 
 fn test_output() -> Arc<NNOutput> {
-    Arc::new(NNOutput::from_raw([0.0; POLICY_SIZE], 0.0, 0.0, 0.0))
+    Arc::new(NNOutput::from_raw(
+        [0.0; MAX_POLICY_SIZE].into(),
+        0.0,
+        0.0,
+        0.0,
+    ))
 }
 
 fn test_processed_output() -> Arc<NNOutput> {
     let game_state = GameState::new(Rules::TROMP_TAYLORISH_9);
     let mut output = test_output();
-    Arc::get_mut(&mut output)
-        .unwrap()
-        .process_in_place(game_state.next_player(), &legal_mask(&game_state));
+    Arc::get_mut(&mut output).unwrap().process_in_place(
+        game_state.next_player(),
+        &legal_mask(&game_state),
+        game_state.board().size(),
+    );
     output
 }
 

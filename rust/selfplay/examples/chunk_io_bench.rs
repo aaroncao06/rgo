@@ -14,7 +14,7 @@ pub use rgo_engine::{game, inference};
 mod training_data;
 
 use game::{game_state::GameState, rules::Rules};
-use inference::{inputs::NNInput, policy::POLICY_SIZE};
+use inference::{inputs::NNInput, policy::MAX_POLICY_SIZE};
 use rgo_artifacts::chunk_path;
 use serde_json::json;
 use tokio::{
@@ -33,12 +33,12 @@ impl Drop for Scratch {
 fn mock_chunk(records: usize) -> Vec<u8> {
     let mut sample = TrainingSample {
         input: NNInput::encode(&GameState::new(Rules::TROMP_TAYLORISH_9)),
-        policy_target: [1.0 / POLICY_SIZE as f32; POLICY_SIZE],
+        policy_target: [1.0 / MAX_POLICY_SIZE as f32; MAX_POLICY_SIZE],
         value_target: ValueTarget {
             win_probability: 0.5,
             score_mean: 0.0,
             score_stdev: 1.0,
-            ownership: [1; inference::policy::BOARD_POLICY_SIZE],
+            ownership: [1; game::board::MAX_BOARD_POINTS],
         },
     };
     let mut encoder = ChunkEncoder::new(records);

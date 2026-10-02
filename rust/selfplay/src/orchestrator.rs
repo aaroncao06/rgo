@@ -465,7 +465,6 @@ mod tests {
             backend::{InferenceBackend, InferenceError},
             inputs::NNInput,
             outputs::NNOutput,
-            policy::{PASS_POLICY_INDEX, POLICY_SIZE},
             runtime::{start_test_runtime, test_backend_factory},
         },
         search::{params::SearchParams, worker::SearchBudget},
@@ -518,12 +517,14 @@ mod tests {
             outputs: &mut Vec<Arc<NNOutput>>,
         ) -> Result<(), InferenceError> {
             for input in inputs {
-                let mut logits = [-100.0; POLICY_SIZE];
-                logits[PASS_POLICY_INDEX] = 100.0;
+                let points = input.board_size * input.board_size;
+                let mut logits = vec![-100.0; points + 1].into_boxed_slice();
+                logits[points] = 100.0;
                 let mut output = NNOutput::from_raw(logits, 0.0, 0.0, 0.0);
                 if input.include_ownership {
-                    output = output
-                        .with_ownership_logits([0.0; crate::inference::policy::BOARD_POLICY_SIZE]);
+                    output = output.with_ownership_logits(
+                        vec![0.0; input.board_size * input.board_size].into_boxed_slice(),
+                    );
                 }
                 outputs.push(Arc::new(output));
             }

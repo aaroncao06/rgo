@@ -1,5 +1,4 @@
 use crate::game::board::Player;
-use crate::inference::policy::{BOARD_POLICY_SIZE, POLICY_SIZE};
 use crate::inference::symmetry::Symmetry;
 
 const SCORE_MULTIPLIER: f32 = 20.0;
@@ -8,31 +7,32 @@ const SCORE_MULTIPLIER: f32 = 20.0;
 // all nn outputs that we train, some not used during mcts
 #[allow(dead_code)]
 struct RawNNOutputs {
-    policy_logits: [f32; POLICY_SIZE],
+    policy_logits: Box<[f32]>,
     win_logit: f32,
     raw_score_mean: f32,
     raw_score_stdev_logit: f32,
-    soft_policy_logits: [f32; POLICY_SIZE],
-    opponent_policy_logits: [f32; POLICY_SIZE],
-    soft_opponent_policy_logits: [f32; POLICY_SIZE],
-    ownership_logits: [f32; BOARD_POLICY_SIZE],
+    soft_policy_logits: Box<[f32]>,
+    opponent_policy_logits: Box<[f32]>,
+    soft_opponent_policy_logits: Box<[f32]>,
+    ownership_logits: Box<[f32]>,
 }
 
 #[derive(Clone)]
 pub struct NNOutput {
-    policy: [f32; POLICY_SIZE], // logits -> probs
-    win: f32,                   // logit -> white prob
-    score_mean: f32,            // score mean -> white score mean
-    score_aux: f32,             // stdev logit -> white score mean sq
-    processed: bool,            //just to be safe now that we are modifying in place
+    policy: Box<[f32]>, // Active row-major points, then pass; logits -> probs.
+    win: f32,           // logit -> white prob
+    score_mean: f32,    // score mean -> white score mean
+    score_aux: f32,     // stdev logit -> white score mean sq
+    processed: bool,    //just to be safe now that we are modifying in place
     // Optional logits -> signed white ownership; no inline map on ordinary evaluations.
-    ownership: Option<Box<[f32; BOARD_POLICY_SIZE]>>,
+    ownership: Option<Box<[f32]>>,
 }
 
-fn masked_softmax_in_place(policy: &mut [f32; POLICY_SIZE], legal_mask: &[bool; POLICY_SIZE]) {
+fn masked_softmax_in_place(policy: &mut [f32], legal_mask: &[bool]) {
+    debug_assert_eq!(policy.len(), legal_mask.len());
     let mut max_logit = f32::NEG_INFINITY;
     let mut legal_count = 0_usize;
-    for i in 0..POLICY_SIZE {
+    for i in 0..policy.len() {
         if legal_mask[i] {
             debug_assert!(policy[i].is_finite(), "policy logits must be finite");
             legal_count += 1;
@@ -41,7 +41,7 @@ fn masked_softmax_in_place(policy: &mut [f32; POLICY_SIZE], legal_mask: &[bool; 
     }
     debug_assert!(legal_count > 0, "position has no legal moves");
     let mut sum = 0_f32;
-    for i in 0..POLICY_SIZE {
+    for i in 0..policy.len() {
         if legal_mask[i] {
             let weight = (policy[i] - max_logit).exp();
             policy[i] = weight;
@@ -55,7 +55,7 @@ fn masked_softmax_in_place(policy: &mut [f32; POLICY_SIZE], legal_mask: &[bool; 
         "invalid policy normalization"
     );
     let inv_sum = 1_f32 / sum;
-    for i in 0..POLICY_SIZE {
+    for i in 0..policy.len() {
         if legal_mask[i] {
             policy[i] *= inv_sum;
         }
@@ -91,7 +91,7 @@ fn score_mean_sq(mean: f32, stdev: f32) -> f32 {
 }
 impl NNOutput {
     pub fn from_raw(
-        policy_logits: [f32; POLICY_SIZE],
+        policy_logits: Box<[f32]>,
         win_logit: f32,
         raw_score_mean: f32,
         raw_score_stdev_logit: f32,
@@ -112,40 +112,42 @@ impl NNOutput {
             ownership: None,
         }
     }
-    pub fn with_ownership_logits(mut self, logits: [f32; BOARD_POLICY_SIZE]) -> Self {
+    pub fn with_ownership_logits(mut self, logits: Box<[f32]>) -> Self {
         debug_assert!(!self.processed);
         debug_assert!(
             logits.iter().all(|v| v.is_finite()),
             "nonfinite ownership output"
         );
-        self.ownership = Some(Box::new(logits));
+        self.ownership = Some(logits);
         self
     }
-    pub(super) fn restore_symmetry_in_place(&mut self, symmetry: Symmetry) {
+    pub(super) fn restore_symmetry_in_place(&mut self, symmetry: Symmetry, board_size: usize) {
         debug_assert!(!self.processed);
-        let spatial_policy = self
-            .policy
-            .first_chunk_mut::<BOARD_POLICY_SIZE>()
-            .expect("policy contains a full board plane");
-        symmetry.restore_output(spatial_policy);
+        debug_assert_eq!(self.policy.len(), board_size * board_size + 1);
+        let spatial_policy = &mut self.policy[..board_size * board_size];
+        symmetry.restore_output(spatial_policy, board_size, board_size);
         if let Some(ownership) = self.ownership.as_mut() {
-            symmetry.restore_output(ownership);
+            symmetry.restore_output(ownership, board_size, board_size);
         }
     }
     pub fn has_ownership(&self) -> bool {
         self.ownership.is_some()
     }
-    pub fn white_ownership(&self) -> Option<&[f32; BOARD_POLICY_SIZE]> {
+    /// Exact-size, row-major ownership plane: index with the active board stride.
+    pub fn white_ownership(&self) -> Option<&[f32]> {
         debug_assert!(self.processed);
         self.ownership.as_deref()
     }
     pub(crate) fn process_in_place(
         &mut self,
         next_player: Player,
-        legal_mask: &[bool; POLICY_SIZE],
+        legal_mask: &[bool],
+        board_size: usize,
     ) {
         debug_assert!(!self.processed, "NN output processed twice");
 
+        debug_assert_eq!(self.policy.len(), board_size * board_size + 1);
+        let legal_mask = &legal_mask[..self.policy.len()];
         masked_softmax_in_place(&mut self.policy, legal_mask);
 
         let current_win_prob = sigmoid(self.win);
@@ -155,7 +157,7 @@ impl NNOutput {
         self.win = win_prob_to_white(current_win_prob, next_player);
         self.score_mean = signed_value_to_white(score_mean, next_player);
         self.score_aux = score_mean_sq(score_mean, score_stdev);
-        self.process_ownership_in_place(next_player);
+        self.process_ownership_in_place(next_player, board_size);
         self.processed = true;
     }
 
@@ -165,30 +167,33 @@ impl NNOutput {
         &mut self,
         next_player: Player,
         cached: &Self,
+        board_size: usize,
     ) {
         debug_assert!(!self.processed && cached.processed);
         debug_assert!(self.has_ownership() && !cached.has_ownership());
-        self.policy = cached.policy;
+        debug_assert_eq!(self.policy.len(), board_size * board_size + 1);
+        self.policy.copy_from_slice(&cached.policy);
         self.win = cached.win;
         self.score_mean = cached.score_mean;
         self.score_aux = cached.score_aux;
-        self.process_ownership_in_place(next_player);
+        self.process_ownership_in_place(next_player, board_size);
         self.processed = true;
     }
 
-    fn process_ownership_in_place(&mut self, next_player: Player) {
+    fn process_ownership_in_place(&mut self, next_player: Player, board_size: usize) {
         if let Some(ownership) = self.ownership.as_mut() {
+            debug_assert_eq!(ownership.len(), board_size * board_size);
             for value in ownership.iter_mut() {
                 *value = signed_value_to_white(value.tanh(), next_player);
             }
         }
     }
-    pub fn policy_probs(&self) -> &[f32; POLICY_SIZE] {
+    pub fn policy_probs(&self) -> &[f32] {
         debug_assert!(self.processed);
         &self.policy
     }
 
-    pub(crate) fn policy_probs_mut(&mut self) -> &mut [f32; POLICY_SIZE] {
+    pub(crate) fn policy_probs_mut(&mut self) -> &mut [f32] {
         debug_assert!(self.processed);
         &mut self.policy
     }
@@ -216,20 +221,70 @@ impl NNOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        game::board::{MAX_BOARD_POINTS, MAX_BOARD_SIZE},
+        inference::policy::MAX_POLICY_SIZE,
+    };
+
+    #[test]
+    fn compact_policy_restores_every_symmetry_and_preserves_pass_and_allocations() {
+        for size in 1..=MAX_BOARD_SIZE {
+            let points = size * size;
+            let canonical: Vec<_> = (0..points).map(|i| i as f32 + 0.25).collect();
+            for symmetry in Symmetry::ALL {
+                let mut logits = vec![0.0; points + 1].into_boxed_slice();
+                for y in 0..size {
+                    for x in 0..size {
+                        let end = size - 1;
+                        let (tx, ty) = match symmetry {
+                            Symmetry::Identity => (x, y),
+                            Symmetry::FlipY => (x, end - y),
+                            Symmetry::FlipX => (end - x, y),
+                            Symmetry::FlipXY => (end - x, end - y),
+                            Symmetry::Transpose => (y, x),
+                            Symmetry::TransposeFlipY => (end - y, x),
+                            Symmetry::TransposeFlipX => (y, end - x),
+                            Symmetry::TransposeFlipXY => (end - y, end - x),
+                        };
+                        logits[tx + ty * size] = canonical[x + y * size];
+                    }
+                }
+                logits[points] = 1234.0;
+                let ownership = logits[..points].into();
+                let mut output =
+                    NNOutput::from_raw(logits, 0.0, 0.0, 0.0).with_ownership_logits(ownership);
+                let policy_address = output.policy.as_ptr();
+                let ownership_address = output.ownership.as_ref().unwrap().as_ptr();
+                output.restore_symmetry_in_place(symmetry, size);
+                assert_eq!(
+                    &output.policy[..points],
+                    canonical,
+                    "size={size}, {symmetry:?}"
+                );
+                assert_eq!(output.policy[points], 1234.0);
+                assert_eq!(output.policy.as_ptr(), policy_address);
+                assert_eq!(&**output.ownership.as_ref().unwrap(), canonical);
+                assert_eq!(
+                    output.ownership.as_ref().unwrap().as_ptr(),
+                    ownership_address
+                );
+            }
+        }
+    }
 
     #[test]
     fn ownership_upgrade_reuses_fresh_map_and_preserves_processed_predictions() {
         for player in [Player::Black, Player::White] {
-            let mut logits = [0.0; POLICY_SIZE];
+            let mut logits = [0.0; MAX_POLICY_SIZE];
             logits[1] = 2.0;
-            let mut legal = [true; POLICY_SIZE];
+            let mut legal = [true; MAX_POLICY_SIZE];
             legal[0] = false;
-            let mut cached = NNOutput::from_raw(logits, 1.0, 2.0, -1.0);
-            cached.process_in_place(player, &legal);
-            let mut fresh = NNOutput::from_raw([5.0; POLICY_SIZE], -2.0, -3.0, 2.0)
-                .with_ownership_logits([1.0; BOARD_POLICY_SIZE]);
+            let mut cached = NNOutput::from_raw(logits.into(), 1.0, 2.0, -1.0);
+            cached.process_in_place(player, &legal, MAX_BOARD_SIZE);
+            let mut fresh = NNOutput::from_raw([5.0; MAX_POLICY_SIZE].into(), -2.0, -3.0, 2.0)
+                .with_ownership_logits([1.0; MAX_BOARD_POINTS].into());
             let map_address = fresh.ownership.as_ref().unwrap().as_ptr();
-            fresh.process_with_cached_values_in_place(player, &cached);
+            fresh.process_with_cached_values_in_place(player, &cached, MAX_BOARD_SIZE);
             assert_eq!(fresh.white_ownership().unwrap().as_ptr(), map_address);
             assert_eq!(fresh.policy_probs(), cached.policy_probs());
             assert_eq!(fresh.policy_probs()[0], 0.0);
@@ -249,11 +304,62 @@ mod tests {
     }
 
     #[test]
+    fn ownership_processing_and_cache_upgrades_use_exact_size_maps() {
+        use crate::{
+            game::{game_state::GameState, rules::Rules},
+            inference::policy::legal_mask,
+        };
+        for board_size in 1..=MAX_BOARD_SIZE {
+            let state = GameState::new(Rules {
+                board_size,
+                ..Rules::default()
+            });
+            let mut legal = legal_mask(&state);
+            legal[0] = false; // Ownership still applies to occupied/illegal active points.
+            for player in [Player::Black, Player::White] {
+                let mut cached = NNOutput::from_raw(
+                    vec![0.0; board_size * board_size + 1].into_boxed_slice(),
+                    1.0,
+                    2.0,
+                    -1.0,
+                );
+                cached.process_in_place(player, &legal, board_size);
+                for upgrade in [false, true] {
+                    let mut output = NNOutput::from_raw(
+                        vec![0.0; board_size * board_size + 1].into_boxed_slice(),
+                        1.0,
+                        2.0,
+                        -1.0,
+                    )
+                    .with_ownership_logits(vec![2.0; board_size * board_size].into_boxed_slice());
+                    let address = output.ownership.as_ref().unwrap().as_ptr();
+                    let policy_address = output.policy.as_ptr();
+                    if upgrade {
+                        output.process_with_cached_values_in_place(player, &cached, board_size);
+                    } else {
+                        output.process_in_place(player, &legal, board_size);
+                    }
+                    assert_eq!(output.policy_probs(), cached.policy_probs());
+                    assert_eq!(output.policy_probs().as_ptr(), policy_address);
+                    assert_eq!(output.policy_probs().len(), board_size * board_size + 1);
+                    assert_eq!(output.policy_probs()[0], 0.0);
+                    assert!((output.policy_probs().iter().sum::<f32>() - 1.0).abs() < 1e-6);
+                    let ownership = output.white_ownership().unwrap();
+                    assert_eq!(ownership.as_ptr(), address);
+                    assert_eq!(ownership.len(), board_size * board_size);
+                    let expected = signed_value_to_white(2.0_f32.tanh(), player);
+                    assert!(ownership.iter().all(|&value| value == expected));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn ownership_is_optional_and_converted_from_logits_to_white() {
         for player in [Player::Black, Player::White] {
-            let mut output = NNOutput::from_raw([0.0; POLICY_SIZE], 0.0, 0.0, 0.0)
-                .with_ownership_logits([1.0; BOARD_POLICY_SIZE]);
-            output.process_in_place(player, &[true; POLICY_SIZE]);
+            let mut output = NNOutput::from_raw([0.0; MAX_POLICY_SIZE].into(), 0.0, 0.0, 0.0)
+                .with_ownership_logits([1.0; MAX_BOARD_POINTS].into());
+            output.process_in_place(player, &[true; MAX_POLICY_SIZE], MAX_BOARD_SIZE);
             let expected = if player == Player::White {
                 1.0_f32.tanh()
             } else {
@@ -271,8 +377,8 @@ mod tests {
             assert_eq!(cloned.white_ownership(), output.white_ownership());
             assert_ne!(cloned.policy_probs()[0], output.policy_probs()[0]);
         }
-        let mut output = NNOutput::from_raw([0.0; POLICY_SIZE], 0.0, 0.0, 0.0);
-        output.process_in_place(Player::Black, &[true; POLICY_SIZE]);
+        let mut output = NNOutput::from_raw([0.0; MAX_POLICY_SIZE].into(), 0.0, 0.0, 0.0);
+        output.process_in_place(Player::Black, &[true; MAX_POLICY_SIZE], MAX_BOARD_SIZE);
         assert!(output.white_ownership().is_none());
     }
 
@@ -285,29 +391,29 @@ mod tests {
     }
 
     fn process(
-        policy_logits: [f32; POLICY_SIZE],
+        policy_logits: [f32; MAX_POLICY_SIZE],
         win_logit: f32,
         raw_score_mean: f32,
         raw_score_stdev_logit: f32,
         next_player: Player,
-        legal_mask: &[bool; POLICY_SIZE],
+        legal_mask: &[bool; MAX_POLICY_SIZE],
     ) -> NNOutput {
         let mut output = NNOutput::from_raw(
-            policy_logits,
+            policy_logits.into(),
             win_logit,
             raw_score_mean,
             raw_score_stdev_logit,
         );
         assert!(!output.is_processed());
-        output.process_in_place(next_player, legal_mask);
+        output.process_in_place(next_player, legal_mask, MAX_BOARD_SIZE);
         assert!(output.is_processed());
         output
     }
 
     #[test]
     fn masked_softmax_zeros_illegal_moves_and_normalizes_legal_moves() {
-        let policy_logits = [0.0; POLICY_SIZE];
-        let mut legal_mask = [false; POLICY_SIZE];
+        let policy_logits = [0.0; MAX_POLICY_SIZE];
+        let mut legal_mask = [false; MAX_POLICY_SIZE];
         legal_mask[3] = true;
         legal_mask[17] = true;
 
@@ -322,10 +428,10 @@ mod tests {
 
     #[test]
     fn masked_softmax_is_stable_for_extreme_logits() {
-        let mut policy_logits = [0.0; POLICY_SIZE];
+        let mut policy_logits = [0.0; MAX_POLICY_SIZE];
         policy_logits[4] = 1_000.0;
         policy_logits[9] = -1_000.0;
-        let mut legal_mask = [false; POLICY_SIZE];
+        let mut legal_mask = [false; MAX_POLICY_SIZE];
         legal_mask[4] = true;
         legal_mask[9] = true;
 
@@ -344,8 +450,8 @@ mod tests {
 
     #[test]
     fn processing_scales_scores_and_converts_perspective() {
-        let policy_logits = [0.0; POLICY_SIZE];
-        let mut legal_mask = [false; POLICY_SIZE];
+        let policy_logits = [0.0; MAX_POLICY_SIZE];
+        let mut legal_mask = [false; MAX_POLICY_SIZE];
         legal_mask[0] = true;
         let win_logit = 3.0_f32.ln();
         let raw_score_mean = 0.5;
@@ -385,6 +491,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "nonfinite value output")]
     fn raw_outputs_reject_nonfinite_scalar_values() {
-        let _ = NNOutput::from_raw([0.0; POLICY_SIZE], f32::NAN, 0.0, 0.0);
+        let _ = NNOutput::from_raw([0.0; MAX_POLICY_SIZE].into(), f32::NAN, 0.0, 0.0);
     }
 }

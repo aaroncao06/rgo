@@ -1,17 +1,21 @@
+use crate::game::board::MAX_BOARD_POINTS;
 use crate::inference::{
     inputs::{NNInput, NUM_GLOBAL_FEATURES, NUM_SPATIAL_FEATURES},
-    policy::{BOARD_POLICY_SIZE, POLICY_SIZE},
+    policy::{MAX_POLICY_SIZE, active_rows},
 };
 use sha2::{Digest, Sha256};
 
 pub(super) const CHUNK_MAGIC: [u8; 8] = *b"RGOCHNK\0";
 pub(super) const CHUNK_FORMAT_VERSION: u32 = 1;
-pub(super) const CHUNK_HEADER_SIZE: usize = 8 + 7 * size_of::<u32>();
+pub(super) const CHUNK_HEADER_SIZE: usize = 8 + 4 * size_of::<u32>();
 pub(super) const CHUNK_CHECKSUM_SIZE: usize = 32;
-pub(super) const TRAINING_RECORD_SIZE: usize =
-    (NUM_SPATIAL_FEATURES * BOARD_POLICY_SIZE + NUM_GLOBAL_FEATURES + POLICY_SIZE + 3)
-        * size_of::<f32>()
-        + BOARD_POLICY_SIZE;
+/// Each record starts with its board size, followed by compact active arrays.
+pub(super) fn training_record_size(board_size: usize) -> usize {
+    let points = board_size * board_size;
+    size_of::<u32>()
+        + (NUM_SPATIAL_FEATURES * points + NUM_GLOBAL_FEATURES + points + 1 + 3) * size_of::<f32>()
+        + points
+}
 
 #[derive(Debug, PartialEq)]
 pub(super) struct ValueTarget {
@@ -19,14 +23,14 @@ pub(super) struct ValueTarget {
     pub(super) score_mean: f32,
     pub(super) score_stdev: f32,
     /// 0 = opponent, 1 = neutral, 2 = current player.
-    pub(super) ownership: [u8; BOARD_POLICY_SIZE],
+    pub(super) ownership: [u8; MAX_BOARD_POINTS],
 }
 
-// Eventually this will become a packed representation for network transfer.
-// Record finalization is already the allocation boundary where packing belongs.
+// In-memory arrays retain capacity. Policy uses an active prefix including pass;
+// spatial inputs and ownership retain the maximum row stride.
 pub(super) struct TrainingSample {
     pub(super) input: NNInput,
-    pub(super) policy_target: [f32; POLICY_SIZE],
+    pub(super) policy_target: [f32; MAX_POLICY_SIZE],
     pub(super) value_target: ValueTarget,
 }
 
@@ -56,7 +60,7 @@ impl ChunkEncoder {
         assert!(record_capacity > 0, "training chunks must be nonempty");
         let header = chunk_header(record_capacity);
         bytes.clear();
-        bytes.reserve(encoded_chunk_size(record_capacity));
+        bytes.reserve(CHUNK_HEADER_SIZE + CHUNK_CHECKSUM_SIZE);
         bytes.extend_from_slice(&header);
         let mut checksum = Sha256::new();
         checksum.update(header);
@@ -82,13 +86,23 @@ impl ChunkEncoder {
             "training chunk capacity exceeded"
         );
         let record_start = self.bytes.len();
+        let board_size = sample.input.board_size;
+        self.bytes
+            .reserve(training_record_size(board_size) + CHUNK_CHECKSUM_SIZE);
         debug_assert!(
             !sample.input.include_ownership,
             "ownership requests are inference metadata, not training input"
         );
-        extend_f32s(&mut self.bytes, &sample.input.spatial);
+        self.bytes
+            .extend_from_slice(&(board_size as u32).to_le_bytes());
+        for row in sample.input.spatial_rows() {
+            extend_f32s(&mut self.bytes, row);
+        }
         extend_f32s(&mut self.bytes, &sample.input.global);
-        extend_f32s(&mut self.bytes, &sample.policy_target);
+        extend_f32s(
+            &mut self.bytes,
+            &sample.policy_target[..board_size * board_size + 1],
+        );
         extend_f32s(
             &mut self.bytes,
             &[
@@ -97,17 +111,19 @@ impl ChunkEncoder {
                 sample.value_target.score_stdev,
             ],
         );
-        self.bytes.extend_from_slice(&sample.value_target.ownership);
+        for row in active_rows(&sample.value_target.ownership, board_size) {
+            self.bytes.extend_from_slice(row);
+        }
+        debug_assert_eq!(
+            self.bytes.len() - record_start,
+            training_record_size(board_size)
+        );
         self.checksum.update(&self.bytes[record_start..]);
         self.record_count += 1;
     }
 
     pub(super) fn finish(mut self) -> EncodedChunk {
         debug_assert!(self.record_count > 0, "cannot finish an empty chunk");
-        debug_assert_eq!(
-            self.bytes.len(),
-            CHUNK_HEADER_SIZE + self.record_count * TRAINING_RECORD_SIZE
-        );
 
         let checksum = if self.record_count == self.record_capacity {
             self.checksum.finalize()
@@ -155,11 +171,8 @@ fn chunk_header(record_count: usize) -> [u8; CHUNK_HEADER_SIZE] {
     let mut offset = CHUNK_MAGIC.len();
     for value in [
         CHUNK_FORMAT_VERSION,
-        TRAINING_RECORD_SIZE as u32,
-        record_count,
-        BOARD_POLICY_SIZE as u32,
-        POLICY_SIZE as u32,
         NUM_SPATIAL_FEATURES as u32,
+        record_count,
         NUM_GLOBAL_FEATURES as u32,
     ] {
         header[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
@@ -168,71 +181,120 @@ fn chunk_header(record_count: usize) -> [u8; CHUNK_HEADER_SIZE] {
     header
 }
 
-fn encoded_chunk_size(record_capacity: usize) -> usize {
-    CHUNK_HEADER_SIZE
-        .checked_add(
-            record_capacity
-                .checked_mul(TRAINING_RECORD_SIZE)
-                .expect("encoded chunk size overflow"),
-        )
-        .and_then(|size| size.checked_add(CHUNK_CHECKSUM_SIZE))
-        .expect("encoded chunk size overflow")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::game::{game_state::GameState, rules::Rules};
 
-    #[test]
-    fn chunk_encoding_has_a_versioned_header_and_fixed_size_records() {
-        let sample = TrainingSample {
-            input: NNInput::encode(&GameState::new(Rules::TROMP_TAYLORISH_9)),
-            policy_target: [0.25; POLICY_SIZE],
+    fn sample(board_size: usize) -> TrainingSample {
+        let mut input = NNInput::encode(&GameState::new(Rules {
+            board_size,
+            ..Rules::TROMP_TAYLORISH_9
+        }));
+        // Unique values across rows and planes catch accidental flat truncation.
+        input.spatial = std::array::from_fn(|i| i as f32);
+        TrainingSample {
+            input,
+            policy_target: std::array::from_fn(|i| i as f32 + 0.25),
             value_target: ValueTarget {
                 win_probability: 0.75,
                 score_mean: 3.5,
                 score_stdev: 1.25,
-                ownership: [2; BOARD_POLICY_SIZE],
+                ownership: std::array::from_fn(|i| (i % 3) as u8),
             },
-        };
+        }
+    }
 
-        let bytes = encode_chunk(&[sample]);
+    #[test]
+    fn chunk_encoding_stores_only_active_cells_and_pass_for_all_board_sizes() {
+        use crate::game::board::MAX_BOARD_SIZE;
+        for board_size in 1..=MAX_BOARD_SIZE {
+            let sample = sample(board_size);
+            let bytes = encode_chunk(&[sample]);
+            assert_eq!(&bytes[..8], &CHUNK_MAGIC);
+            assert_eq!(read_u32(&bytes, 8), CHUNK_FORMAT_VERSION);
+            assert_eq!(read_u32(&bytes, 12), NUM_SPATIAL_FEATURES as u32);
+            assert_eq!(read_u32(&bytes, 16), 1);
+            assert_eq!(read_u32(&bytes, 20), NUM_GLOBAL_FEATURES as u32);
+            assert_eq!(
+                bytes.len(),
+                CHUNK_HEADER_SIZE + training_record_size(board_size) + CHUNK_CHECKSUM_SIZE
+            );
+            assert!(verify_chunk_checksum(&bytes));
 
-        assert_eq!(&bytes[..8], &CHUNK_MAGIC);
-        assert_eq!(read_u32(&bytes, 8), CHUNK_FORMAT_VERSION);
-        assert_eq!(read_u32(&bytes, 12), TRAINING_RECORD_SIZE as u32);
-        assert_eq!(read_u32(&bytes, 16), 1);
-        assert_eq!(read_u32(&bytes, 20), BOARD_POLICY_SIZE as u32);
-        assert_eq!(read_u32(&bytes, 24), POLICY_SIZE as u32);
-        assert_eq!(read_u32(&bytes, 28), NUM_SPATIAL_FEATURES as u32);
-        assert_eq!(read_u32(&bytes, 32), NUM_GLOBAL_FEATURES as u32);
-        assert_eq!(
-            bytes.len(),
-            CHUNK_HEADER_SIZE + TRAINING_RECORD_SIZE + CHUNK_CHECKSUM_SIZE
-        );
-        assert!(verify_chunk_checksum(&bytes));
+            let mut offset = CHUNK_HEADER_SIZE;
+            assert_eq!(read_u32(&bytes, offset), board_size as u32);
+            offset += 4;
+            for plane in 0..NUM_SPATIAL_FEATURES {
+                for y in 0..board_size {
+                    for x in 0..board_size {
+                        assert_eq!(
+                            read_f32(&bytes, offset),
+                            (plane * MAX_BOARD_POINTS + y * MAX_BOARD_SIZE + x) as f32
+                        );
+                        offset += 4;
+                    }
+                }
+            }
+            for global in [-7.5, 0.0] {
+                assert_eq!(read_f32(&bytes, offset), global);
+                offset += 4;
+            }
+            for y in 0..board_size {
+                for x in 0..board_size {
+                    assert_eq!(read_f32(&bytes, offset), (y * board_size + x) as f32 + 0.25);
+                    offset += 4;
+                }
+            }
+            assert_eq!(
+                read_f32(&bytes, offset),
+                (board_size * board_size) as f32 + 0.25
+            );
+            offset += 4;
+            for value in [0.75, 3.5, 1.25] {
+                assert_eq!(read_f32(&bytes, offset), value);
+                offset += 4;
+            }
+            for y in 0..board_size {
+                for x in 0..board_size {
+                    assert_eq!(bytes[offset], ((y * MAX_BOARD_SIZE + x) % 3) as u8);
+                    offset += 1;
+                }
+            }
+            assert_eq!(offset + CHUNK_CHECKSUM_SIZE, bytes.len());
+        }
+    }
 
-        let policy_offset = CHUNK_HEADER_SIZE
-            + (NUM_SPATIAL_FEATURES * BOARD_POLICY_SIZE + NUM_GLOBAL_FEATURES) * size_of::<f32>();
-        assert_eq!(read_f32(&bytes, policy_offset), 0.25);
-        let value_offset = policy_offset + POLICY_SIZE * size_of::<f32>();
-        assert_eq!(read_f32(&bytes, value_offset), 0.75);
-        assert_eq!(read_f32(&bytes, value_offset + 4), 3.5);
-        assert_eq!(read_f32(&bytes, value_offset + 8), 1.25);
-        assert_eq!(bytes[value_offset + 12], 2);
+    #[test]
+    fn mixed_size_records_are_self_describing_in_full_and_partial_chunks() {
+        for capacity in [3, 5] {
+            let mut encoder = ChunkEncoder::new(capacity);
+            for board_size in [9, 3, 5] {
+                encoder.push(&sample(board_size));
+            }
+            let chunk = encoder.finish();
+            assert_eq!(chunk.records, 3);
+            assert_eq!(read_u32(&chunk.bytes, 16), 3);
+            let mut offset = CHUNK_HEADER_SIZE;
+            for board_size in [9, 3, 5] {
+                assert_eq!(read_u32(&chunk.bytes, offset), board_size);
+                offset += training_record_size(board_size as usize);
+            }
+            assert_eq!(offset + CHUNK_CHECKSUM_SIZE, chunk.bytes.len());
+            assert!(verify_chunk_checksum(&chunk.bytes));
+        }
     }
 
     #[test]
     fn chunk_checksum_rejects_corrupted_payload() {
         let sample = TrainingSample {
             input: NNInput::encode(&GameState::new(Rules::TROMP_TAYLORISH_9)),
-            policy_target: [0.25; POLICY_SIZE],
+            policy_target: [0.25; MAX_POLICY_SIZE],
             value_target: ValueTarget {
                 win_probability: 0.75,
                 score_mean: 3.5,
                 score_stdev: 1.25,
-                ownership: [2; BOARD_POLICY_SIZE],
+                ownership: [2; MAX_BOARD_POINTS],
             },
         };
         let mut bytes = encode_chunk(&[sample]);

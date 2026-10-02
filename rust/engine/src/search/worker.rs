@@ -100,7 +100,7 @@ struct PlayoutStep {
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     pub selected_move: Loc,
-    pub policy_target: [f32; crate::inference::policy::POLICY_SIZE],
+    pub policy_target: [f32; crate::inference::policy::MAX_POLICY_SIZE],
     pub value_target: SearchValueTarget,
 }
 

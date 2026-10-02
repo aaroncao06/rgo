@@ -15,23 +15,22 @@ def tensor(name, shape):
 nodes = [
     helper.make_node("ReduceMean", ["global"], ["mean"], axes=[1], keepdims=1),
     helper.make_node("Concat", ["mean", "mean", "mean"], ["value"], axis=1),
-    helper.make_node("Flatten", ["spatial"], ["flat"], axis=1),
-    helper.make_node("Slice", ["flat", "start", "end", "axis"], ["policy_logits"]),
-    helper.make_node("Slice", ["flat", "start", "ownership_end", "axis"], ["ownership_flat"]),
-    helper.make_node("Reshape", ["ownership_flat", "ownership_shape"], ["ownership_logits"]),
+    helper.make_node("Slice", ["spatial", "start", "channel_end", "axis"], ["ownership_logits"]),
+    helper.make_node("Flatten", ["ownership_logits"], ["board_policy"], axis=1),
+    helper.make_node("Mul", ["mean", "zero"], ["pass_logit"]),
+    helper.make_node("Concat", ["board_policy", "pass_logit"], ["policy_logits"], axis=1),
 ]
 initializers = [
     helper.make_tensor("start", TensorProto.INT64, [1], [0]),
-    helper.make_tensor("end", TensorProto.INT64, [1], [82]),
+    helper.make_tensor("channel_end", TensorProto.INT64, [1], [1]),
     helper.make_tensor("axis", TensorProto.INT64, [1], [1]),
-    helper.make_tensor("ownership_end", TensorProto.INT64, [1], [81]),
-    helper.make_tensor("ownership_shape", TensorProto.INT64, [4], [-1, 1, 9, 9]),
+    helper.make_tensor("zero", TensorProto.FLOAT, [1], [0.0]),
 ]
 graph = helper.make_graph(
     nodes, "rgo_v0_fixture",
-    [tensor("spatial", ["N", 3, 9, 9]), tensor("global", ["N", 2])],
-    [tensor("policy_logits", ["N", 82]), tensor("value", ["N", 3]),
-     tensor("ownership_logits", ["N", 1, 9, 9])],
+    [tensor("spatial", ["N", 3, "H", "W"]), tensor("global", ["N", 2])],
+    [tensor("policy_logits", ["N", "P"]), tensor("value", ["N", 3]),
+     tensor("ownership_logits", ["N", 1, "H", "W"])],
     initializer=initializers,
 )
 model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)], ir_version=10)
@@ -45,3 +44,10 @@ helper.set_model_props(model, {"rgo.io_version": "0"})
 model.graph.input[0].type.tensor_type.shape.dim[1].dim_value = 4
 onnx.checker.check_model(model)
 onnx.save(model, directory / "wrong_shape.onnx")
+
+# Declared dynamic dimensions cannot prove that the graph returns H*W+1.
+# This graph deliberately omits pass so runtime shape checking must reject it.
+model.graph.input[0].type.tensor_type.shape.dim[1].dim_value = 3
+model.graph.node[-1].CopyFrom(helper.make_node("Identity", ["board_policy"], ["policy_logits"]))
+onnx.checker.check_model(model)
+onnx.save(model, directory / "wrong_output.onnx")

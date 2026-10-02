@@ -10,7 +10,7 @@ use crate::{
         board::{Board, Loc, Player},
         game_state::GameState,
     },
-    inference::policy::{loc_to_policy, policy_to_loc},
+    inference::policy::loc_to_policy,
     search::{move_selection, node::SearchNode, node_store::NodeStore, root_policy},
 };
 use rand::Rng;
@@ -22,12 +22,20 @@ impl<N: NodeStore> SearchWorker<N> {
     ) -> Result<SearchResult, SearchError> {
         // KataGo's self-play path includes LCB in the recorded policy target,
         // but disables it while sampling the move that will actually be played.
-        let (moves, policy_weights) = self.root_selection_weights()?;
-        let move_weights = if self.params.use_lcb_for_selection {
-            self.root_selection_weights_with_lcb(false)?.1
-        } else {
-            policy_weights.clone()
-        };
+        let (moves, mut policy_weights, reference_weight) = self.root_base_weights();
+        // Split before LCB, fallback, and pruning: both paths retain their
+        // original operation order. With no children, LCB has no effect.
+        let mut move_weights = (self.params.use_lcb_for_selection && reference_weight.is_some())
+            .then(|| policy_weights.clone());
+        self.finish_root_weights(
+            &moves,
+            &mut policy_weights,
+            reference_weight,
+            self.params.use_lcb_for_selection,
+        )?;
+        if let Some(weights) = move_weights.as_mut() {
+            self.finish_root_weights(&moves, weights, reference_weight, false)?;
+        }
         let game_state = &self
             .search_graph
             .root
@@ -41,7 +49,11 @@ impl<N: NodeStore> SearchWorker<N> {
             self.params.chosen_move_temperature,
             self.params.chosen_move_temperature_halflife,
         );
-        let selected_move = moves[move_selection::sample_index(&move_weights, temperature, rng)];
+        let selected_move = moves[move_selection::sample_index(
+            move_weights.as_deref().unwrap_or(&policy_weights),
+            temperature,
+            rng,
+        )];
         let policy_target = normalized_policy_target(game_state.board(), &moves, &policy_weights);
         let root = self
             .search_graph
@@ -56,17 +68,7 @@ impl<N: NodeStore> SearchWorker<N> {
         })
     }
 
-    // Final play-selection weights before move temperature or normalization.
-    // These are also the source weights for the self-play policy target.
-    // This reads the graph without changing its statistics or stored policy.
-    pub(super) fn root_selection_weights(&self) -> Result<(Vec<Loc>, Vec<f64>), SearchError> {
-        self.root_selection_weights_with_lcb(self.params.use_lcb_for_selection)
-    }
-
-    fn root_selection_weights_with_lcb(
-        &self,
-        use_lcb: bool,
-    ) -> Result<(Vec<Loc>, Vec<f64>), SearchError> {
+    fn root_base_weights(&self) -> (Vec<Loc>, Vec<f64>, Option<f64>) {
         let root = self
             .search_graph
             .root
@@ -103,8 +105,8 @@ impl<N: NodeStore> SearchWorker<N> {
             }
         }
 
-        if !moves.is_empty() {
-            let reference_weight = weights[best_index];
+        let reference_weight = (!moves.is_empty()).then(|| weights[best_index]);
+        if let Some(reference_weight) = reference_weight {
             let explore_scaling = exploration_scaling(total_child_weight, self.params);
             let best_edge = root.node.edges().nth(best_index).unwrap();
             // SAFETY: all node pointers remain live and there are no mutable borrows.
@@ -139,21 +141,38 @@ impl<N: NodeStore> SearchWorker<N> {
                     );
                 }
             }
-            if use_lcb {
-                self.adjust_root_weights_by_lcb(&mut weights, reference_weight);
-            }
         } else {
             // Zero-budget search still has a root evaluation: use its legal policy.
-            for (i, &probability) in policy.iter().enumerate() {
-                let loc = policy_to_loc(root.game_state.board(), i);
+            let board = root.game_state.board();
+            for loc in board.locs().chain(std::iter::once(Loc::PASS)) {
+                let probability = policy[loc_to_policy(board, loc)];
                 if root.game_state.is_legal(loc) && root.is_allowed_move(loc, self.params) {
                     moves.push(loc);
                     weights.push(f64::from(probability));
                 }
             }
         }
+        (moves, weights, reference_weight)
+    }
+
+    fn finish_root_weights(
+        &self,
+        moves: &[Loc],
+        weights: &mut [f64],
+        reference_weight: Option<f64>,
+        use_lcb: bool,
+    ) -> Result<(), SearchError> {
+        if use_lcb && let Some(reference_weight) = reference_weight {
+            self.adjust_root_weights_by_lcb(weights, reference_weight);
+        }
+        let root = self
+            .search_graph
+            .root
+            .as_ref()
+            .expect("selection requires an active game");
+        let policy = root.node.policy_probs();
         if weights.iter().copied().fold(0.0, f64::max) <= 1e-50 {
-            for (loc, weight) in moves.iter().zip(&mut weights) {
+            for (loc, weight) in moves.iter().zip(weights.iter_mut()) {
                 *weight =
                     if root.game_state.is_legal(*loc) && root.is_allowed_move(*loc, self.params) {
                         f64::from(policy[loc_to_policy(root.game_state.board(), *loc)])
@@ -168,11 +187,11 @@ impl<N: NodeStore> SearchWorker<N> {
             }
         }
         move_selection::prune_weights(
-            &mut weights,
+            weights,
             self.params.chosen_move_subtract,
             self.params.chosen_move_prune,
         );
-        Ok((moves, weights))
+        Ok(())
     }
 
     pub(super) fn apply_root_policy_temperature_and_noise<R: Rng + ?Sized>(
@@ -195,12 +214,13 @@ impl<N: NodeStore> SearchWorker<N> {
             .as_mut()
             .expect("root policy requires an active game");
         let policy = root.node.policy_probs_mut();
+        let legal = &legal[..policy.len()];
         // KataGo shapes the policy before constructing the noise distribution.
-        root_policy::apply_temperature(policy, &legal, temperature);
+        root_policy::apply_temperature(policy, legal, temperature);
         if params.root_noise_enabled {
             root_policy::add_dirichlet_noise(
                 policy,
-                &legal,
+                legal,
                 params.root_dirichlet_noise_total_concentration,
                 params.root_dirichlet_noise_weight,
                 rng,
@@ -265,11 +285,11 @@ fn normalized_policy_target(
     board: &Board,
     moves: &[Loc],
     weights: &[f64],
-) -> [f32; crate::inference::policy::POLICY_SIZE] {
+) -> [f32; crate::inference::policy::MAX_POLICY_SIZE] {
     debug_assert_eq!(moves.len(), weights.len());
     let weight_sum: f64 = weights.iter().sum();
     debug_assert!(weight_sum > 0.0);
-    let mut target = [0.0; crate::inference::policy::POLICY_SIZE];
+    let mut target = [0.0; crate::inference::policy::MAX_POLICY_SIZE];
     for (&move_loc, &weight) in moves.iter().zip(weights) {
         target[loc_to_policy(board, move_loc)] = (weight / weight_sum) as f32;
     }
@@ -289,5 +309,21 @@ fn search_value_target(node: &SearchNode, player: Player) -> SearchValueTarget {
         win_probability: win_probability as f32,
         score_mean: score_mean as f32,
         score_stdev: score_variance.sqrt() as f32,
+    }
+}
+
+#[cfg(test)]
+impl<N: NodeStore> SearchWorker<N> {
+    // Final weights exposed to the policy tests. Production computes the base
+    // once and finishes the training and sampling weights separately.
+    pub(super) fn root_selection_weights(&self) -> Result<(Vec<Loc>, Vec<f64>), SearchError> {
+        let (moves, mut weights, reference_weight) = self.root_base_weights();
+        self.finish_root_weights(
+            &moves,
+            &mut weights,
+            reference_weight,
+            self.params.use_lcb_for_selection,
+        )?;
+        Ok((moves, weights))
     }
 }

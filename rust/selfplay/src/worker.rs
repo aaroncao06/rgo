@@ -9,12 +9,12 @@ use super::{
 };
 use crate::{
     game::{
-        board::{Color, Loc, Player},
+        board::{Color, Loc, MAX_BOARD_POINTS, Player},
         game_state::GameState,
     },
     inference::{
         inputs::NNInput,
-        policy::{BOARD_POLICY_SIZE, POLICY_SIZE, loc_to_policy},
+        policy::{MAX_POLICY_SIZE, loc_to_spatial},
         runtime::{InferenceClient, ModelHandle},
     },
     search::{
@@ -39,7 +39,7 @@ fn derive_rng_seed(global_seed: u64, worker_index: u64, stream: u64) -> u64 {
 struct SelfPlayRecord {
     player: Player,
     selected_move: Loc, // to reconstruct nn input when we replay the game to finalize
-    policy_target: [f32; POLICY_SIZE],
+    policy_target: [f32; MAX_POLICY_SIZE],
     search_value_target: SearchValueTarget,
 }
 
@@ -262,10 +262,10 @@ fn ownership_for_player(
     board: &crate::game::board::Board,
     final_ownership: &[Color; crate::game::board::ARRAY_LEN],
     player: Player,
-) -> [u8; BOARD_POLICY_SIZE] {
-    let mut ownership = [1; BOARD_POLICY_SIZE];
+) -> [u8; MAX_BOARD_POINTS] {
+    let mut ownership = [1; MAX_BOARD_POINTS];
     for loc in board.locs() {
-        ownership[loc_to_policy(board, loc)] = match (final_ownership[loc.index()], player) {
+        ownership[loc_to_spatial(board, loc)] = match (final_ownership[loc.index()], player) {
             (Color::Empty, _) => 1,
             (Color::Black, Player::Black) | (Color::White, Player::White) => 2,
             (Color::Black, Player::White) | (Color::White, Player::Black) => 0,
@@ -279,6 +279,7 @@ fn ownership_for_player(
 mod tests {
     use super::*;
     use crate::game::rules::Rules;
+    use crate::inference::policy::loc_to_policy;
 
     #[test]
     fn global_seed_derives_stable_distinct_worker_streams() {
@@ -301,51 +302,75 @@ mod tests {
 
     #[test]
     fn finished_game_replay_builds_player_relative_training_samples() {
-        let rules = Rules::TROMP_TAYLORISH_9;
-        let mut game_state = GameState::new(rules);
-        let center = game_state.board().loc(4, 4).unwrap();
-        let moves = [center, Loc::PASS, Loc::PASS];
-        let mut records = Vec::new();
+        for board_size in [5, 9] {
+            let rules = Rules {
+                board_size,
+                ..Rules::TROMP_TAYLORISH_9
+            };
+            let mut game_state = GameState::new(rules);
+            let center = game_state
+                .board()
+                .loc(board_size / 2, board_size / 2)
+                .unwrap();
+            let moves = [center, Loc::PASS, Loc::PASS];
+            let mut records = Vec::new();
 
-        for (turn, move_loc) in moves.into_iter().enumerate() {
-            let mut policy_target = [0.0; POLICY_SIZE];
-            policy_target[loc_to_policy(game_state.board(), move_loc)] = 1.0;
-            records.push(SelfPlayRecord {
-                player: game_state.next_player(),
-                selected_move: move_loc,
-                policy_target,
-                search_value_target: SearchValueTarget {
-                    win_probability: 0.1 + turn as f32 * 0.1,
-                    score_mean: turn as f32 + 0.5,
-                    score_stdev: turn as f32 + 1.5,
-                },
-            });
-            assert!(game_state.play(move_loc));
+            for (turn, move_loc) in moves.into_iter().enumerate() {
+                let mut policy_target = [0.0; MAX_POLICY_SIZE];
+                policy_target[loc_to_policy(game_state.board(), move_loc)] = 1.0;
+                records.push(SelfPlayRecord {
+                    player: game_state.next_player(),
+                    selected_move: move_loc,
+                    policy_target,
+                    search_value_target: SearchValueTarget {
+                        win_probability: 0.1 + turn as f32 * 0.1,
+                        score_mean: turn as f32 + 0.5,
+                        score_stdev: turn as f32 + 1.5,
+                    },
+                });
+                assert!(game_state.play(move_loc));
+            }
+            assert!(game_state.is_finished());
+
+            let mut samples = Vec::new();
+            build_training_samples(&mut records, &mut game_state, &mut samples);
+
+            assert!(records.is_empty());
+            assert_eq!(samples.len(), 3);
+            assert_eq!(samples[0].input.global, [-7.5, 0.0]);
+            assert_eq!(samples[1].input.global, [7.5, 0.0]);
+            assert_eq!(samples[2].input.global, [-7.5, 1.0]);
+
+            let center_policy = loc_to_policy(game_state.board(), center);
+            let center_spatial = loc_to_spatial(game_state.board(), center);
+            assert_eq!(samples[0].input.spatial[center_spatial], 0.0);
+            assert_eq!(
+                samples[1].input.spatial[MAX_BOARD_POINTS + center_spatial],
+                1.0
+            );
+            assert_eq!(samples[2].input.spatial[center_spatial], 1.0);
+            assert_eq!(samples[0].policy_target[center_policy], 1.0);
+
+            assert_eq!(samples[0].value_target.win_probability, 0.1);
+            assert_eq!(samples[0].value_target.score_mean, 0.5);
+            assert_eq!(samples[0].value_target.score_stdev, 1.5);
+            assert_eq!(samples[0].value_target.ownership[center_spatial], 2);
+            assert_eq!(samples[1].value_target.ownership[center_spatial], 0);
+            for sample in &samples {
+                assert_eq!(sample.input.board_size, board_size);
+                assert!(
+                    sample.policy_target[board_size * board_size + 1..]
+                        .iter()
+                        .all(|&p| p == 0.0)
+                );
+                for i in 0..MAX_BOARD_POINTS {
+                    let x = i % crate::game::board::MAX_BOARD_SIZE;
+                    let y = i / crate::game::board::MAX_BOARD_SIZE;
+                    if x >= board_size || y >= board_size {
+                        assert_eq!(sample.value_target.ownership[i], 1);
+                    }
+                }
+            }
         }
-        assert!(game_state.is_finished());
-
-        let mut samples = Vec::new();
-        build_training_samples(&mut records, &mut game_state, &mut samples);
-
-        assert!(records.is_empty());
-        assert_eq!(samples.len(), 3);
-        assert_eq!(samples[0].input.global, [-7.5, 0.0]);
-        assert_eq!(samples[1].input.global, [7.5, 0.0]);
-        assert_eq!(samples[2].input.global, [-7.5, 1.0]);
-
-        let center_policy = loc_to_policy(game_state.board(), center);
-        assert_eq!(samples[0].input.spatial[center_policy], 0.0);
-        assert_eq!(
-            samples[1].input.spatial[BOARD_POLICY_SIZE + center_policy],
-            1.0
-        );
-        assert_eq!(samples[2].input.spatial[center_policy], 1.0);
-        assert_eq!(samples[0].policy_target[center_policy], 1.0);
-
-        assert_eq!(samples[0].value_target.win_probability, 0.1);
-        assert_eq!(samples[0].value_target.score_mean, 0.5);
-        assert_eq!(samples[0].value_target.score_stdev, 1.5);
-        assert_eq!(samples[0].value_target.ownership[center_policy], 2);
-        assert_eq!(samples[1].value_target.ownership[center_policy], 0);
     }
 }

@@ -4,7 +4,7 @@ use crate::{
     inference::{
         backend::InferenceBackend,
         inputs::NNInput,
-        policy::POLICY_SIZE,
+        policy::MAX_POLICY_SIZE,
         runtime::{start_test_runtime, test_backend_factory},
     },
     search::{move_selection, node::SearchStats, node_store::FixedArenaNodeStore},
@@ -19,7 +19,7 @@ fn loc(x: usize, y: usize) -> Loc {
 
 struct TestBackend {
     fail: bool,
-    policy_logits: [f32; POLICY_SIZE],
+    policy_logits: [f32; MAX_POLICY_SIZE],
 }
 
 impl InferenceBackend for TestBackend {
@@ -32,10 +32,11 @@ impl InferenceBackend for TestBackend {
             return Err(InferenceError::ExecutionFailed);
         }
         for input in inputs {
-            let mut output = NNOutput::from_raw(self.policy_logits, 0.0, 0.0, 0.0);
+            let mut output = NNOutput::from_raw(self.policy_logits.into(), 0.0, 0.0, 0.0);
             if input.include_ownership {
-                output = output
-                    .with_ownership_logits([0.0; crate::inference::policy::BOARD_POLICY_SIZE]);
+                output = output.with_ownership_logits(
+                    vec![0.0; input.board_size * input.board_size].into_boxed_slice(),
+                );
             }
             outputs.push(Arc::new(output));
         }
@@ -44,10 +45,13 @@ impl InferenceBackend for TestBackend {
 }
 
 fn inference_client(fail: bool) -> InferenceClient {
-    inference_client_with_policy(fail, [0.0; POLICY_SIZE])
+    inference_client_with_policy(fail, [0.0; MAX_POLICY_SIZE])
 }
 
-fn inference_client_with_policy(fail: bool, policy_logits: [f32; POLICY_SIZE]) -> InferenceClient {
+fn inference_client_with_policy(
+    fail: bool,
+    policy_logits: [f32; MAX_POLICY_SIZE],
+) -> InferenceClient {
     let model_handle = start_test_runtime(
         0,
         vec![test_backend_factory(
@@ -66,7 +70,7 @@ fn inference_client_with_policy(fail: bool, policy_logits: [f32; POLICY_SIZE]) -
 }
 
 struct OneShotBackend {
-    policy_logits: [f32; POLICY_SIZE],
+    policy_logits: [f32; MAX_POLICY_SIZE],
     evaluated: bool,
 }
 
@@ -80,17 +84,19 @@ impl InferenceBackend for OneShotBackend {
             return Err(InferenceError::ExecutionFailed);
         }
         self.evaluated = true;
-        for _ in inputs {
+        for input in inputs {
             // This fixture also supports cache-first tests that later request a root.
-            let output = NNOutput::from_raw(self.policy_logits, 0.0, 0.0, 0.0)
-                .with_ownership_logits([0.0; crate::inference::policy::BOARD_POLICY_SIZE]);
+            let output = NNOutput::from_raw(self.policy_logits.into(), 0.0, 0.0, 0.0)
+                .with_ownership_logits(
+                    vec![0.0; input.board_size * input.board_size].into_boxed_slice(),
+                );
             outputs.push(Arc::new(output));
         }
         Ok(())
     }
 }
 
-fn one_shot_inference_client(policy_logits: [f32; POLICY_SIZE]) -> InferenceClient {
+fn one_shot_inference_client(policy_logits: [f32; MAX_POLICY_SIZE]) -> InferenceClient {
     let model_handle = start_test_runtime(
         0,
         vec![test_backend_factory(
@@ -119,16 +125,18 @@ fn node_budget(max_nodes: usize) -> SearchBudget {
     SearchBudget::new(max_nodes, max_nodes.saturating_mul(4))
 }
 
-fn processed_output(policy_logits: [f32; POLICY_SIZE], white_win_logit: f32) -> Arc<NNOutput> {
+fn processed_output(policy_logits: [f32; MAX_POLICY_SIZE], white_win_logit: f32) -> Arc<NNOutput> {
     let mut output = Arc::new(NNOutput::from_raw(
-        policy_logits,
+        policy_logits.into(),
         white_win_logit,
         0.0,
         -20.0,
     ));
-    Arc::get_mut(&mut output)
-        .unwrap()
-        .process_in_place(Player::White, &[true; POLICY_SIZE]);
+    Arc::get_mut(&mut output).unwrap().process_in_place(
+        Player::White,
+        &[true; MAX_POLICY_SIZE],
+        crate::game::board::MAX_BOARD_SIZE,
+    );
     output
 }
 
@@ -190,8 +198,8 @@ fn graph_snapshot(worker: &SearchWorker<FixedArenaNodeStore>) -> Vec<NodeSnapsho
     snapshots
 }
 
-fn focused_policy() -> [f32; POLICY_SIZE] {
-    let mut logits = [-20.0; POLICY_SIZE];
+fn focused_policy() -> [f32; MAX_POLICY_SIZE] {
+    let mut logits = [-20.0; MAX_POLICY_SIZE];
     logits[loc_to_policy(loc(4, 4))] = 20.0;
     logits[loc_to_policy(loc(3, 3))] = 10.0;
     logits
@@ -204,7 +212,7 @@ async fn root_preprocessing_preserves_shared_cached_output() {
     // retrieve the original shared output from the cache.
     let mut client = one_shot_inference_client(focused_policy());
     let cached = client.evaluate(&state, false).await.unwrap();
-    let original_policy = *cached.policy_probs();
+    let original_policy = cached.policy_probs().to_vec();
     let mut worker = worker();
     let mut rng = SmallRng::seed_from_u64(17);
 
@@ -281,7 +289,7 @@ async fn search_stops_at_playout_guard_when_terminal_revisits_cannot_fill_the_st
     let mut state = GameState::new(Rules::TROMP_TAYLORISH_9);
     assert!(state.play(Loc::PASS));
 
-    let mut pass_policy = [-1000.0; POLICY_SIZE];
+    let mut pass_policy = [-1000.0; MAX_POLICY_SIZE];
     pass_policy[loc_to_policy(Loc::PASS)] = 0.0;
     let mut worker = worker();
     worker.params.root_noise_enabled = false;
@@ -369,7 +377,7 @@ async fn final_lcb_weights_use_edge_sample_size_for_transpositions() {
     worker.params.chosen_move_temperature_early = 0.0;
     worker.params.chosen_move_temperature = 0.0;
     let moves = [loc(3, 3), loc(4, 4)];
-    let mut logits = [-1000.0; POLICY_SIZE];
+    let mut logits = [-1000.0; MAX_POLICY_SIZE];
     for loc in moves {
         logits[loc_to_policy(loc)] = 0.0;
     }
@@ -418,6 +426,23 @@ async fn final_lcb_weights_use_edge_sample_size_for_transpositions() {
         result.policy_target[loc_to_policy(moves[1])]
             > result.policy_target[loc_to_policy(moves[0])]
     );
+
+    // Pruning caps use each path's own maximum, after the LCB boost.
+    worker.params.chosen_move_subtract = 50.0;
+    worker.params.chosen_move_prune = 50.0;
+    let result = worker.build_search_result(&mut rng).unwrap();
+    let boosted = 52.480_946_693_222_53;
+    let subtract = boosted / 64.0;
+    let expected = (boosted - subtract) / (25.0 + boosted - 2.0 * subtract);
+    assert!((f64::from(result.policy_target[loc_to_policy(moves[1])]) - expected).abs() < 1e-7);
+    assert_eq!(result.selected_move, moves[0]);
+    // Disabling LCB makes sampling and training use the same pruned weights.
+    worker.params.use_lcb_for_selection = false;
+    let result = worker.build_search_result(&mut rng).unwrap();
+    assert_eq!(result.selected_move, moves[0]);
+    assert_eq!(result.policy_target[loc_to_policy(moves[0])], 0.5);
+    assert_eq!(result.policy_target[loc_to_policy(moves[1])], 0.5);
+    assert_eq!(graph_snapshot(&worker), before);
 }
 
 #[tokio::test]
@@ -429,7 +454,7 @@ async fn final_weights_reduce_overexploration_without_changing_graph_stats() {
     let first_move = loc(3, 3);
     let second_move = loc(4, 4);
     // Finite logits whose softmax underflows to zero on the other moves.
-    let mut logits = [-1000.0; POLICY_SIZE];
+    let mut logits = [-1000.0; MAX_POLICY_SIZE];
     logits[loc_to_policy(first_move)] = 0.0;
     logits[loc_to_policy(second_move)] = 0.0;
     let mut client = inference_client_with_policy(false, logits);
@@ -478,11 +503,64 @@ fn new_worker_has_no_active_graph_or_scratch_state() {
 }
 
 #[test]
+fn selection_and_root_fallback_visit_only_active_board_points_and_pass() {
+    let mut worker = worker();
+    let state = GameState::new(Rules {
+        board_size: 5,
+        ..Rules::default()
+    });
+    let preferred = state.board().loc(2, 2).unwrap();
+    let mut logits = vec![0.0; 26].into_boxed_slice();
+    logits[crate::inference::policy::loc_to_policy(state.board(), preferred)] = 2.0;
+    let mut output = NNOutput::from_raw(logits, 0.0, 0.0, 0.0);
+    output.process_in_place(
+        Player::White,
+        &crate::inference::policy::legal_mask(&state),
+        5,
+    );
+    let output = Arc::new(output);
+    assert_eq!(output.policy_probs().len(), 26);
+    let cached = output.clone();
+    let cached_policy = cached.policy_probs().to_vec();
+    worker.search_graph.reset(&state, output, 0.0, 16);
+    let root = worker.search_graph.root.as_ref().unwrap();
+    assert_eq!(
+        worker.select_child(&root.node, &state, true),
+        (preferred, None)
+    );
+    let (moves, weights) = worker.root_selection_weights().unwrap();
+    let expected: Vec<_> = state
+        .board()
+        .locs()
+        .chain(std::iter::once(Loc::PASS))
+        .collect();
+    assert_eq!(moves, expected);
+    assert_eq!(weights.len(), 26);
+    assert!(weights[12] > weights[25]);
+
+    worker.params.root_noise_enabled = true;
+    let mut rng = SmallRng::seed_from_u64(0);
+    worker.apply_root_policy_temperature_and_noise(&state, &mut rng);
+    let root_policy = worker
+        .search_graph
+        .root
+        .as_ref()
+        .unwrap()
+        .node
+        .policy_probs();
+    assert_eq!(root_policy.len(), 26);
+    assert!(root_policy.iter().all(|&p| p.is_finite() && p >= 0.0));
+    assert!((root_policy.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+    assert_eq!(cached.policy_probs(), cached_policy);
+    assert_ne!(root_policy, cached_policy);
+}
+
+#[test]
 fn selection_chooses_the_highest_policy_unexpanded_move() {
     let mut worker = worker();
     let game_state = GameState::new(Rules::TROMP_TAYLORISH_9);
     let expected_move = loc(4, 4);
-    let mut logits = [0.0; POLICY_SIZE];
+    let mut logits = [0.0; MAX_POLICY_SIZE];
     logits[loc_to_policy(expected_move)] = 5.0;
     let output = processed_output(logits, 0.0);
     worker
@@ -501,7 +579,7 @@ fn selection_orients_child_utility_for_the_player_to_move() {
     let mut worker = worker();
     let game_state = GameState::new(Rules::TROMP_TAYLORISH_9);
     assert_eq!(game_state.next_player(), Player::Black);
-    let parent_output = processed_output([0.0; POLICY_SIZE], 0.0);
+    let parent_output = processed_output([0.0; MAX_POLICY_SIZE], 0.0);
     worker
         .search_graph
         .reset(&game_state, parent_output.clone(), 0.0, 16);
@@ -510,9 +588,9 @@ fn selection_orients_child_utility_for_the_player_to_move() {
     let white_favored_move = loc(3, 3);
     let black_favored_move = loc(4, 4);
     let mut white_favored_child =
-        initialized_node(processed_output([0.0; POLICY_SIZE], 9.0_f32.ln()), 0.8);
+        initialized_node(processed_output([0.0; MAX_POLICY_SIZE], 9.0_f32.ln()), 0.8);
     let mut black_favored_child = initialized_node(
-        processed_output([0.0; POLICY_SIZE], (1.0_f32 / 9.0).ln()),
+        processed_output([0.0; MAX_POLICY_SIZE], (1.0_f32 / 9.0).ln()),
         -0.8,
     );
     parent.add_child(
@@ -538,7 +616,7 @@ fn root_selection_forces_an_existing_child_below_its_desired_visits() {
     let game_state = GameState::new(Rules::TROMP_TAYLORISH_9);
     let forced_move = loc(3, 3);
     let otherwise_best_move = loc(4, 4);
-    let mut logits = [-20.0; POLICY_SIZE];
+    let mut logits = [-20.0; MAX_POLICY_SIZE];
     logits[loc_to_policy(forced_move)] = 4.0;
     logits[loc_to_policy(otherwise_best_move)] = 0.0;
     let parent_output = processed_output(logits, 0.0);
@@ -547,9 +625,9 @@ fn root_selection_forces_an_existing_child_below_its_desired_visits() {
         .reset(&game_state, parent_output.clone(), 0.0, 16);
     let mut parent = initialized_node(parent_output, 0.0);
     let mut forced_child =
-        initialized_node(processed_output([0.0; POLICY_SIZE], 9.0_f32.ln()), 1.0);
+        initialized_node(processed_output([0.0; MAX_POLICY_SIZE], 9.0_f32.ln()), 1.0);
     let mut otherwise_best_child = initialized_node(
-        processed_output([0.0; POLICY_SIZE], (1.0_f32 / 9.0).ln()),
+        processed_output([0.0; MAX_POLICY_SIZE], (1.0_f32 / 9.0).ln()),
         -1.0,
     );
     let forced_edge = parent.add_child(
@@ -586,7 +664,7 @@ fn forced_root_visit_ties_follow_child_insertion_order() {
     let first_move = loc(4, 4);
     let second_move = loc(3, 3);
     assert!(loc_to_policy(first_move) > loc_to_policy(second_move));
-    let mut logits = [-20.0; POLICY_SIZE];
+    let mut logits = [-20.0; MAX_POLICY_SIZE];
     logits[loc_to_policy(first_move)] = 0.0;
     logits[loc_to_policy(second_move)] = 0.0;
     let mut parent = initialized_node(processed_output(logits, 0.0), 0.0);
@@ -614,7 +692,7 @@ fn existing_child_wins_exact_tie_against_unexpanded_move() {
     worker.params.fpu_reduction_max = 0.0;
     let game_state = GameState::new(Rules::TROMP_TAYLORISH_9);
     let existing_move = loc(4, 4);
-    let output = processed_output([0.0; POLICY_SIZE], 0.0);
+    let output = processed_output([0.0; MAX_POLICY_SIZE], 0.0);
     let mut parent = initialized_node(output.clone(), 0.0);
     let mut child = initialized_node(output, 0.0);
     let edge = parent.add_child(existing_move, 0.5, NonNull::from(child.as_mut()));
@@ -628,10 +706,11 @@ fn existing_child_wins_exact_tie_against_unexpanded_move() {
 #[test]
 fn value_weighting_favors_the_better_child_and_preserves_total_weight() {
     let mut worker = worker();
-    let mut parent = initialized_node(processed_output([0.0; POLICY_SIZE], 0.0), 0.0);
-    let mut good_child = initialized_node(processed_output([0.0; POLICY_SIZE], 9.0_f32.ln()), 1.0);
+    let mut parent = initialized_node(processed_output([0.0; MAX_POLICY_SIZE], 0.0), 0.0);
+    let mut good_child =
+        initialized_node(processed_output([0.0; MAX_POLICY_SIZE], 9.0_f32.ln()), 1.0);
     let mut bad_child = initialized_node(
-        processed_output([0.0; POLICY_SIZE], (1.0_f32 / 9.0).ln()),
+        processed_output([0.0; MAX_POLICY_SIZE], (1.0_f32 / 9.0).ln()),
         -1.0,
     );
     for _ in 0..9 {
@@ -656,7 +735,7 @@ fn value_weighting_favors_the_better_child_and_preserves_total_weight() {
 #[test]
 fn transposed_child_squared_weights_scale_by_squared_edge_fraction() {
     let mut worker = worker();
-    let output = processed_output([0.0; POLICY_SIZE], 0.0);
+    let output = processed_output([0.0; MAX_POLICY_SIZE], 0.0);
     let mut child = initialized_node(output.clone(), 0.0);
     for _ in 0..9 {
         child.record_visit(0.5, 0.0, 0.0, 0.0);
@@ -686,7 +765,7 @@ async fn graph_cycles_end_the_playout_and_back_up_without_inference() {
         let first_move = loc(1, 0);
         let second_move = loc(2, 0);
         let policy = |loc| {
-            let mut logits = [-20.0; POLICY_SIZE];
+            let mut logits = [-20.0; MAX_POLICY_SIZE];
             logits[loc_to_policy(loc)] = 20.0;
             logits
         };
@@ -770,7 +849,7 @@ async fn graph_cycles_end_the_playout_and_back_up_without_inference() {
 #[tokio::test]
 async fn transposed_child_catches_up_before_requesting_more_inference() {
     let move_loc = loc(4, 4);
-    let mut logits = [-20.0; POLICY_SIZE];
+    let mut logits = [-20.0; MAX_POLICY_SIZE];
     logits[loc_to_policy(move_loc)] = 20.0;
     let mut client = one_shot_inference_client(logits);
     let mut worker = worker();
@@ -785,7 +864,7 @@ async fn transposed_child_catches_up_before_requesting_more_inference() {
     let mut child_ptr = worker.search_graph.node_store.insert(child_key).unwrap();
     {
         let child = unsafe { child_ptr.as_mut() };
-        child.initialize_from_nn_eval(processed_output([0.0; POLICY_SIZE], 0.0), 0.0);
+        child.initialize_from_nn_eval(processed_output([0.0; MAX_POLICY_SIZE], 0.0), 0.0);
         for _ in 1..3 {
             child.record_visit(0.5, 0.0, 0.0, 0.0);
         }
@@ -863,7 +942,7 @@ async fn playout_expands_and_evaluates_a_missing_child() {
 #[tokio::test]
 async fn consecutive_playouts_descend_and_back_up_through_existing_edges() {
     let preferred_move = loc(4, 4);
-    let mut logits = [0.0; POLICY_SIZE];
+    let mut logits = [0.0; MAX_POLICY_SIZE];
     logits[loc_to_policy(preferred_move)] = 20.0;
     let mut client = inference_client_with_policy(false, logits);
     let mut worker = worker();
@@ -895,7 +974,7 @@ async fn integer_terminal_scores_use_katago_gridded_second_moment() {
             ..Rules::TROMP_TAYLORISH_9
         });
         assert!(root_state.play(Loc::PASS));
-        let mut logits = [-20.0; POLICY_SIZE];
+        let mut logits = [-20.0; MAX_POLICY_SIZE];
         logits[loc_to_policy(Loc::PASS)] = 20.0;
         let mut client = one_shot_inference_client(logits);
         let mut worker = worker();
@@ -933,7 +1012,7 @@ async fn integer_terminal_scores_use_katago_gridded_second_moment() {
 async fn terminal_leaf_uses_exact_score_without_inference() {
     let mut root_state = GameState::new(Rules::TROMP_TAYLORISH_9);
     assert!(root_state.play(Loc::PASS));
-    let mut logits = [0.0; POLICY_SIZE];
+    let mut logits = [0.0; MAX_POLICY_SIZE];
     logits[loc_to_policy(Loc::PASS)] = 20.0;
     let mut client = one_shot_inference_client(logits);
     let mut worker = worker();

@@ -29,7 +29,7 @@ device = { type = "cpu", intra_threads = 1 }
 #   { probability = 0.1, budget = { max_nodes = 2048, max_playouts = 4096 } },
 # ]
 # [self_play.rules]
-# board_size = 9 # The current model supports only 9x9.
+# board_size = 9 # Supported sizes: 9, 13, 19; storage currently supports only 9.
 # komi = 7.5
 # multi_stone_suicide_legal = true
 # [search]

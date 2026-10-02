@@ -70,8 +70,12 @@ impl ModelHandle {
     fn model_version(&self) -> ModelVersion {
         self.0.model_version
     }
-    fn submit_request(&self, request: Arc<EvalSlot>) -> Result<(), InferenceError> {
-        self.0.queue.submit_request(request)
+    fn submit_request(
+        &self,
+        request: Arc<EvalSlot>,
+        board_size: usize,
+    ) -> Result<(), InferenceError> {
+        self.0.queue.submit_request(request, board_size)
     }
     fn lookup(&self, key: EvaluationKey) -> Option<Arc<NNOutput>> {
         self.0.cache.lookup(key)
@@ -140,11 +144,6 @@ impl InferenceClient {
         game_state: &GameState,
         include_ownership: bool,
     ) -> Result<Arc<NNOutput>, InferenceError> {
-        if game_state.board().size() != super::policy::MODEL_BOARD_SIZE {
-            return Err(InferenceError::UnsupportedBoardSize {
-                board_size: game_state.board().size(),
-            });
-        }
         // Randomized and non-randomized clients intentionally share this cache.
         // Every entry is restored to canonical coordinates before insertion, so
         // either kind of evaluation is a valid prediction for the same position;
@@ -168,7 +167,10 @@ impl InferenceClient {
 
         self.slot.queue(input);
         // send a clone of the arc pointer
-        if let Err(error) = self.model_handle().submit_request(self.slot.clone()) {
+        if let Err(error) = self
+            .model_handle()
+            .submit_request(self.slot.clone(), game_state.board().size())
+        {
             self.slot.cancel_queued();
             return Err(error);
         }
@@ -181,14 +183,18 @@ impl InferenceClient {
         );
         let fresh = Arc::get_mut(&mut output).expect("raw NN output must be exclusively owned");
         if let Some(symmetry) = symmetry {
-            fresh.restore_symmetry_in_place(symmetry);
+            fresh.restore_symmetry_in_place(symmetry, game_state.board().size());
         }
         if let Some(cached) = cached {
             // Preserve the original predictions when only ownership was missing.
             // Future randomized symmetries may produce different policy/value outputs.
-            fresh.process_with_cached_values_in_place(next_player, &cached);
+            fresh.process_with_cached_values_in_place(
+                next_player,
+                &cached,
+                game_state.board().size(),
+            );
         } else {
-            fresh.process_in_place(next_player, &legal_mask);
+            fresh.process_in_place(next_player, &legal_mask, game_state.board().size());
         }
 
         self.model_handle().insert(key, output.clone());

@@ -1,5 +1,6 @@
 //! The V0 ONNX tensor boundary. No model architecture or search processing lives here.
 
+use crate::game::board::MAX_BOARD_SIZE;
 use std::{path::Path, sync::Arc};
 
 use ort::{
@@ -12,7 +13,6 @@ use super::{
     backend::{InferenceBackend, InferenceError},
     inputs::{NNInput, NUM_GLOBAL_FEATURES, NUM_SPATIAL_FEATURES},
     outputs::NNOutput,
-    policy::{BOARD_POLICY_SIZE, MODEL_BOARD_SIZE, POLICY_SIZE},
 };
 
 /// Select an execution provider, not exclusive ownership of a device.
@@ -93,19 +93,29 @@ impl OnnxBackend {
     ) -> ort::Result<()> {
         debug_assert!(outputs.is_empty());
         debug_assert!(!inputs.is_empty(), "cannot evaluate an empty batch");
+        let board_size = inputs[0].board_size;
+        debug_assert!((1..=MAX_BOARD_SIZE).contains(&board_size));
+        debug_assert!(
+            inputs.iter().all(|input| input.board_size == board_size),
+            "batch mixes board sizes"
+        );
+        let board_points = board_size * board_size;
+        let policy_size = board_points + 1;
         self.spatial.clear();
         self.global.clear();
         self.spatial
-            .reserve(inputs.len() * NUM_SPATIAL_FEATURES * BOARD_POLICY_SIZE);
+            .reserve(inputs.len() * NUM_SPATIAL_FEATURES * board_points);
         self.global.reserve(inputs.len() * NUM_GLOBAL_FEATURES);
         for input in inputs {
-            self.spatial.extend_from_slice(&input.spatial);
+            for row in input.spatial_rows() {
+                self.spatial.extend_from_slice(row);
+            }
             self.global.extend_from_slice(&input.global);
         }
         let n = inputs.len();
         let include_ownership = inputs.iter().any(|input| input.include_ownership);
         let tensors = ort::inputs![
-            "spatial" => TensorRef::from_array_view(([n, NUM_SPATIAL_FEATURES, MODEL_BOARD_SIZE, MODEL_BOARD_SIZE], self.spatial.as_slice()))?,
+            "spatial" => TensorRef::from_array_view(([n, NUM_SPATIAL_FEATURES, board_size, board_size], self.spatial.as_slice()))?,
             "global" => TensorRef::from_array_view(([n, NUM_GLOBAL_FEATURES], self.global.as_slice()))?,
         ];
         let batch = if include_ownership {
@@ -114,31 +124,31 @@ impl OnnxBackend {
             self.session
                 .run_with_options(tensors, &self.without_ownership)?
         };
-        // Extract raw tensors; debug checks enforce the exporter/backend contract.
-        let policy_batch = tensor(&batch, "policy_logits", &[n, POLICY_SIZE])?;
+        // Validate dynamic output shapes before copying each compact result.
+        let policy_batch = tensor(&batch, "policy_logits", &[n, policy_size])?;
         let value_batch = tensor(&batch, "value", &[n, 3])?;
         let ownership_batch = if include_ownership {
             Some(tensor(
                 &batch,
                 "ownership_logits",
-                &[n, 1, MODEL_BOARD_SIZE, MODEL_BOARD_SIZE],
+                &[n, 1, board_size, board_size],
             )?)
         } else {
             None
         };
         for (i, input) in inputs.iter().enumerate() {
-            let policy_logits = policy_batch[i * POLICY_SIZE..(i + 1) * POLICY_SIZE]
-                .try_into()
-                .unwrap();
+            let compact_policy = &policy_batch[i * policy_size..(i + 1) * policy_size];
             let value_row = &value_batch[i * 3..(i + 1) * 3];
-            let mut output =
-                NNOutput::from_raw(policy_logits, value_row[0], value_row[1], value_row[2]);
+            let mut output = NNOutput::from_raw(
+                compact_policy.into(),
+                value_row[0],
+                value_row[1],
+                value_row[2],
+            );
             if input.include_ownership {
-                let ownership_logits = ownership_batch.unwrap()
-                    [i * BOARD_POLICY_SIZE..(i + 1) * BOARD_POLICY_SIZE]
-                    .try_into()
-                    .unwrap();
-                output = output.with_ownership_logits(ownership_logits);
+                let ownership_logits =
+                    &ownership_batch.unwrap()[i * board_points..(i + 1) * board_points];
+                output = output.with_ownership_logits(ownership_logits.into());
             }
             outputs.push(Arc::new(output));
         }
@@ -164,24 +174,21 @@ fn validate_contract(session: &Session) -> ort::Result<()> {
     validate_ports(
         session.inputs(),
         &[
-            (
-                "spatial",
-                &[NUM_SPATIAL_FEATURES, MODEL_BOARD_SIZE, MODEL_BOARD_SIZE],
-            ),
-            ("global", &[NUM_GLOBAL_FEATURES]),
+            ("spatial", &[NUM_SPATIAL_FEATURES as i64, -1, -1]),
+            ("global", &[NUM_GLOBAL_FEATURES as i64]),
         ],
     )?;
     validate_ports(
         session.outputs(),
         &[
-            ("policy_logits", &[POLICY_SIZE]),
+            ("policy_logits", &[-1]),
             ("value", &[3]),
-            ("ownership_logits", &[1, MODEL_BOARD_SIZE, MODEL_BOARD_SIZE]),
+            ("ownership_logits", &[1, -1, -1]),
         ],
     )
 }
 
-fn validate_ports(ports: &[Outlet], expected: &[(&str, &[usize])]) -> ort::Result<()> {
+fn validate_ports(ports: &[Outlet], expected: &[(&str, &[i64])]) -> ort::Result<()> {
     if ports.len() != expected.len() {
         return Err(ort::Error::new(
             "unexpected number of model inputs or outputs",
@@ -205,7 +212,7 @@ fn validate_ports(ports: &[Outlet], expected: &[(&str, &[usize])]) -> ort::Resul
             || shape[1..]
                 .iter()
                 .zip(dimensions)
-                .any(|(&actual, &expected)| actual != expected as i64)
+                .any(|(&actual, &expected)| actual != expected)
         {
             return Err(ort::Error::new(format!(
                 "invalid shape for {name}: {shape:?}"
@@ -225,14 +232,16 @@ fn tensor<'a>(
         .ok_or_else(|| ort::Error::new(format!("missing output {name}")))?;
     let (shape, values) = output.try_extract_tensor::<f32>()?;
     // Runtime shapes can disagree with declarations even after load validation.
-    debug_assert!(
-        shape.len() == expected.len()
-            && shape
-                .iter()
-                .zip(expected)
-                .all(|(&actual, &expected)| actual == expected as i64),
-        "invalid shape in {name}: expected {expected:?}, got {shape:?}"
-    );
+    if shape.len() != expected.len()
+        || shape
+            .iter()
+            .zip(expected)
+            .any(|(&actual, &expected)| actual != expected as i64)
+    {
+        return Err(ort::Error::new(format!(
+            "invalid shape in {name}: expected {expected:?}, got {shape:?}"
+        )));
+    }
     debug_assert!(
         values.iter().all(|value| value.is_finite()),
         "nonfinite values in {name}"

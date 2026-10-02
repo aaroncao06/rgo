@@ -50,6 +50,10 @@ mod unix {
         }
 
         fn start(model: Option<&str>, make_model_dir: bool) -> Self {
+            Self::start_with_size(model, make_model_dir, 9)
+        }
+
+        fn start_with_size(model: Option<&str>, make_model_dir: bool, board_size: usize) -> Self {
             let dir = std::env::temp_dir().join(format!(
                 "rgo-cli-test-{}-{}",
                 std::process::id(),
@@ -71,7 +75,7 @@ mod unix {
                 .replace("self_play_chunks", "output/chunks");
             fs::write(
                 dir.join("config.toml"),
-                format!("{config}\n[self_play]\nsearch_budget_policy = [{{ probability = 1.0, budget = {{ max_nodes = 0, max_playouts = 0 }} }}]\n"),
+                format!("{config}\n[self_play]\nsearch_budget_policy = [{{ probability = 1.0, budget = {{ max_nodes = 0, max_playouts = 0 }} }}]\n[self_play.rules]\nboard_size = {board_size}\n"),
             )
             .unwrap();
             let log = fs::File::create(dir.join("stderr.log")).unwrap();
@@ -180,8 +184,8 @@ mod unix {
     }
 
     #[test]
-    fn model_commands_publish_durable_chunks_and_drain() {
-        let mut run = TestProcess::worker(None);
+    fn model_commands_publish_compact_chunks_and_drain() {
+        let mut run = TestProcess::start_with_size(None, true, 9);
         run.ready();
         let fixture =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../engine/tests/data/v0.onnx");
@@ -223,6 +227,18 @@ mod unix {
                 u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as u64,
             );
             let checksum_offset = bytes.len() - 32;
+            let records = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+            assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 3);
+            assert_eq!(u32::from_le_bytes(bytes[20..24].try_into().unwrap()), 2);
+            let mut offset = 24;
+            for _ in 0..records {
+                assert_eq!(
+                    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()),
+                    9
+                );
+                offset += 4 + (3 * 81 + 2 + 82 + 3) * 4 + 81;
+            }
+            assert_eq!(offset, checksum_offset);
             assert_eq!(
                 Sha256::digest(&bytes[..checksum_offset]).as_slice(),
                 &bytes[checksum_offset..]

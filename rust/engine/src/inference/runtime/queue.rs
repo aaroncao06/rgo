@@ -1,6 +1,8 @@
 //! Reusable request slots and the shared batch queue.
 
-use crate::inference::{backend::InferenceError, inputs::NNInput, outputs::NNOutput};
+use crate::inference::{
+    SUPPORTED_BOARD_SIZES, backend::InferenceError, inputs::NNInput, outputs::NNOutput,
+};
 use std::{
     collections::VecDeque,
     sync::{Arc, Condvar, Mutex},
@@ -25,7 +27,9 @@ pub(super) struct BatchQueue {
     capacity: usize,
 }
 struct QueueInner {
-    requests: VecDeque<Arc<EvalSlot>>,
+    requests: [VecDeque<Arc<EvalSlot>>; SUPPORTED_BOARD_SIZES.len()],
+    // Each nonempty size appears once. Rotate after dispatch to avoid starvation.
+    ready_sizes: VecDeque<usize>,
     closed: bool, // executor exits thread when queue is closed and empty, instead of waiting
 }
 
@@ -108,25 +112,38 @@ impl BatchQueue {
     pub(super) fn new(capacity: usize) -> Self {
         Self {
             inner: Mutex::new(QueueInner {
-                requests: VecDeque::with_capacity(capacity),
+                requests: std::array::from_fn(|_| VecDeque::new()),
+                ready_sizes: VecDeque::with_capacity(SUPPORTED_BOARD_SIZES.len()),
                 closed: false,
             }),
             state_changed: Condvar::new(),
             capacity,
         }
     }
-    pub(super) fn submit_request(&self, request: Arc<EvalSlot>) -> Result<(), InferenceError> {
+    pub(super) fn submit_request(
+        &self,
+        request: Arc<EvalSlot>,
+        board_size: usize,
+    ) -> Result<(), InferenceError> {
+        let size_index = SUPPORTED_BOARD_SIZES
+            .iter()
+            .position(|&size| size == board_size)
+            .ok_or(InferenceError::UnsupportedBoardSize(board_size))?;
         let mut queue_inner = self.inner.lock().expect("batch queue mutex poisoned");
         if queue_inner.closed {
             return Err(InferenceError::RuntimeClosed);
         }
         // stay debug since this should never be an issue, our queue should be exactly the size fo the number of workers, it is cheap
         debug_assert!(
-            queue_inner.requests.len() < self.capacity,
+            queue_inner.requests.iter().map(|q| q.len()).sum::<usize>() < self.capacity,
             "batch queue capacity exceeded"
         );
 
-        queue_inner.requests.push_back(request);
+        // not currently in ready sizes so push it now
+        if queue_inner.requests[size_index].is_empty() {
+            queue_inner.ready_sizes.push_back(size_index);
+        }
+        queue_inner.requests[size_index].push_back(request);
         drop(queue_inner);
 
         self.state_changed.notify_one();
@@ -142,24 +159,31 @@ impl BatchQueue {
         batch.clear(); //outside the mutex
 
         let mut queue_inner = self.inner.lock().expect("batch queue mutex poisoned");
-        while queue_inner.requests.is_empty() && !queue_inner.closed {
+        while queue_inner.ready_sizes.is_empty() && !queue_inner.closed {
             queue_inner = self
                 .state_changed
                 .wait(queue_inner)
                 .expect("batch queue mutex poisoned");
         }
-        if queue_inner.requests.is_empty() {
+        if queue_inner.ready_sizes.is_empty() {
             debug_assert!(queue_inner.closed);
             return false;
         }
+        let size_index = queue_inner
+            .ready_sizes
+            .pop_front()
+            .expect("a size is ready");
         while batch.len() < max_batch_size {
-            let Some(request) = queue_inner.requests.pop_front() else {
+            let Some(request) = queue_inner.requests[size_index].pop_front() else {
                 break;
             };
             batch.push(request);
         }
 
-        let requests_remain = !queue_inner.requests.is_empty();
+        if !queue_inner.requests[size_index].is_empty() {
+            queue_inner.ready_sizes.push_back(size_index);
+        }
+        let requests_remain = !queue_inner.ready_sizes.is_empty();
         drop(queue_inner);
         if requests_remain {
             self.state_changed.notify_one();

@@ -1,3 +1,6 @@
+/// Board sizes supported by self-play and inference batching.
+pub const SUPPORTED_BOARD_SIZES: [usize; 3] = [9, 13, 19];
+
 pub mod backend;
 pub mod inputs;
 pub mod onnx;

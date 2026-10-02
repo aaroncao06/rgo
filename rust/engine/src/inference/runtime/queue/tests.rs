@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     game::{game_state::GameState, rules::Rules},
-    inference::policy::POLICY_SIZE,
+    inference::policy::MAX_POLICY_SIZE,
 };
 use std::{sync::mpsc, thread, time::Duration};
 
@@ -10,7 +10,12 @@ fn test_input() -> NNInput {
 }
 
 fn test_output() -> Arc<NNOutput> {
-    Arc::new(NNOutput::from_raw([0.0; POLICY_SIZE], 0.0, 0.0, 0.0))
+    Arc::new(NNOutput::from_raw(
+        [0.0; MAX_POLICY_SIZE].into(),
+        0.0,
+        0.0,
+        0.0,
+    ))
 }
 
 #[tokio::test]
@@ -73,9 +78,15 @@ fn receive_batch_is_fifo_and_respects_max_batch_size() {
     let second = Arc::new(EvalSlot::new());
     let third = Arc::new(EvalSlot::new());
 
-    queue.submit_request(Arc::clone(&first)).unwrap();
-    queue.submit_request(Arc::clone(&second)).unwrap();
-    queue.submit_request(Arc::clone(&third)).unwrap();
+    queue
+        .submit_request(Arc::clone(&first), crate::game::board::MAX_BOARD_SIZE)
+        .unwrap();
+    queue
+        .submit_request(Arc::clone(&second), crate::game::board::MAX_BOARD_SIZE)
+        .unwrap();
+    queue
+        .submit_request(Arc::clone(&third), crate::game::board::MAX_BOARD_SIZE)
+        .unwrap();
 
     let mut batch = Vec::new();
     assert!(queue.receive_batch(2, &mut batch));
@@ -89,14 +100,38 @@ fn receive_batch_is_fifo_and_respects_max_batch_size() {
 }
 
 #[test]
+fn batches_group_by_size_keep_fifo_order_and_rotate_between_sizes() {
+    let queue = BatchQueue::new(7);
+    let slots: Vec<_> = (0..7).map(|_| Arc::new(EvalSlot::new())).collect();
+    for (slot, board_size) in slots.iter().zip([9, 13, 9, 19, 9, 13, 9]) {
+        queue.submit_request(slot.clone(), board_size).unwrap();
+    }
+    queue.close();
+    let mut batch = Vec::new();
+    for indices in [&[0, 2][..], &[1, 5], &[3], &[4, 6]] {
+        assert!(queue.receive_batch(2, &mut batch));
+        assert_eq!(batch.len(), indices.len());
+        for (actual, &expected) in batch.iter().zip(indices) {
+            assert!(Arc::ptr_eq(actual, &slots[expected]));
+        }
+    }
+    assert!(!queue.receive_batch(2, &mut batch));
+}
+
+#[test]
 fn closed_queue_drains_requests_then_stops() {
     let queue = BatchQueue::new(1);
     let request = Arc::new(EvalSlot::new());
-    queue.submit_request(Arc::clone(&request)).unwrap();
+    queue
+        .submit_request(Arc::clone(&request), crate::game::board::MAX_BOARD_SIZE)
+        .unwrap();
     queue.close();
 
     assert!(matches!(
-        queue.submit_request(Arc::new(EvalSlot::new())),
+        queue.submit_request(
+            Arc::new(EvalSlot::new()),
+            crate::game::board::MAX_BOARD_SIZE
+        ),
         Err(InferenceError::RuntimeClosed)
     ));
 
@@ -125,7 +160,9 @@ fn submission_wakes_a_waiting_receiver() {
     });
 
     started_rx.recv().unwrap();
-    queue.submit_request(Arc::clone(&request)).unwrap();
+    queue
+        .submit_request(Arc::clone(&request), crate::game::board::MAX_BOARD_SIZE)
+        .unwrap();
 
     let (received, batch) = result_rx
         .recv_timeout(Duration::from_secs(1))
@@ -159,4 +196,17 @@ fn close_wakes_a_waiting_receiver() {
             .expect("receiver did not wake after closure")
     );
     receiver.join().unwrap();
+}
+
+#[test]
+fn unsupported_sizes_are_rejected_without_queuing() {
+    let queue = BatchQueue::new(1);
+    for size in [0, 1, 5, 7, 8, 10, 12, 14, 18, 20, usize::MAX] {
+        assert!(matches!(
+            queue.submit_request(Arc::new(EvalSlot::new()), size),
+            Err(InferenceError::UnsupportedBoardSize(actual)) if actual == size
+        ));
+    }
+    queue.close();
+    assert!(!queue.receive_batch(1, &mut Vec::new()));
 }

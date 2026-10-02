@@ -239,19 +239,19 @@ mod tests {
     use super::*;
     use crate::{
         game::{game_state::GameState, rules::Rules},
-        inference::{inputs::NNInput, policy::POLICY_SIZE},
+        inference::{inputs::NNInput, policy::MAX_POLICY_SIZE},
         training_data::{TrainingSample, ValueTarget, encode_chunk, verify_chunk_checksum},
     };
 
     fn sample() -> TrainingSample {
         TrainingSample {
             input: NNInput::encode(&GameState::new(Rules::TROMP_TAYLORISH_9)),
-            policy_target: [0.0; POLICY_SIZE],
+            policy_target: [0.0; MAX_POLICY_SIZE],
             value_target: ValueTarget {
                 win_probability: 0.5,
                 score_mean: 0.0,
                 score_stdev: 1.0,
-                ownership: [1; crate::inference::policy::BOARD_POLICY_SIZE],
+                ownership: [1; crate::game::board::MAX_BOARD_POINTS],
             },
         }
     }

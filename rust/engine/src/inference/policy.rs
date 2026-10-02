@@ -1,46 +1,56 @@
-use crate::game::board::{Board, Loc};
+use crate::game::board::{Board, Loc, MAX_BOARD_POINTS, MAX_BOARD_SIZE};
 use crate::game::game_state::GameState;
 
-/// Current model geometry, independent of the engine's storage capacity.
-pub const MODEL_BOARD_SIZE: usize = 9;
-pub const BOARD_POLICY_SIZE: usize = MODEL_BOARD_SIZE * MODEL_BOARD_SIZE;
-pub const PASS_POLICY_INDEX: usize = BOARD_POLICY_SIZE;
-pub const POLICY_SIZE: usize = BOARD_POLICY_SIZE + 1;
+/// Capacity for fixed policy scratch arrays; actual policies have board_size² + 1 entries.
+pub const MAX_POLICY_SIZE: usize = MAX_BOARD_POINTS + 1;
 
-/// Convert an on-board location or pass after validating model geometry.
+/// Convert an active-board location or pass to the compact policy.
 pub fn loc_to_policy(board: &Board, loc: Loc) -> usize {
     // Map a Loc action to its index in the dense NN policy.
-    debug_assert_eq!(
-        board.size(),
-        MODEL_BOARD_SIZE,
-        "policy geometry must match the board"
-    );
     debug_assert!(loc != Loc::NULL);
     if loc == Loc::PASS {
-        return PASS_POLICY_INDEX;
+        return board.size() * board.size();
     }
     let (x, y) = board.coords_assume_on_board(loc);
-    x + y * MODEL_BOARD_SIZE
+    x + y * board.size()
 }
 
-/// Convert a valid policy index after validating model geometry.
+/// Convert an active-board policy index or pass to a location.
 pub fn policy_to_loc(board: &Board, i: usize) -> Loc {
-    debug_assert_eq!(
-        board.size(),
-        MODEL_BOARD_SIZE,
-        "policy geometry must match the board"
-    );
-    debug_assert!(i < POLICY_SIZE);
-    if i == PASS_POLICY_INDEX {
+    let size = board.size();
+    debug_assert!(i <= size * size);
+    if i == size * size {
         return Loc::PASS;
     }
-    board.loc_assume_on_board(i % MODEL_BOARD_SIZE, i / MODEL_BOARD_SIZE)
+    board.loc_assume_on_board(i % size, i / size)
 }
 
-pub fn legal_mask(game_state: &GameState) -> [bool; POLICY_SIZE] {
-    let mut mask = [false; POLICY_SIZE];
-    for (i, allowed) in mask.iter_mut().enumerate() {
-        *allowed = game_state.is_legal(policy_to_loc(game_state.board(), i));
+/// Index an active point in a fixed-capacity spatial plane.
+pub fn loc_to_spatial(board: &Board, loc: Loc) -> usize {
+    let (x, y) = board.coords_assume_on_board(loc);
+    x + y * MAX_BOARD_SIZE
+}
+
+/// Active rows of a fixed-capacity plane, without the trailing storage columns.
+pub fn active_rows<T>(
+    plane: &[T; MAX_BOARD_POINTS],
+    board_size: usize,
+) -> impl Iterator<Item = &[T]> {
+    debug_assert!((1..=MAX_BOARD_SIZE).contains(&board_size));
+    plane
+        .as_chunks::<MAX_BOARD_SIZE>()
+        .0
+        .iter()
+        .take(board_size)
+        .map(move |row| &row[..board_size])
+}
+
+/// Compact policy mask in a fixed-capacity scratch array; the unused tail is false.
+pub fn legal_mask(game_state: &GameState) -> [bool; MAX_POLICY_SIZE] {
+    let mut mask = [false; MAX_POLICY_SIZE];
+    let board = game_state.board();
+    for loc in board.locs().chain(std::iter::once(Loc::PASS)) {
+        mask[loc_to_policy(board, loc)] = game_state.is_legal(loc);
     }
     mask
 }
@@ -52,7 +62,7 @@ mod tests {
 
     #[test]
     fn corner_policy_indices_are_row_major() {
-        let board = Board::new(MODEL_BOARD_SIZE);
+        let board = Board::new(MAX_BOARD_SIZE);
         assert_eq!(loc_to_policy(&board, board.loc(0, 0).unwrap()), 0);
         assert_eq!(loc_to_policy(&board, board.loc(8, 0).unwrap()), 8);
         assert_eq!(loc_to_policy(&board, board.loc(0, 8).unwrap()), 72);
@@ -61,17 +71,35 @@ mod tests {
 
     #[test]
     fn every_policy_slot_round_trips_to_its_location() {
-        let board = Board::new(MODEL_BOARD_SIZE);
-        for i in 0..POLICY_SIZE {
-            assert_eq!(loc_to_policy(&board, policy_to_loc(&board, i)), i);
+        for size in 1..=MAX_BOARD_SIZE {
+            let board = Board::new(size);
+            for i in 0..=size * size {
+                assert_eq!(loc_to_policy(&board, policy_to_loc(&board, i)), i);
+            }
         }
     }
 
-    #[cfg(debug_assertions)]
     #[test]
-    #[should_panic(expected = "policy geometry must match the board")]
-    fn incompatible_policy_geometry_is_a_contract_violation() {
-        policy_to_loc(&Board::new(5), 0);
+    fn compact_policy_uses_the_active_stride_and_masks_the_unused_scratch_tail() {
+        let state = GameState::new(Rules {
+            board_size: 5,
+            ..Rules::default()
+        });
+        let board = state.board();
+        let mask = legal_mask(&state);
+        for (i, &legal) in mask[..25].iter().enumerate() {
+            assert!(legal);
+            let point = policy_to_loc(board, i);
+            assert!(board.is_on_board(point));
+            assert_eq!(loc_to_policy(board, point), i);
+            assert_eq!(board.coords(point), Some((i % 5, i / 5)));
+        }
+        assert!(mask[25]);
+        assert!(mask[26..].iter().all(|&legal| !legal));
+        assert_eq!(policy_to_loc(board, 25), Loc::PASS);
+        let corner = board.loc(4, 4).unwrap();
+        assert_eq!(loc_to_policy(board, corner), 24);
+        assert_eq!(loc_to_spatial(board, corner), 4 + 4 * MAX_BOARD_SIZE);
     }
 
     #[test]

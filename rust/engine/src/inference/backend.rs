@@ -2,34 +2,34 @@ use std::sync::Arc;
 
 use crate::inference::outputs::NNOutput;
 
-#[cfg(test)]
-use crate::inference::policy::POLICY_SIZE;
-
 use super::inputs::NNInput;
 
 #[derive(Debug, Clone)]
 pub enum InferenceError {
-    UnsupportedBoardSize { board_size: usize },
     ExecutionFailed,
     MismatchedBatchOutput,
     RuntimeClosed,
+    UnsupportedBoardSize(usize),
     Onnx(Arc<ort::Error>),
 }
 pub trait InferenceBackend {
     /// Evaluate raw model activations in input order.
     ///
     /// The executor supplies a nonempty input batch and an empty, reusable
-    /// output vector. On success,
+    /// output vector. Every input in a batch has the same active board size.
+    /// On success,
     /// append exactly one output per input; return an error if the backend
     /// cannot produce that complete batch. Partial outputs on error are ignored.
     /// Returned raw activations must be finite. This is a model/backend contract
     /// invariant checked with debug assertions, not a release-time tensor scan.
     /// Each output must be unprocessed and exclusively owned: do not retain
     /// other strong or weak Arc references or share one output between rows.
+    /// Policy contains exactly board_size² active row-major logits, then pass.
     /// The client uses Arc::get_mut to apply legal masking and perspective/score
     /// transformations before sharing the result with the model cache and search.
     /// When input.include_ownership is true, attach current-player ownership
-    /// logits via with_ownership_logits. Other requests may omit that output.
+    /// logits as an exact-size, row-major boxed plane of board_size² values
+    /// via with_ownership_logits. Other requests may omit that output.
     fn evaluate_batch(
         &mut self,
         inputs: &[NNInput],
@@ -53,10 +53,16 @@ impl InferenceBackend for DummyInferenceBackend {
         debug_assert!(outputs.is_empty()); // up to the executor to clear before calling
         // outputs.reserve(inputs.len()); //should be noop if you are keeping consistent batch sizes, safeguard
         for input in inputs {
-            let mut output = NNOutput::from_raw([0.0; POLICY_SIZE], 0.0, 0.0, 0.0);
+            let mut output = NNOutput::from_raw(
+                vec![0.0; input.board_size * input.board_size + 1].into_boxed_slice(),
+                0.0,
+                0.0,
+                0.0,
+            );
             if input.include_ownership {
-                output = output
-                    .with_ownership_logits([0.0; crate::inference::policy::BOARD_POLICY_SIZE]);
+                output = output.with_ownership_logits(
+                    vec![0.0; input.board_size * input.board_size].into_boxed_slice(),
+                );
             }
             outputs.push(Arc::new(output));
         }

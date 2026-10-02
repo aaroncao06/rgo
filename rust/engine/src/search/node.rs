@@ -101,7 +101,7 @@ impl SearchNode {
         let white_utility = self.white_utility();
         self.record_visit(white_win, white_score, white_score_mean_sq, white_utility);
     }
-    pub(super) fn policy_probs(&self) -> &[f32; crate::inference::policy::POLICY_SIZE] {
+    pub(super) fn policy_probs(&self) -> &[f32] {
         self.nn_output
             .as_ref()
             .expect("search nodes must be evaluated before traversal")
@@ -110,7 +110,7 @@ impl SearchNode {
     /// Prepare the root policy before creating children. Clones the inference
     /// output if it is shared, so cached outputs remain unchanged. Existing
     /// edges retain their own priors and would not reflect later policy edits.
-    pub(super) fn policy_probs_mut(&mut self) -> &mut [f32; crate::inference::policy::POLICY_SIZE] {
+    pub(super) fn policy_probs_mut(&mut self) -> &mut [f32] {
         std::sync::Arc::make_mut(
             self.nn_output
                 .as_mut()
@@ -239,17 +239,26 @@ impl ChildStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{game::board::Player, inference::policy::POLICY_SIZE};
+    use crate::{game::board::Player, inference::policy::MAX_POLICY_SIZE};
 
     fn loc(x: usize, y: usize) -> Loc {
         crate::game::board::Board::new(9).loc(x, y).unwrap()
     }
 
     fn processed_output() -> Arc<NNOutput> {
-        let mut output = Arc::new(NNOutput::from_raw([0.0; POLICY_SIZE], 0.0, 0.0, 0.0));
+        let mut output = Arc::new(NNOutput::from_raw(
+            [0.0; MAX_POLICY_SIZE].into(),
+            0.0,
+            0.0,
+            0.0,
+        ));
         Arc::get_mut(&mut output)
             .expect("test output is exclusively owned")
-            .process_in_place(Player::White, &[true; POLICY_SIZE]);
+            .process_in_place(
+                Player::White,
+                &[true; MAX_POLICY_SIZE],
+                crate::game::board::MAX_BOARD_SIZE,
+            );
         output
     }
 

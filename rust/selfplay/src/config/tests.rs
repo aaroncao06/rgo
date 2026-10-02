@@ -43,9 +43,9 @@ fn partial_algorithm_overrides_preserve_other_defaults() {
 }
 
 #[test]
-fn board_size_must_fit_storage_and_the_current_model() {
+fn board_size_must_be_supported_and_fit_storage() {
     SelfPlayConfig::from_toml(&format!("{EXAMPLE}\n[self_play.rules]\nboard_size = 9\n")).unwrap();
-    for size in [0, 10, usize::MAX] {
+    for size in [0, 1, 5, 7, 8, 10, 13, 19, usize::MAX] {
         assert!(matches!(
             SelfPlayConfig::from_toml(&format!(
                 "{EXAMPLE}\n[self_play.rules]\nboard_size = {size}\n"
@@ -53,12 +53,6 @@ fn board_size_must_fit_storage_and_the_current_model() {
             Err(ConfigError::Invalid(_)) | Err(ConfigError::Parse(_))
         ));
     }
-    assert!(matches!(
-        SelfPlayConfig::from_toml(&format!("{EXAMPLE}\n[self_play.rules]\nboard_size = 5\n")),
-        Err(ConfigError::Invalid(
-            "the current self-play model requires a 9x9 board"
-        ))
-    ));
 }
 
 #[test]

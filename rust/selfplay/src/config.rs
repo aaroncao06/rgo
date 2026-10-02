@@ -86,10 +86,10 @@ impl SelfPlayConfig {
             }
         }
         self.inference.validate()?;
-        self.self_play.rules.validate()?;
-        if self.self_play.rules.board_size != crate::inference::policy::MODEL_BOARD_SIZE {
-            return Err("the current self-play model requires a 9x9 board");
+        if !crate::inference::SUPPORTED_BOARD_SIZES.contains(&self.self_play.rules.board_size) {
+            return Err("self-play board_size must be 9, 13, or 19");
         }
+        self.self_play.rules.validate()?;
         self.self_play.search_budget_policy.validate()?;
         self.search.validate()?;
         Ok(())

@@ -2,6 +2,8 @@ use super::hash::{Hash128, board_size_hash, stone_hash};
 
 /// Storage capacity, independent of a game's active board size.
 pub const MAX_BOARD_SIZE: usize = 9;
+/// Number of playable points at the maximum storage capacity.
+pub const MAX_BOARD_POINTS: usize = MAX_BOARD_SIZE * MAX_BOARD_SIZE;
 const STRIDE: usize = MAX_BOARD_SIZE + 1; // first element of each row is the wall
 pub const ARRAY_LEN: usize = STRIDE * STRIDE + STRIDE + 1; //need bottom row of walls and bottom corner
 

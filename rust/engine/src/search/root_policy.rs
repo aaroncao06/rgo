@@ -3,14 +3,11 @@
 use rand::RngExt;
 use std::f64::consts::TAU;
 
-use crate::inference::policy::POLICY_SIZE;
+use crate::inference::policy::MAX_POLICY_SIZE;
 
 /// Apply the stable power transform before adding root noise.
-pub(super) fn apply_temperature(
-    policy: &mut [f32; POLICY_SIZE],
-    legal: &[bool; POLICY_SIZE],
-    temperature: f64,
-) {
+pub(super) fn apply_temperature(policy: &mut [f32], legal: &[bool], temperature: f64) {
+    debug_assert_eq!(policy.len(), legal.len());
     debug_assert!(temperature.is_finite() && temperature > 0.0);
 
     if (temperature - 1.0).abs() > f64::EPSILON {
@@ -42,12 +39,14 @@ pub(super) fn apply_temperature(
 /// Mix in KataGo's Dirichlet draw, whose alpha distribution combines uniform
 /// mass with the clipped log policy after temperature adjustment.
 pub(super) fn add_dirichlet_noise<R: RngExt + ?Sized>(
-    policy: &mut [f32; POLICY_SIZE],
-    legal: &[bool; POLICY_SIZE],
+    policy: &mut [f32],
+    legal: &[bool],
     noise_total_concentration: f64,
     noise_weight: f64,
     rng: &mut R,
 ) {
+    debug_assert_eq!(policy.len(), legal.len());
+    debug_assert!(policy.len() <= MAX_POLICY_SIZE);
     if noise_weight == 0.0 {
         return;
     }
@@ -57,9 +56,9 @@ pub(super) fn add_dirichlet_noise<R: RngExt + ?Sized>(
     let legal_count = legal.iter().filter(|&&is_legal| is_legal).count();
     debug_assert!(legal_count > 0);
     let legal_count_f64 = legal_count as f64;
-    let mut alpha = [0.0; POLICY_SIZE];
+    let mut alpha = [0.0; MAX_POLICY_SIZE];
     let mut log_policy_sum = 0.0;
-    for i in 0..POLICY_SIZE {
+    for i in 0..policy.len() {
         if legal[i] {
             alpha[i] = (f64::from(policy[i]).min(0.01) + 1e-20).ln();
             log_policy_sum += alpha[i];
@@ -67,38 +66,38 @@ pub(super) fn add_dirichlet_noise<R: RngExt + ?Sized>(
     }
     let log_policy_mean = log_policy_sum / legal_count_f64;
     let mut alpha_prop_sum = 0.0;
-    for i in 0..POLICY_SIZE {
+    for i in 0..policy.len() {
         if legal[i] {
             alpha[i] = (alpha[i] - log_policy_mean).max(0.0);
             alpha_prop_sum += alpha[i];
         }
     }
     if alpha_prop_sum <= 0.0 {
-        for i in 0..POLICY_SIZE {
+        for i in 0..policy.len() {
             if legal[i] {
                 alpha[i] = 1.0 / legal_count_f64;
             }
         }
     } else {
-        for i in 0..POLICY_SIZE {
+        for i in 0..policy.len() {
             if legal[i] {
                 alpha[i] = 0.5 * (alpha[i] / alpha_prop_sum + 1.0 / legal_count_f64);
             }
         }
     }
 
-    let mut noise = [0.0; POLICY_SIZE];
+    let mut noise = [0.0; MAX_POLICY_SIZE];
     let mut noise_sum = 0.0;
     // Reuse both Box–Muller samples across gamma draws for this root.
     let mut spare_normal = None;
-    for i in 0..POLICY_SIZE {
+    for i in 0..policy.len() {
         if legal[i] {
             noise[i] = gamma_sample(alpha[i] * noise_total_concentration, rng, &mut spare_normal);
             noise_sum += noise[i];
         }
     }
     debug_assert!(noise_sum > 0.0 && noise_sum.is_finite());
-    for i in 0..POLICY_SIZE {
+    for i in 0..policy.len() {
         if legal[i] {
             let draw = noise[i] / noise_sum;
             policy[i] = (draw * noise_weight + f64::from(policy[i]) * (1.0 - noise_weight)) as f32;
@@ -162,8 +161,8 @@ mod tests {
 
     #[test]
     fn root_policy_temperature_matches_katago_power_transform() {
-        let mut policy = [0.0; POLICY_SIZE];
-        let mut legal = [false; POLICY_SIZE];
+        let mut policy = [0.0; MAX_POLICY_SIZE];
+        let mut legal = [false; MAX_POLICY_SIZE];
         for (index, probability) in [0.25_f32, 0.5, 0.25].into_iter().enumerate() {
             policy[index] = probability;
             legal[index] = true;
@@ -179,9 +178,9 @@ mod tests {
 
     #[test]
     fn noise_reaches_zero_probability_legal_moves_but_not_illegal_moves() {
-        let mut policy = [0.0; POLICY_SIZE];
+        let mut policy = [0.0; MAX_POLICY_SIZE];
         policy[0] = 1.0;
-        let mut legal = [false; POLICY_SIZE];
+        let mut legal = [false; MAX_POLICY_SIZE];
         legal[0] = true;
         legal[1] = true;
         let mut rng = SmallRng::seed_from_u64(19);
@@ -198,8 +197,8 @@ mod tests {
 
     #[test]
     fn root_dirichlet_noise_preserves_legal_probability_mass() {
-        let mut policy = [0.0; POLICY_SIZE];
-        let mut legal = [false; POLICY_SIZE];
+        let mut policy = [0.0; MAX_POLICY_SIZE];
+        let mut legal = [false; MAX_POLICY_SIZE];
         for (index, probability) in [0.6_f32, 0.3, 0.1].into_iter().enumerate() {
             policy[index] = probability;
             legal[index] = true;

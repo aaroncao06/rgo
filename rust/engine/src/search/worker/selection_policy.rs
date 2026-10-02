@@ -6,7 +6,7 @@ use crate::{
         board::{Loc, Player},
         game_state::GameState,
     },
-    inference::policy::{POLICY_SIZE, loc_to_policy, policy_to_loc},
+    inference::policy::{MAX_POLICY_SIZE, loc_to_policy},
     search::{
         node::{EdgeIndex, SearchNode},
         node_store::NodeStore,
@@ -42,7 +42,7 @@ impl<N: NodeStore> SearchWorker<N> {
         let mut best_edge = None;
         let mut best_selection_value = f64::NEG_INFINITY;
         let policy_probs = node.policy_probs();
-        let mut expanded = [false; POLICY_SIZE];
+        let mut expanded = [false; MAX_POLICY_SIZE];
         for (edge_index, edge) in node.indexed_edges() {
             let move_loc = edge.move_loc();
             let policy_index = loc_to_policy(game_state.board(), move_loc);
@@ -92,11 +92,13 @@ impl<N: NodeStore> SearchWorker<N> {
         // highest-policy legal candidate needs scoring. The mask avoids lookups.
         let mut best_new_move = Loc::NULL;
         let mut best_new_policy = -1.0_f32;
-        for (policy_index, &probability) in policy_probs.iter().enumerate() {
+        let board = game_state.board();
+        for move_loc in board.locs().chain(std::iter::once(Loc::PASS)) {
+            let policy_index = loc_to_policy(board, move_loc);
             if expanded[policy_index] {
                 continue;
             }
-            let move_loc = policy_to_loc(game_state.board(), policy_index);
+            let probability = policy_probs[policy_index];
             if game_state.is_legal(move_loc)
                 && probability > best_new_policy
                 && root.is_none_or(|root| root.is_allowed_move(move_loc, self.params))
