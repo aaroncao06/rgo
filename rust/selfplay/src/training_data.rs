@@ -1,8 +1,10 @@
 use crate::game::board::MAX_BOARD_AREA;
 use crate::inference::{
     inputs::{NNInput, NUM_GLOBAL_FEATURES, NUM_SPATIAL_FEATURES},
-    policy::{MAX_POLICY_SIZE, active_rows},
+    policy::active_rows,
 };
+use crate::search::worker::PolicyTarget;
+use half::f16;
 use sha2::{Digest, Sha256};
 
 pub(super) const CHUNK_MAGIC: [u8; 8] = *b"RGOCHNK\0";
@@ -10,7 +12,7 @@ pub(super) const CHUNK_FORMAT_VERSION: u32 = 1;
 pub(super) const CHUNK_HEADER_SIZE: usize = 8 + 4 * size_of::<u32>();
 pub(super) const CHUNK_CHECKSUM_SIZE: usize = 32;
 /// Each record stores: board dimension (u8), binary spatial planes, global
-/// features (f32), policy including pass (f32), three value targets (f32), and
+/// features (f32), policy including pass (f16), three value targets (f32), and
 /// ownership labels. Only active cells are stored, in row-major order.
 ///
 /// Each spatial plane uses one bit per cell and starts on a byte boundary;
@@ -21,7 +23,8 @@ pub(super) fn training_record_size(board_dim: usize) -> usize {
     let board_area = board_dim * board_dim;
     size_of::<u8>()
         + NUM_SPATIAL_FEATURES * board_area.div_ceil(8)
-        + (NUM_GLOBAL_FEATURES + board_area + 1 + 3) * size_of::<f32>()
+        + (NUM_GLOBAL_FEATURES + 3) * size_of::<f32>()
+        + (board_area + 1) * size_of::<f16>()
         + (2 * board_area).div_ceil(8)
 }
 
@@ -38,7 +41,7 @@ pub(super) struct ValueTarget {
 // spatial inputs and ownership retain the maximum row stride.
 pub(super) struct TrainingSample {
     pub(super) input: NNInput,
-    pub(super) policy_target: [f32; MAX_POLICY_SIZE],
+    pub(super) policy_target: PolicyTarget,
     pub(super) value_target: ValueTarget,
 }
 
@@ -110,7 +113,7 @@ impl ChunkEncoder {
             extend_packed::<1>(&mut self.bytes, cells);
         }
         extend_f32s(&mut self.bytes, &sample.input.global);
-        extend_f32s(
+        extend_f16s(
             &mut self.bytes,
             &sample.policy_target[..board_dim * board_dim + 1],
         );
@@ -168,6 +171,12 @@ fn extend_f32s(bytes: &mut Vec<u8>, values: &[f32]) {
     }
 }
 
+fn extend_f16s(bytes: &mut Vec<u8>, values: &[f16]) {
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
 fn extend_packed<const BITS: u32>(bytes: &mut Vec<u8>, values: impl Iterator<Item = u8>) {
     let mut byte = 0;
     let mut shift = 0;
@@ -218,6 +227,7 @@ mod tests {
     use super::*;
     use crate::game::board::MAX_BOARD_DIM;
     use crate::game::{game_state::GameState, rules::Rules};
+    use crate::inference::policy::MAX_POLICY_SIZE;
 
     fn sample(board_dim: usize) -> TrainingSample {
         let mut input = NNInput::encode(&GameState::new(Rules {
@@ -237,7 +247,9 @@ mod tests {
         input.global[1] = -0.0;
         TrainingSample {
             input,
-            policy_target: std::array::from_fn(|i| i as f32 + 0.25),
+            policy_target: std::array::from_fn(|i| {
+                f16::from_f64(i as f64 / MAX_POLICY_SIZE as f64)
+            }),
             value_target: ValueTarget {
                 win_probability: 0.75,
                 score_mean: 3.5,
@@ -283,22 +295,20 @@ mod tests {
                     }
                 }
             }
-            for value in sample
-                .input
-                .global
-                .iter()
-                .copied()
-                .chain(
-                    sample.policy_target[..board_dim * board_dim + 1]
-                        .iter()
-                        .copied(),
-                )
-                .chain([
-                    sample.value_target.win_probability,
-                    sample.value_target.score_mean,
-                    sample.value_target.score_stdev,
-                ])
-            {
+            for value in sample.input.global {
+                assert_eq!(read_f32(&bytes, offset).to_bits(), value.to_bits());
+                offset += 4;
+            }
+            for value in &sample.policy_target[..board_dim * board_dim + 1] {
+                let stored = f16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap());
+                assert_eq!(stored.to_bits(), value.to_bits());
+                offset += 2;
+            }
+            for value in [
+                sample.value_target.win_probability,
+                sample.value_target.score_mean,
+                sample.value_target.score_stdev,
+            ] {
                 assert_eq!(read_f32(&bytes, offset).to_bits(), value.to_bits());
                 offset += 4;
             }
@@ -313,6 +323,21 @@ mod tests {
             }
             assert_eq!(offset + CHUNK_CHECKSUM_SIZE, bytes.len());
         }
+    }
+
+    #[test]
+    fn policy_storage_uses_little_endian_binary16_and_preserves_subnormals() {
+        let mut sample = sample(1);
+        sample.policy_target[0] = f16::from_f64(1.0 / 3.0);
+        sample.policy_target[1] = f16::from_bits(1);
+        let bytes = encode_chunk(&[sample]);
+        let policy_offset =
+            CHUNK_HEADER_SIZE + 1 + NUM_SPATIAL_FEATURES + NUM_GLOBAL_FEATURES * size_of::<f32>();
+        assert_eq!(
+            &bytes[policy_offset..policy_offset + 4],
+            &[0x55, 0x35, 0x01, 0x00]
+        );
+        assert!(verify_chunk_checksum(&bytes));
     }
 
     #[test]
@@ -361,9 +386,9 @@ mod tests {
             );
             assert_eq!(offset, bytes.len());
         }
-        assert_eq!(training_record_size(9), 403);
-        assert_eq!(training_record_size(13), 810);
-        assert_eq!(training_record_size(19), 1698);
+        assert_eq!(training_record_size(9), 239);
+        assert_eq!(training_record_size(13), 470);
+        assert_eq!(training_record_size(19), 974);
     }
 
     #[test]
@@ -390,7 +415,7 @@ mod tests {
     fn chunk_checksum_rejects_corrupted_payload() {
         let sample = TrainingSample {
             input: NNInput::encode(&GameState::new(Rules::TROMP_TAYLORISH_9)),
-            policy_target: [0.25; MAX_POLICY_SIZE],
+            policy_target: [f16::from_f32(0.25); MAX_POLICY_SIZE],
             value_target: ValueTarget {
                 win_probability: 0.75,
                 score_mean: 3.5,

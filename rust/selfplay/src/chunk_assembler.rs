@@ -246,7 +246,7 @@ mod tests {
     fn sample() -> TrainingSample {
         TrainingSample {
             input: NNInput::encode(&GameState::new(Rules::TROMP_TAYLORISH_9)),
-            policy_target: [0.0; MAX_POLICY_SIZE],
+            policy_target: [half::f16::ZERO; MAX_POLICY_SIZE],
             value_target: ValueTarget {
                 win_probability: 0.5,
                 score_mean: 0.0,

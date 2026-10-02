@@ -97,10 +97,14 @@ struct PlayoutStep {
     player: Player,
 }
 
+/// Policy probabilities rounded once to binary16 for training-data storage.
+/// Search and move selection compute with the original full-precision weights.
+pub type PolicyTarget = [half::f16; crate::inference::policy::MAX_POLICY_SIZE];
+
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     pub selected_move: Loc,
-    pub policy_target: [f32; crate::inference::policy::MAX_POLICY_SIZE],
+    pub policy_target: PolicyTarget,
     pub value_target: SearchValueTarget,
 }
 

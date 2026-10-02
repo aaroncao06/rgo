@@ -2,7 +2,7 @@
 //! reduced-weight/LCB adjustments, and temperature sampling.
 
 use super::{
-    SearchError, SearchResult, SearchValueTarget, SearchWorker,
+    PolicyTarget, SearchError, SearchResult, SearchValueTarget, SearchWorker,
     selection_policy::{exploration_scaling, selection_value},
 };
 use crate::{
@@ -286,17 +286,13 @@ impl<N: NodeStore> SearchWorker<N> {
     }
 }
 
-fn normalized_policy_target(
-    board: &Board,
-    moves: &[Loc],
-    weights: &[f64],
-) -> [f32; crate::inference::policy::MAX_POLICY_SIZE] {
+fn normalized_policy_target(board: &Board, moves: &[Loc], weights: &[f64]) -> PolicyTarget {
     debug_assert_eq!(moves.len(), weights.len());
     let weight_sum: f64 = weights.iter().sum();
     debug_assert!(weight_sum > 0.0);
-    let mut target = [0.0; crate::inference::policy::MAX_POLICY_SIZE];
+    let mut target = [half::f16::ZERO; crate::inference::policy::MAX_POLICY_SIZE];
     for (&move_loc, &weight) in moves.iter().zip(weights) {
-        target[loc_to_policy(board, move_loc)] = (weight / weight_sum) as f32;
+        target[loc_to_policy(board, move_loc)] = half::f16::from_f64(weight / weight_sum);
     }
     target
 }
@@ -330,5 +326,27 @@ impl<N: NodeStore> SearchWorker<N> {
             self.params.use_lcb_for_selection,
         )?;
         Ok((moves, weights))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game::board::MAX_BOARD_DIM;
+
+    #[test]
+    fn policy_targets_normalize_weights_and_leave_unused_slots_zero() {
+        for dim in 1..=MAX_BOARD_DIM {
+            let board = Board::new(dim);
+            let first = board.loc(0, 0).unwrap();
+            let target = normalized_policy_target(&board, &[first, Loc::PASS], &[1.0, 3.0]);
+            assert_eq!(target[0], half::f16::from_f64(0.25));
+            assert_eq!(target[dim * dim], half::f16::from_f64(0.75));
+            for (i, value) in target.iter().enumerate() {
+                if i != 0 && i != dim * dim {
+                    assert_eq!(value.to_bits(), 0);
+                }
+            }
+        }
     }
 }

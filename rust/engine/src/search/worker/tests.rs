@@ -290,8 +290,8 @@ async fn search_returns_move_and_policy_target_without_mutating_the_position() {
         let chosen = result.selected_move;
         assert_eq!(chosen, preferred);
         assert!(state.is_legal(chosen));
-        assert!((result.policy_target.iter().sum::<f32>() - 1.0).abs() < 1e-6);
-        assert!(result.policy_target[loc_to_policy(chosen)] > 0.0);
+        assert!((result.policy_target.iter().map(|p| p.to_f64()).sum::<f64>() - 1.0).abs() < 5e-4);
+        assert!(result.policy_target[loc_to_policy(chosen)] > half::f16::ZERO);
         assert_eq!(GraphKey::new(&state), key);
         assert_eq!(state.turn_number(), 1);
         assert_eq!(
@@ -467,14 +467,23 @@ async fn final_lcb_weights_use_edge_sample_size_for_transpositions() {
     let boosted = 52.480_946_693_222_53;
     let subtract = boosted / 64.0;
     let expected = (boosted - subtract) / (25.0 + boosted - 2.0 * subtract);
-    assert!((f64::from(result.policy_target[loc_to_policy(moves[1])]) - expected).abs() < 1e-7);
+    assert_eq!(
+        result.policy_target[loc_to_policy(moves[1])],
+        half::f16::from_f32(expected as f32)
+    );
     assert_eq!(result.selected_move, moves[0]);
     // Disabling LCB makes sampling and training use the same pruned weights.
     worker.params.use_lcb_for_selection = false;
     let result = worker.build_search_result(&mut rng).unwrap();
     assert_eq!(result.selected_move, moves[0]);
-    assert_eq!(result.policy_target[loc_to_policy(moves[0])], 0.5);
-    assert_eq!(result.policy_target[loc_to_policy(moves[1])], 0.5);
+    assert_eq!(
+        result.policy_target[loc_to_policy(moves[0])],
+        half::f16::from_f32(0.5)
+    );
+    assert_eq!(
+        result.policy_target[loc_to_policy(moves[1])],
+        half::f16::from_f32(0.5)
+    );
     assert_eq!(graph_snapshot(&worker), before);
 }
 

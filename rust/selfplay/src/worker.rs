@@ -14,13 +14,15 @@ use crate::{
     },
     inference::{
         inputs::NNInput,
-        policy::{MAX_POLICY_SIZE, loc_to_spatial},
+        policy::loc_to_spatial,
         runtime::{InferenceClient, ModelHandle},
     },
     search::{
         node_store::FixedArenaNodeStore,
         params::SearchParams,
-        worker::{SearchBudget, SearchError, SearchResult, SearchValueTarget, SearchWorker},
+        worker::{
+            PolicyTarget, SearchBudget, SearchError, SearchResult, SearchValueTarget, SearchWorker,
+        },
     },
 };
 
@@ -39,7 +41,7 @@ fn derive_rng_seed(global_seed: u64, worker_index: u64, stream: u64) -> u64 {
 struct SelfPlayRecord {
     player: Player,
     selected_move: Loc, // to reconstruct nn input when we replay the game to finalize
-    policy_target: [f32; MAX_POLICY_SIZE],
+    policy_target: PolicyTarget,
     search_value_target: SearchValueTarget,
 }
 
@@ -316,8 +318,9 @@ mod tests {
             let mut records = Vec::new();
 
             for (turn, move_loc) in moves.into_iter().enumerate() {
-                let mut policy_target = [0.0; MAX_POLICY_SIZE];
-                policy_target[loc_to_policy(game_state.board(), move_loc)] = 1.0;
+                let mut policy_target =
+                    [half::f16::ZERO; crate::inference::policy::MAX_POLICY_SIZE];
+                policy_target[loc_to_policy(game_state.board(), move_loc)] = half::f16::ONE;
                 records.push(SelfPlayRecord {
                     player: game_state.next_player(),
                     selected_move: move_loc,
@@ -346,7 +349,7 @@ mod tests {
             assert_eq!(samples[0].input.spatial[center_spatial], 0);
             assert_eq!(samples[1].input.spatial[MAX_BOARD_AREA + center_spatial], 1);
             assert_eq!(samples[2].input.spatial[center_spatial], 1);
-            assert_eq!(samples[0].policy_target[center_policy], 1.0);
+            assert_eq!(samples[0].policy_target[center_policy], half::f16::ONE);
 
             assert_eq!(samples[0].value_target.win_probability, 0.1);
             assert_eq!(samples[0].value_target.score_mean, 0.5);
@@ -358,7 +361,7 @@ mod tests {
                 assert!(
                     sample.policy_target[board_dim * board_dim + 1..]
                         .iter()
-                        .all(|&p| p == 0.0)
+                        .all(|&p| p == half::f16::ZERO)
                 );
                 for i in 0..MAX_BOARD_AREA {
                     let x = i % crate::game::board::MAX_BOARD_DIM;

@@ -8,7 +8,7 @@
 
 use std::{io, path::Path, time::Instant};
 
-pub use rgo_engine::{game, inference};
+pub use rgo_engine::{game, inference, search};
 #[path = "../src/training_data.rs"]
 #[allow(dead_code)] // The standalone benchmark uses only part of the encoder API.
 mod training_data;
@@ -31,9 +31,13 @@ impl Drop for Scratch {
 }
 
 fn mock_chunk(records: usize) -> Vec<u8> {
+    let state = GameState::new(Rules::TROMP_TAYLORISH_9);
+    let policy_len = state.board().dim().pow(2) + 1;
+    let mut policy_target = [half::f16::ZERO; MAX_POLICY_SIZE];
+    policy_target[..policy_len].fill(half::f16::from_f64(1.0 / policy_len as f64));
     let mut sample = TrainingSample {
-        input: NNInput::encode(&GameState::new(Rules::TROMP_TAYLORISH_9)),
-        policy_target: [1.0 / MAX_POLICY_SIZE as f32; MAX_POLICY_SIZE],
+        input: NNInput::encode(&state),
+        policy_target,
         value_target: ValueTarget {
             win_probability: 0.5,
             score_mean: 0.0,

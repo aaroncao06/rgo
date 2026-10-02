@@ -7,6 +7,7 @@ edition = "2024"
 cuda = ["rgo-engine/cuda"]
 
 [dependencies]
+half = "2.7"
 rgo-artifacts = { path = "../artifacts" }
 rgo-engine = { path = "../engine" }
 rand = { version = "0.10", default-features = false, features = ["sys_rng"] }

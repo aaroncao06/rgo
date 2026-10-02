@@ -233,8 +233,11 @@ mod unix {
             let mut offset = 24;
             for _ in 0..records {
                 assert_eq!(bytes[offset], 9);
-                offset +=
-                    1 + 3 * 81_usize.div_ceil(8) + (2 + 82 + 3) * 4 + (2 * 81_usize).div_ceil(8);
+                offset += 1
+                    + 3 * 81_usize.div_ceil(8)
+                    + (2 + 3) * 4
+                    + 82 * 2
+                    + (2 * 81_usize).div_ceil(8);
             }
             assert_eq!(offset, checksum_offset);
             assert_eq!(
