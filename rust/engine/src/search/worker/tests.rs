@@ -2,8 +2,7 @@ use super::*;
 use crate::{
     game::rules::Rules,
     inference::{
-        backend::InferenceBackend,
-        inputs::NNInput,
+        backend::{InferenceBackend, InputBatch},
         policy::MAX_POLICY_SIZE,
         runtime::{start_test_runtime, test_backend_factory},
     },
@@ -25,20 +24,20 @@ struct TestBackend {
 impl InferenceBackend for TestBackend {
     fn evaluate_batch(
         &mut self,
-        inputs: &[NNInput],
+        inputs: &dyn InputBatch,
         outputs: &mut Vec<Arc<NNOutput>>,
     ) -> Result<(), InferenceError> {
         if self.fail {
             return Err(InferenceError::ExecutionFailed);
         }
-        for input in inputs {
+        inputs.for_each_input(&mut |input| {
             let mut output = NNOutput::from_raw(self.policy_logits.into(), 0.0, 0.0, 0.0);
             if input.include_ownership {
                 output = output
                     .with_ownership_logits(vec![0.0; input.board_dim * input.board_dim].into());
             }
             outputs.push(Arc::new(output));
-        }
+        });
         Ok(())
     }
 }
@@ -76,19 +75,19 @@ struct OneShotBackend {
 impl InferenceBackend for OneShotBackend {
     fn evaluate_batch(
         &mut self,
-        inputs: &[NNInput],
+        inputs: &dyn InputBatch,
         outputs: &mut Vec<Arc<NNOutput>>,
     ) -> Result<(), InferenceError> {
         if self.evaluated {
             return Err(InferenceError::ExecutionFailed);
         }
         self.evaluated = true;
-        for input in inputs {
+        inputs.for_each_input(&mut |input| {
             // This fixture also supports cache-first tests that later request a root.
             let output = NNOutput::from_raw(self.policy_logits.into(), 0.0, 0.0, 0.0)
                 .with_ownership_logits(vec![0.0; input.board_dim * input.board_dim].into());
             outputs.push(Arc::new(output));
-        }
+        });
         Ok(())
     }
 }

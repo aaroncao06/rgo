@@ -4,6 +4,17 @@ use crate::inference::outputs::NNOutput;
 
 use super::inputs::NNInput;
 
+/// A homogeneous batch borrowed from request storage. Each visit finishes
+/// before the next begins; implementations must not retain input references.
+pub trait InputBatch {
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn board_dim(&self) -> usize;
+    fn for_each_input(&self, visit: &mut dyn FnMut(&NNInput));
+}
+
 #[derive(Debug, Clone)]
 pub enum InferenceError {
     ExecutionFailed,
@@ -17,6 +28,8 @@ pub trait InferenceBackend {
     ///
     /// The executor supplies a nonempty input batch and an empty, reusable
     /// output vector. Every input in a batch has the same active board size.
+    /// Gather input data during `for_each_input` visits, then execute the model
+    /// after visits return so request storage is not locked during inference.
     /// On success,
     /// append exactly one output per input; return an error if the backend
     /// cannot produce that complete batch. Partial outputs on error are ignored.
@@ -28,13 +41,28 @@ pub trait InferenceBackend {
     /// The client uses Arc::get_mut to apply legal masking and perspective/score
     /// transformations before sharing the result with the model cache and search.
     /// When input.include_ownership is true, attach current-player ownership
-    /// logits as an exact-size, row-major boxed plane of board_dim² values
+    /// logits as an exclusively owned, exact-size Arc plane of board_dim² values
     /// via with_ownership_logits. Other requests may omit that output.
     fn evaluate_batch(
         &mut self,
-        inputs: &[NNInput],
+        inputs: &dyn InputBatch,
         outputs: &mut Vec<Arc<NNOutput>>,
     ) -> Result<(), InferenceError>;
+}
+
+#[cfg(test)]
+impl<T: AsRef<[NNInput]>> InputBatch for T {
+    fn len(&self) -> usize {
+        self.as_ref().len()
+    }
+    fn board_dim(&self) -> usize {
+        self.as_ref()[0].board_dim
+    }
+    fn for_each_input(&self, visit: &mut dyn FnMut(&NNInput)) {
+        for input in self.as_ref() {
+            visit(input);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -47,12 +75,12 @@ struct DummyInferenceBackend {
 impl InferenceBackend for DummyInferenceBackend {
     fn evaluate_batch(
         &mut self,
-        inputs: &[NNInput],
+        inputs: &dyn InputBatch,
         outputs: &mut Vec<Arc<NNOutput>>,
     ) -> Result<(), InferenceError> {
         debug_assert!(outputs.is_empty()); // up to the executor to clear before calling
         // outputs.reserve(inputs.len()); //should be noop if you are keeping consistent batch sizes, safeguard
-        for input in inputs {
+        inputs.for_each_input(&mut |input| {
             let mut output = NNOutput::from_raw(
                 vec![0.0; input.board_dim * input.board_dim + 1].into_boxed_slice(),
                 0.0,
@@ -64,7 +92,7 @@ impl InferenceBackend for DummyInferenceBackend {
                     .with_ownership_logits(vec![0.0; input.board_dim * input.board_dim].into());
             }
             outputs.push(Arc::new(output));
-        }
+        });
         self.batch_sizes.push(inputs.len());
         if inputs.len() != outputs.len() {
             return Err(InferenceError::MismatchedBatchOutput);
@@ -93,7 +121,7 @@ mod tests {
 
         outputs.clear();
         backend
-            .evaluate_batch(&inputs[..1], &mut outputs)
+            .evaluate_batch(&&inputs[..1], &mut outputs)
             .expect("second dummy batch should succeed");
         assert_eq!(outputs.len(), 1);
         assert_eq!(backend.batch_sizes, [3, 1]);

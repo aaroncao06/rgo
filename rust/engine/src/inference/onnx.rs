@@ -10,8 +10,8 @@ use ort::{
 };
 
 use super::{
-    backend::{InferenceBackend, InferenceError},
-    inputs::{NNInput, NUM_GLOBAL_FEATURES, NUM_SPATIAL_FEATURES},
+    backend::{InferenceBackend, InferenceError, InputBatch},
+    inputs::{NUM_GLOBAL_FEATURES, NUM_SPATIAL_FEATURES},
     outputs::NNOutput,
 };
 
@@ -47,6 +47,7 @@ pub(crate) struct OnnxBackend {
     // Each executor reuses its contiguous input buffers between batches.
     spatial: Vec<f32>,
     global: Vec<f32>,
+    ownership_requests: Vec<bool>,
 }
 
 impl OnnxBackend {
@@ -83,37 +84,38 @@ impl OnnxBackend {
             without_ownership,
             spatial: Vec::new(),
             global: Vec::new(),
+            ownership_requests: Vec::new(),
         })
     }
 
     fn evaluate(
         &mut self,
-        inputs: &[NNInput],
+        inputs: &dyn InputBatch,
         outputs: &mut Vec<Arc<NNOutput>>,
     ) -> ort::Result<()> {
         debug_assert!(outputs.is_empty());
         debug_assert!(!inputs.is_empty(), "cannot evaluate an empty batch");
-        let board_dim = inputs[0].board_dim;
+        let board_dim = inputs.board_dim();
         debug_assert!((1..=MAX_BOARD_DIM).contains(&board_dim));
-        debug_assert!(
-            inputs.iter().all(|input| input.board_dim == board_dim),
-            "batch mixes board sizes"
-        );
         let board_area = board_dim * board_dim;
         let policy_size = board_area + 1;
         self.spatial.clear();
         self.global.clear();
+        self.ownership_requests.clear();
         self.spatial
             .reserve(inputs.len() * NUM_SPATIAL_FEATURES * board_area);
         self.global.reserve(inputs.len() * NUM_GLOBAL_FEATURES);
-        for input in inputs {
+        self.ownership_requests.reserve(inputs.len());
+        inputs.for_each_input(&mut |input| {
+            debug_assert_eq!(input.board_dim, board_dim, "batch mixes board sizes");
             for row in input.spatial_rows() {
                 self.spatial.extend_from_slice(row);
             }
             self.global.extend_from_slice(&input.global);
-        }
+            self.ownership_requests.push(input.include_ownership);
+        });
         let n = inputs.len();
-        let include_ownership = inputs.iter().any(|input| input.include_ownership);
+        let include_ownership = self.ownership_requests.iter().any(|&include| include);
         let tensors = ort::inputs![
             "spatial" => TensorRef::from_array_view(([n, NUM_SPATIAL_FEATURES, board_dim, board_dim], self.spatial.as_slice()))?,
             "global" => TensorRef::from_array_view(([n, NUM_GLOBAL_FEATURES], self.global.as_slice()))?,
@@ -136,7 +138,7 @@ impl OnnxBackend {
         } else {
             None
         };
-        for (i, input) in inputs.iter().enumerate() {
+        for (i, &include_ownership) in self.ownership_requests.iter().enumerate() {
             let compact_policy = &policy_batch[i * policy_size..(i + 1) * policy_size];
             let value_row = &value_batch[i * 3..(i + 1) * 3];
             let mut output = NNOutput::from_raw(
@@ -145,7 +147,7 @@ impl OnnxBackend {
                 value_row[1],
                 value_row[2],
             );
-            if input.include_ownership {
+            if include_ownership {
                 let ownership_logits =
                     &ownership_batch.unwrap()[i * board_area..(i + 1) * board_area];
                 // Allocate the ownership Arc directly from the tensor slice.
@@ -160,7 +162,7 @@ impl OnnxBackend {
 impl InferenceBackend for OnnxBackend {
     fn evaluate_batch(
         &mut self,
-        inputs: &[NNInput],
+        inputs: &dyn InputBatch,
         outputs: &mut Vec<Arc<NNOutput>>,
     ) -> Result<(), InferenceError> {
         self.evaluate(inputs, outputs)

@@ -132,26 +132,6 @@ impl SelfPlayOrchestrator {
         .await
     }
 
-    #[cfg(test)]
-    async fn run_n_games_per_worker<F>(
-        self,
-        games_per_worker: usize,
-        latest_model_version_rx: watch::Receiver<Option<ModelVersion>>,
-        mut load_model: F,
-    ) -> Result<(), SelfPlayRunError>
-    where
-        F: FnMut(ModelVersion) -> Result<ModelHandle, ModelLoadError>,
-    {
-        let (_finish_tx, finish_rx) = watch::channel(false);
-        self.run_inner(
-            Some(games_per_worker),
-            latest_model_version_rx,
-            finish_rx,
-            |version, _| load_model(version),
-        )
-        .await
-    }
-
     // The production run() API always loads ONNX through ModelRuntime::load.
     // Private lifecycle tests inject controlled failures and update timing here.
     async fn run_inner<F>(
@@ -447,6 +427,28 @@ fn record_worker_event(
 }
 
 #[cfg(test)]
+impl SelfPlayOrchestrator {
+    async fn run_n_games_per_worker<F>(
+        self,
+        games_per_worker: usize,
+        latest_model_version_rx: watch::Receiver<Option<ModelVersion>>,
+        mut load_model: F,
+    ) -> Result<(), SelfPlayRunError>
+    where
+        F: FnMut(ModelVersion) -> Result<ModelHandle, ModelLoadError>,
+    {
+        let (_finish_tx, finish_rx) = watch::channel(false);
+        self.run_inner(
+            Some(games_per_worker),
+            latest_model_version_rx,
+            finish_rx,
+            |version, _| load_model(version),
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::{
         io,
@@ -462,8 +464,7 @@ mod tests {
     use super::*;
     use crate::{
         inference::{
-            backend::{InferenceBackend, InferenceError},
-            inputs::NNInput,
+            backend::{InferenceBackend, InferenceError, InputBatch},
             outputs::NNOutput,
             runtime::{start_test_runtime, test_backend_factory},
         },
@@ -513,10 +514,10 @@ mod tests {
     impl InferenceBackend for PassBackend {
         fn evaluate_batch(
             &mut self,
-            inputs: &[NNInput],
+            inputs: &dyn InputBatch,
             outputs: &mut Vec<Arc<NNOutput>>,
         ) -> Result<(), InferenceError> {
-            for input in inputs {
+            inputs.for_each_input(&mut |input| {
                 let board_area = input.board_dim * input.board_dim;
                 let mut logits = vec![-100.0; board_area + 1].into_boxed_slice();
                 logits[board_area] = 100.0;
@@ -526,7 +527,7 @@ mod tests {
                         .with_ownership_logits(vec![0.0; input.board_dim * input.board_dim].into());
                 }
                 outputs.push(Arc::new(output));
-            }
+            });
             Ok(())
         }
     }
@@ -536,7 +537,7 @@ mod tests {
     impl InferenceBackend for FailingBackend {
         fn evaluate_batch(
             &mut self,
-            _inputs: &[NNInput],
+            _inputs: &dyn InputBatch,
             _outputs: &mut Vec<Arc<NNOutput>>,
         ) -> Result<(), InferenceError> {
             Err(InferenceError::ExecutionFailed)
@@ -554,7 +555,7 @@ mod tests {
     impl InferenceBackend for DropTrackingBackend {
         fn evaluate_batch(
             &mut self,
-            inputs: &[NNInput],
+            inputs: &dyn InputBatch,
             outputs: &mut Vec<Arc<NNOutput>>,
         ) -> Result<(), InferenceError> {
             PassBackend.evaluate_batch(inputs, outputs)
@@ -576,7 +577,7 @@ mod tests {
     impl InferenceBackend for BlockingPassBackend {
         fn evaluate_batch(
             &mut self,
-            inputs: &[NNInput],
+            inputs: &dyn InputBatch,
             outputs: &mut Vec<Arc<NNOutput>>,
         ) -> Result<(), InferenceError> {
             if let Some(first_eval_tx) = self.first_eval_tx.take() {

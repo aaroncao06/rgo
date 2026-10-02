@@ -176,7 +176,7 @@ async fn executors_respect_individual_batch_limits_on_a_shared_queue() {
     impl InferenceBackend for RecordingBackend {
         fn evaluate_batch(
             &mut self,
-            inputs: &[NNInput],
+            inputs: &dyn InputBatch,
             outputs: &mut Vec<Arc<NNOutput>>,
         ) -> Result<(), InferenceError> {
             self.batches
@@ -188,7 +188,7 @@ async fn executors_respect_individual_batch_limits_on_a_shared_queue() {
                 // Hold both executors' first batches until the queue is filled.
                 self.started.wait();
             }
-            outputs.extend(inputs.iter().map(|_| test_output()));
+            inputs.for_each_input(&mut |_| outputs.push(test_output()));
             Ok(())
         }
     }
@@ -327,11 +327,11 @@ struct EchoSpatialOwnershipBackend(Arc<Mutex<usize>>);
 impl InferenceBackend for EchoSpatialOwnershipBackend {
     fn evaluate_batch(
         &mut self,
-        inputs: &[NNInput],
+        inputs: &dyn InputBatch,
         outputs: &mut Vec<Arc<NNOutput>>,
     ) -> Result<(), InferenceError> {
         *self.0.lock().unwrap() += inputs.len();
-        for input in inputs {
+        inputs.for_each_input(&mut |input| {
             assert!(input.include_ownership);
             let plane = input
                 .spatial
@@ -345,7 +345,7 @@ impl InferenceBackend for EchoSpatialOwnershipBackend {
                 NNOutput::from_raw([0.0; MAX_POLICY_SIZE].into(), 0.0, 0.0, 0.0)
                     .with_ownership_logits(ownership),
             ));
-        }
+        });
         Ok(())
     }
 }
@@ -353,10 +353,10 @@ impl InferenceBackend for EchoSpatialOwnershipBackend {
 impl InferenceBackend for OwnershipBackend {
     fn evaluate_batch(
         &mut self,
-        inputs: &[NNInput],
+        inputs: &dyn InputBatch,
         outputs: &mut Vec<Arc<NNOutput>>,
     ) -> Result<(), InferenceError> {
-        for input in inputs {
+        inputs.for_each_input(&mut |input| {
             self.0.lock().unwrap().push(input.include_ownership);
             let mut output = NNOutput::from_raw([0.0; MAX_POLICY_SIZE].into(), 0.0, 0.0, 0.0);
             if input.include_ownership {
@@ -368,7 +368,7 @@ impl InferenceBackend for OwnershipBackend {
                     .with_ownership_logits(vec![1.0; input.board_dim * input.board_dim].into());
             }
             outputs.push(Arc::new(output));
-        }
+        });
         Ok(())
     }
 }
@@ -570,7 +570,7 @@ async fn missing_requested_ownership_violates_backend_contract() {
 impl InferenceBackend for TestBackend {
     fn evaluate_batch(
         &mut self,
-        inputs: &[NNInput],
+        inputs: &dyn InputBatch,
         outputs: &mut Vec<Arc<NNOutput>>,
     ) -> Result<(), InferenceError> {
         debug_assert!(outputs.is_empty());
@@ -580,9 +580,9 @@ impl InferenceBackend for TestBackend {
             return Err(InferenceError::ExecutionFailed);
         }
 
-        for _input in inputs {
+        inputs.for_each_input(&mut |_input| {
             outputs.push(test_output());
-        }
+        });
         Ok(())
     }
 }

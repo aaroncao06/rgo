@@ -3,7 +3,7 @@
 
 use crate::game::game_state::GameState;
 use crate::inference::{
-    backend::{InferenceBackend, InferenceError},
+    backend::{InferenceBackend, InferenceError, InputBatch},
     inputs::NNInput,
     onnx::OnnxBackend,
     outputs::NNOutput,
@@ -157,15 +157,11 @@ impl InferenceClient {
         // Match KataGo's cache boundary: randomize only cache misses, restore
         // outputs to canonical coordinates, then cache under the original state.
         let symmetry = self.next_symmetry();
-        let mut input = NNInput::encode(game_state);
-        if let Some(symmetry) = symmetry {
-            input.apply_symmetry_in_place(symmetry);
-        }
-        input.include_ownership = include_ownership;
         let next_player = game_state.next_player();
         let legal_mask = legal_mask(game_state);
 
-        self.slot.queue(input);
+        self.slot
+            .encode_and_queue(game_state, include_ownership, symmetry);
         // send a clone of the arc pointer
         if let Err(error) = self
             .model_handle()
@@ -214,15 +210,19 @@ impl<B: InferenceBackend> InferenceExecutor<B> {
     }
     fn run(mut self) {
         let mut requests: Vec<Arc<EvalSlot>> = Vec::with_capacity(self.max_batch_size);
-        let mut inputs: Vec<NNInput> = Vec::with_capacity(self.max_batch_size);
         let mut outputs: Vec<Arc<NNOutput>> = Vec::with_capacity(self.max_batch_size);
         while self.queue.receive_batch(self.max_batch_size, &mut requests) {
-            inputs.clear();
             outputs.clear(); // backend expects it to be cleared beforehand
-            //gather inputs
+            let mut board_dim = 0;
             for slot in &requests {
-                inputs.push(slot.take_input());
+                let dim = slot.start();
+                debug_assert!(board_dim == 0 || board_dim == dim);
+                board_dim = dim;
             }
+            let inputs = SlotBatch {
+                requests: &requests,
+                board_dim,
+            };
             //run backend
             match self.backend.evaluate_batch(&inputs, &mut outputs) {
                 Ok(()) => {
@@ -243,6 +243,25 @@ impl<B: InferenceBackend> InferenceExecutor<B> {
                     }
                 }
             }
+        }
+    }
+}
+
+struct SlotBatch<'a> {
+    requests: &'a [Arc<EvalSlot>],
+    board_dim: usize,
+}
+
+impl InputBatch for SlotBatch<'_> {
+    fn len(&self) -> usize {
+        self.requests.len()
+    }
+    fn board_dim(&self) -> usize {
+        self.board_dim
+    }
+    fn for_each_input(&self, visit: &mut dyn FnMut(&NNInput)) {
+        for slot in self.requests {
+            slot.visit_input(visit);
         }
     }
 }
@@ -321,11 +340,11 @@ impl Drop for ModelRuntime {
     }
 }
 
-#[cfg(test)]
-mod tests;
-
 #[cfg(any(test, feature = "test-support"))]
 mod test_support;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub use test_support::{start_test_runtime, test_backend_factory};
+
+#[cfg(test)]
+mod tests;

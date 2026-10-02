@@ -1,5 +1,6 @@
 use super::*;
 use crate::game::board::{MAX_BOARD_AREA, Player};
+use crate::inference::inputs::NNInput;
 use crate::inference::policy::MAX_POLICY_SIZE;
 
 fn backend() -> OnnxBackend {
@@ -36,7 +37,7 @@ fn batches_raw_outputs_and_attaches_only_requested_ownership() {
     }
     // Reuse packing buffers with a different batch size and no ownership fetch.
     outputs.clear();
-    backend.evaluate_batch(&inputs[..1], &mut outputs).unwrap();
+    backend.evaluate_batch(&&inputs[..1], &mut outputs).unwrap();
     assert_eq!(outputs.len(), 1);
     assert!(!outputs[0].has_ownership());
 }

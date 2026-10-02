@@ -70,13 +70,6 @@ impl EventPublisher {
         ack.await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "event writer stopped"))?
     }
-
-    #[cfg(test)]
-    pub(super) fn discard() -> Self {
-        let (tx, rx) = mpsc::channel(1);
-        thread::spawn(move || write_events(io::sink(), rx));
-        Self(tx)
-    }
 }
 
 fn write_events(mut output: impl Write, mut events: mpsc::Receiver<PendingEvent>) {
@@ -218,4 +211,13 @@ async fn supervise_self_play(
         .emit(Event::Stopped)
         .await
         .map_err(|error| format!("could not write stopped event: {error}"))
+}
+
+#[cfg(test)]
+impl EventPublisher {
+    pub(super) fn discard() -> Self {
+        let (tx, rx) = mpsc::channel(1);
+        thread::spawn(move || write_events(io::sink(), rx));
+        Self(tx)
+    }
 }

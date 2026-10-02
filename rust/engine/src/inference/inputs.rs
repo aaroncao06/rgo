@@ -18,38 +18,48 @@ pub struct NNInput {
 
 impl NNInput {
     pub fn encode(game_state: &GameState) -> Self {
+        let mut input = Self::empty();
+        input.encode_in_place(game_state);
+        input
+    }
+
+    pub(super) fn empty() -> Self {
+        Self {
+            board_dim: crate::game::board::MAX_BOARD_DIM,
+            spatial: [0.0; NUM_SPATIAL_FEATURES * MAX_BOARD_AREA],
+            global: [0.0; NUM_GLOBAL_FEATURES],
+            include_ownership: false,
+        }
+    }
+
+    pub fn encode_in_place(&mut self, game_state: &GameState) {
         let current_player = game_state.next_player();
         let current_color = Color::from(current_player);
         let opponent_color = Color::from(current_player.opponent());
 
-        let mut global = [0_f32; NUM_GLOBAL_FEATURES];
         match current_color {
-            Color::White => global[0] = game_state.rules().komi,
-            Color::Black => global[0] = -game_state.rules().komi,
+            Color::White => self.global[0] = game_state.rules().komi,
+            Color::Black => self.global[0] = -game_state.rules().komi,
             _ => {}
         }
-        global[1] = game_state.consecutive_ending_passes() as f32;
+        self.global[1] = game_state.consecutive_ending_passes() as f32;
+        self.board_dim = game_state.board().dim();
+        self.include_ownership = false;
 
         // encode spatial maps
-        let mut spatial = [0_f32; NUM_SPATIAL_FEATURES * MAX_BOARD_AREA];
+        self.spatial.fill(0.0);
         for loc in game_state.board().locs() {
             let color = game_state.board().color_at(loc);
             let spatial_idx = loc_to_spatial(game_state.board(), loc);
 
             if color == current_color {
-                spatial[spatial_idx] = 1_f32;
+                self.spatial[spatial_idx] = 1_f32;
             } else if color == opponent_color {
-                spatial[MAX_BOARD_AREA + spatial_idx] = 1_f32;
+                self.spatial[MAX_BOARD_AREA + spatial_idx] = 1_f32;
             }
             if game_state.is_superko_banned(loc) {
-                spatial[2 * MAX_BOARD_AREA + spatial_idx] = 1_f32;
+                self.spatial[2 * MAX_BOARD_AREA + spatial_idx] = 1_f32;
             }
-        }
-        Self {
-            board_dim: game_state.board().dim(),
-            spatial,
-            global,
-            include_ownership: false,
         }
     }
 

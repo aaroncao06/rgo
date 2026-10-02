@@ -1,7 +1,9 @@
 //! Reusable request slots and the shared batch queue.
 
+use crate::game::game_state::GameState;
 use crate::inference::{
     SUPPORTED_BOARD_DIMS, backend::InferenceError, inputs::NNInput, outputs::NNOutput,
+    symmetry::Symmetry,
 };
 use std::{
     collections::VecDeque,
@@ -11,13 +13,17 @@ use tokio::sync::Notify;
 
 enum SlotState {
     Idle,
-    Queued(NNInput),
+    Queued,
     Running,
     Completed(Result<Arc<NNOutput>, InferenceError>),
 }
+struct SlotData {
+    input: NNInput,
+    state: SlotState,
+}
 // pointers to evalslots are sent to the executor
 pub(super) struct EvalSlot {
-    state: Mutex<SlotState>,
+    data: Mutex<SlotData>,
     ready: Notify,
 }
 
@@ -35,50 +41,69 @@ struct QueueInner {
 
 impl EvalSlot {
     pub(super) fn is_idle(&self) -> bool {
-        matches!(&*self.state.lock().unwrap(), SlotState::Idle)
+        matches!(&self.data.lock().unwrap().state, SlotState::Idle)
     }
 
     pub(super) fn new() -> Self {
         Self {
-            state: Mutex::new(SlotState::Idle),
+            data: Mutex::new(SlotData {
+                input: NNInput::empty(),
+                state: SlotState::Idle,
+            }),
             ready: Notify::new(),
         }
     }
-    pub(super) fn queue(&self, input: NNInput) {
-        let mut slot_state = self.state.lock().expect("eval slot mutex poisoned");
+    pub(super) fn encode_and_queue(
+        &self,
+        game_state: &GameState,
+        include_ownership: bool,
+        symmetry: Option<Symmetry>,
+    ) {
+        let mut data = self.data.lock().expect("eval slot mutex poisoned");
         debug_assert!(
-            matches!(&*slot_state, SlotState::Idle),
+            matches!(&data.state, SlotState::Idle),
             "can only queue in idle slots"
         );
-        *slot_state = SlotState::Queued(input);
-    }
-    pub(super) fn take_input(&self) -> NNInput {
-        let mut slot_state = self.state.lock().expect("eval slot mutex poisoned");
-        //update state and return the input
-        match std::mem::replace(&mut *slot_state, SlotState::Running) {
-            SlotState::Queued(input) => input,
-            _ => panic!("can only take input from a queued slot"),
+        data.input.encode_in_place(game_state);
+        if let Some(symmetry) = symmetry {
+            data.input.apply_symmetry_in_place(symmetry);
         }
+        data.input.include_ownership = include_ownership;
+        data.state = SlotState::Queued;
+    }
+    pub(super) fn start(&self) -> usize {
+        let mut data = self.data.lock().expect("eval slot mutex poisoned");
+        debug_assert!(
+            matches!(data.state, SlotState::Queued),
+            "can only start a queued slot"
+        );
+        data.state = SlotState::Running;
+        data.input.board_dim
+    }
+    pub(super) fn visit_input(&self, visit: &mut dyn FnMut(&NNInput)) {
+        let data = self.data.lock().expect("eval slot mutex poisoned");
+        debug_assert!(matches!(data.state, SlotState::Running));
+        visit(&data.input);
     }
     pub(super) fn complete(&self, result: Result<Arc<NNOutput>, InferenceError>) {
         // fill slot with the result, moves the pointer so that the worker can process it
-        let mut slot_state = self.state.lock().expect("eval slot mutex poisoned");
+        let mut data = self.data.lock().expect("eval slot mutex poisoned");
         debug_assert!(
-            matches!(&*slot_state, SlotState::Running),
+            matches!(&data.state, SlotState::Running),
             "can only put results in running slots"
         );
-        *slot_state = SlotState::Completed(result);
-        drop(slot_state);
+        data.state = SlotState::Completed(result);
+        drop(data);
         self.ready.notify_one();
     }
     pub(super) fn cancel_queued(&self) {
         //only called after submit_request fails
-        let mut slot_state = self.state.lock().expect("eval slot mutex poisoned");
+        let mut data = self.data.lock().expect("eval slot mutex poisoned");
         debug_assert!(
-            matches!(&*slot_state, SlotState::Queued(_)),
+            matches!(&data.state, SlotState::Queued),
             "only a request that failed submission can be reset"
         );
-        *slot_state = SlotState::Idle;
+        data.state = SlotState::Idle;
     }
     pub(super) async fn wait_for_result(&self) -> Result<Arc<NNOutput>, InferenceError> {
         // can wait on active tasks (not idle)
@@ -86,16 +111,16 @@ impl EvalSlot {
             let notified = self.ready.notified();
             {
                 // scope so that the mutex gets dropped before await
-                let mut slot_state = self.state.lock().expect("eval slot mutex poisoned");
-                match &*slot_state {
+                let mut data = self.data.lock().expect("eval slot mutex poisoned");
+                match &data.state {
                     SlotState::Completed(_) => {
-                        let previous = std::mem::replace(&mut *slot_state, SlotState::Idle);
+                        let previous = std::mem::replace(&mut data.state, SlotState::Idle);
                         let SlotState::Completed(result) = previous else {
                             unreachable!()
                         };
                         return result;
                     }
-                    SlotState::Queued(_) | SlotState::Running => {}
+                    SlotState::Queued | SlotState::Running => {}
                     SlotState::Idle => panic!("cant wait on an idle slot"),
                 }
             }
@@ -104,11 +129,6 @@ impl EvalSlot {
     }
 }
 impl BatchQueue {
-    #[cfg(test)]
-    pub(super) fn is_closed(&self) -> bool {
-        self.inner.lock().unwrap().closed
-    }
-
     pub(super) fn new(capacity: usize) -> Self {
         Self {
             inner: Mutex::new(QueueInner {
@@ -197,6 +217,23 @@ impl BatchQueue {
         queue_inner.closed = true;
         drop(queue_inner);
         self.state_changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+impl BatchQueue {
+    pub(super) fn is_closed(&self) -> bool {
+        self.inner.lock().unwrap().closed
+    }
+}
+
+#[cfg(test)]
+impl EvalSlot {
+    pub(super) fn queue(&self, input: NNInput) {
+        let mut data = self.data.lock().unwrap();
+        assert!(matches!(data.state, SlotState::Idle));
+        data.input = input;
+        data.state = SlotState::Queued;
     }
 }
 

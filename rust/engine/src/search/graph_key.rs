@@ -44,8 +44,10 @@ impl GraphKey {
     pub(super) fn raw(&self) -> Hash128 {
         self.0
     }
+}
 
-    #[cfg(test)]
+#[cfg(test)]
+impl GraphKey {
     pub(super) const fn from_raw(raw: Hash128) -> Self {
         Self(raw)
     }

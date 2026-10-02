@@ -1,7 +1,6 @@
 use super::*;
 use crate::inference::{
-    backend::{InferenceBackend, InferenceError},
-    inputs::NNInput,
+    backend::{InferenceBackend, InferenceError, InputBatch},
     outputs::NNOutput,
     runtime::start_test_runtime,
 };
@@ -18,7 +17,7 @@ struct StalledBackend;
 impl InferenceBackend for StalledBackend {
     fn evaluate_batch(
         &mut self,
-        _: &[NNInput],
+        _: &dyn InputBatch,
         _: &mut Vec<Arc<NNOutput>>,
     ) -> Result<(), InferenceError> {
         unreachable!("the test backend never completes startup")

@@ -140,17 +140,6 @@ impl ChunkEncoder {
     }
 }
 
-/// Test helper for encoding a complete sample slice. Production chunk assembly
-/// encodes records incrementally.
-#[cfg(test)]
-pub(super) fn encode_chunk(samples: &[TrainingSample]) -> Vec<u8> {
-    let mut encoder = ChunkEncoder::new(samples.len());
-    for sample in samples {
-        encoder.push(sample);
-    }
-    encoder.finish().bytes
-}
-
 pub(super) fn verify_chunk_checksum(bytes: &[u8]) -> bool {
     let Some(payload_len) = bytes.len().checked_sub(CHUNK_CHECKSUM_SIZE) else {
         return false;
@@ -180,6 +169,17 @@ fn chunk_header(record_count: usize) -> [u8; CHUNK_HEADER_SIZE] {
         offset += size_of::<u32>();
     }
     header
+}
+
+#[cfg(test)]
+/// Test helper for encoding a complete sample slice. Production chunk assembly
+/// encodes records incrementally.
+pub(super) fn encode_chunk(samples: &[TrainingSample]) -> Vec<u8> {
+    let mut encoder = ChunkEncoder::new(samples.len());
+    for sample in samples {
+        encoder.push(sample);
+    }
+    encoder.finish().bytes
 }
 
 #[cfg(test)]

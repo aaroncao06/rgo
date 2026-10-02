@@ -2,8 +2,6 @@ use std::sync::OnceLock;
 
 mod score_value_table;
 use score_value_table::build_expected_score_value_table;
-#[cfg(test)]
-use score_value_table::score_value;
 use score_value_table::{
     TABLE_ASSUMED_BOARD_DIM, TABLE_MEAN_LEN, TABLE_MEAN_RADIUS, TABLE_STDEV_LEN,
 };
@@ -121,6 +119,7 @@ fn expected_white_score_value(
 
 #[cfg(test)]
 mod tests {
+    use super::score_value_table::score_value;
     use super::*;
 
     #[test]

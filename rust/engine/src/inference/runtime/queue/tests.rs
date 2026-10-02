@@ -1,7 +1,10 @@
 use super::*;
 use crate::{
     game::{game_state::GameState, rules::Rules},
-    inference::policy::MAX_POLICY_SIZE,
+    inference::{
+        backend::{InferenceBackend, InputBatch},
+        policy::MAX_POLICY_SIZE,
+    },
 };
 use std::{sync::mpsc, thread, time::Duration};
 
@@ -19,24 +22,68 @@ fn test_output() -> Arc<NNOutput> {
 }
 
 #[tokio::test]
+async fn reencoding_reuses_slot_storage_and_clears_old_features() {
+    let slot = EvalSlot::new();
+    let address = slot.data.lock().unwrap().input.spatial.as_ptr();
+    for dim in [9, 5, 7] {
+        let mut state = GameState::new(Rules {
+            board_dim: dim,
+            ..Rules::default()
+        });
+        assert!(state.play(state.board().loc(0, dim - 1).unwrap()));
+        let symmetry = Symmetry::TransposeFlipXY;
+        let mut expected = NNInput::encode(&state);
+        expected.apply_symmetry_in_place(symmetry);
+        slot.encode_and_queue(&state, true, Some(symmetry));
+        slot.start();
+        slot.visit_input(&mut |input| {
+            assert_eq!(input.spatial.as_ptr(), address);
+            assert_eq!(input.spatial, expected.spatial);
+            assert_eq!(input.global, expected.global);
+            assert_eq!(input.board_dim, dim);
+            assert!(input.include_ownership);
+        });
+        slot.complete(Ok(test_output()));
+        slot.wait_for_result().await.unwrap();
+
+        state.reset(*state.rules());
+        slot.encode_and_queue(&state, false, None);
+        slot.start();
+        slot.visit_input(&mut |input| {
+            assert_eq!(input.spatial.as_ptr(), address);
+            assert!(input.spatial.iter().all(|&value| value == 0.0));
+            assert!(!input.include_ownership);
+        });
+        slot.complete(Ok(test_output()));
+        slot.wait_for_result().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn eval_slot_transitions_through_a_complete_request() {
     let slot = EvalSlot::new();
     slot.queue(test_input());
-    assert!(matches!(&*slot.state.lock().unwrap(), SlotState::Queued(_)));
+    assert!(matches!(
+        &slot.data.lock().unwrap().state,
+        SlotState::Queued
+    ));
 
-    let _input = slot.take_input();
-    assert!(matches!(&*slot.state.lock().unwrap(), SlotState::Running));
+    let _input = slot.start();
+    assert!(matches!(
+        &slot.data.lock().unwrap().state,
+        SlotState::Running
+    ));
 
     let expected = test_output();
     slot.complete(Ok(Arc::clone(&expected)));
     assert!(matches!(
-        &*slot.state.lock().unwrap(),
+        &slot.data.lock().unwrap().state,
         SlotState::Completed(_)
     ));
 
     let actual = slot.wait_for_result().await.unwrap();
     assert!(Arc::ptr_eq(&actual, &expected));
-    assert!(matches!(&*slot.state.lock().unwrap(), SlotState::Idle));
+    assert!(matches!(&slot.data.lock().unwrap().state, SlotState::Idle));
 }
 
 #[tokio::test]
@@ -48,27 +95,27 @@ async fn eval_slot_can_wait_while_still_queued() {
     let waiter = tokio::spawn(async move { waiting_slot.wait_for_result().await });
     tokio::task::yield_now().await;
 
-    let _input = slot.take_input();
+    let _input = slot.start();
     let expected = test_output();
     slot.complete(Ok(Arc::clone(&expected)));
 
     let actual = waiter.await.unwrap().unwrap();
     assert!(Arc::ptr_eq(&actual, &expected));
-    assert!(matches!(&*slot.state.lock().unwrap(), SlotState::Idle));
+    assert!(matches!(&slot.data.lock().unwrap().state, SlotState::Idle));
 }
 
 #[tokio::test]
 async fn eval_slot_propagates_inference_errors() {
     let slot = EvalSlot::new();
     slot.queue(test_input());
-    let _input = slot.take_input();
+    let _input = slot.start();
     slot.complete(Err(InferenceError::ExecutionFailed));
 
     assert!(matches!(
         slot.wait_for_result().await,
         Err(InferenceError::ExecutionFailed)
     ));
-    assert!(matches!(&*slot.state.lock().unwrap(), SlotState::Idle));
+    assert!(matches!(&slot.data.lock().unwrap().state, SlotState::Idle));
 }
 
 #[test]
@@ -206,4 +253,61 @@ fn unsupported_sizes_are_rejected_without_queuing() {
     }
     queue.close();
     assert!(!queue.receive_batch(1, &mut Vec::new()));
+}
+
+#[tokio::test]
+async fn inference_batch_borrows_slot_inputs_and_releases_locks_after_gathering() {
+    struct BorrowingBackend {
+        slots: Vec<Arc<EvalSlot>>,
+        addresses: Vec<usize>,
+    }
+    impl InferenceBackend for BorrowingBackend {
+        fn evaluate_batch(
+            &mut self,
+            inputs: &dyn InputBatch,
+            outputs: &mut Vec<Arc<NNOutput>>,
+        ) -> Result<(), InferenceError> {
+            let mut row = 0;
+            inputs.for_each_input(&mut |input| {
+                assert_eq!(input.spatial.as_ptr() as usize, self.addresses[row]);
+                outputs.push(test_output());
+                row += 1;
+            });
+            assert_eq!(row, self.slots.len());
+            for slot in &self.slots {
+                assert!(
+                    slot.data.try_lock().is_ok(),
+                    "model execution must not retain input locks"
+                );
+            }
+            Ok(())
+        }
+    }
+    let queue = Arc::new(BatchQueue::new(3));
+    let slots: Vec<_> = (0..3).map(|_| Arc::new(EvalSlot::new())).collect();
+    let addresses = slots
+        .iter()
+        .map(|slot| slot.data.lock().unwrap().input.spatial.as_ptr() as usize)
+        .collect();
+    let state = GameState::new(Rules::default());
+    for slot in &slots {
+        slot.encode_and_queue(&state, false, None);
+        queue
+            .submit_request(slot.clone(), state.board().dim())
+            .unwrap();
+    }
+    queue.close();
+    let executor = super::super::InferenceExecutor::new(
+        queue,
+        BorrowingBackend {
+            slots: slots.clone(),
+            addresses,
+        },
+        3,
+    );
+    let thread = thread::spawn(move || executor.run());
+    for slot in &slots {
+        slot.wait_for_result().await.unwrap();
+    }
+    thread.join().unwrap();
 }
