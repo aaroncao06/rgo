@@ -109,7 +109,7 @@ impl OnnxBackend {
         inputs.for_each_input(&mut |input| {
             debug_assert_eq!(input.board_dim, board_dim, "batch mixes board sizes");
             for row in input.spatial_rows() {
-                self.spatial.extend_from_slice(row);
+                self.spatial.extend(row.iter().copied().map(f32::from));
             }
             self.global.extend_from_slice(&input.global);
             self.ownership_requests.push(input.include_ownership);

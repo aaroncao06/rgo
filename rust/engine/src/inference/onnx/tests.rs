@@ -16,7 +16,7 @@ fn batches_raw_outputs_and_attaches_only_requested_ownership() {
     let inputs: Vec<_> = (0..3)
         .map(|i| NNInput {
             board_dim: MAX_BOARD_DIM,
-            spatial: [i as f32; NUM_SPATIAL_FEATURES * MAX_BOARD_AREA],
+            spatial: [(i % 2) as u8; NUM_SPATIAL_FEATURES * MAX_BOARD_AREA],
             global: [i as f32, i as f32],
             include_ownership: i == 1,
         })
@@ -32,7 +32,7 @@ fn batches_raw_outputs_and_attaches_only_requested_ownership() {
         output.process_in_place(Player::White, &[true; MAX_POLICY_SIZE], MAX_BOARD_DIM);
         assert!((output.white_score_mean() - i as f32 * 20.0).abs() < 1e-6);
         if let Some(ownership) = output.white_ownership() {
-            assert!((ownership[0] - (i as f32).tanh()).abs() < 1e-6);
+            assert!((ownership[0] - ((i % 2) as f32).tanh()).abs() < 1e-6);
         }
     }
     // Reuse packing buffers with a different batch size and no ownership fetch.
@@ -56,10 +56,15 @@ fn smaller_boards_pack_inputs_expand_policy_and_keep_ownership_compact() {
         let mut input = NNInput::encode(&state);
         input.include_ownership = true;
         // Padding must never enter the model, even if its storage is nonzero.
-        input.spatial.fill(1000.0);
-        for y in 0..board_dim {
-            for x in 0..board_dim {
-                input.spatial[x + y * MAX_BOARD_DIM] = (x + y * board_dim) as f32 / 100.0;
+        input.spatial.fill(u8::MAX);
+        let mut expected_spatial = Vec::new();
+        for plane in 0..NUM_SPATIAL_FEATURES {
+            for y in 0..board_dim {
+                for x in 0..board_dim {
+                    let value = spatial_feature(plane * board_dim * board_dim + x + y * board_dim);
+                    input.spatial[plane * MAX_BOARD_AREA + x + y * MAX_BOARD_DIM] = value;
+                    expected_spatial.push(f32::from(value));
+                }
             }
         }
         outputs.clear();
@@ -68,6 +73,7 @@ fn smaller_boards_pack_inputs_expand_policy_and_keep_ownership_compact() {
             backend.spatial.len(),
             NUM_SPATIAL_FEATURES * board_dim * board_dim
         );
+        assert_eq!(backend.spatial, expected_spatial);
         let output = Arc::get_mut(&mut outputs[0]).unwrap();
         let legal = crate::inference::policy::legal_mask(&state);
         output.process_in_place(Player::White, &legal, board_dim);
@@ -78,7 +84,7 @@ fn smaller_boards_pack_inputs_expand_policy_and_keep_ownership_compact() {
         for y in 0..board_dim {
             for x in 0..board_dim {
                 let i = x + y * board_dim;
-                let logit = (x + y * board_dim) as f32 / 100.0;
+                let logit = f32::from(spatial_feature(x + y * board_dim));
                 if legal[i] {
                     assert!((policy[i] / policy[board_dim * board_dim] - logit.exp()).abs() < 1e-5);
                 }
@@ -95,20 +101,19 @@ fn debug_checks_reject_nonfinite_model_outputs() {
     let mut backend = backend();
     let mut outputs = Vec::new();
     for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-        for invalid_policy in [true, false] {
-            let input = NNInput {
-                board_dim: MAX_BOARD_DIM,
-                spatial: [if invalid_policy { invalid } else { 0.0 };
-                    NUM_SPATIAL_FEATURES * MAX_BOARD_AREA],
-                global: [if invalid_policy { 0.0 } else { invalid }; NUM_GLOBAL_FEATURES],
-                include_ownership: true,
-            };
-            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                backend.evaluate_batch(&[input], &mut outputs)
-            }));
-            assert!(panic.is_err());
-            assert!(outputs.is_empty());
-        }
+        // Spatial bytes cannot contain NaN/Inf. The fixture feeds global floats
+        // into value and pass logits, so invalid outputs still reach the check.
+        let input = NNInput {
+            board_dim: MAX_BOARD_DIM,
+            spatial: [0; NUM_SPATIAL_FEATURES * MAX_BOARD_AREA],
+            global: [invalid; NUM_GLOBAL_FEATURES],
+            include_ownership: true,
+        };
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            backend.evaluate_batch(&[input], &mut outputs)
+        }));
+        assert!(panic.is_err());
+        assert!(outputs.is_empty());
     }
 }
 
@@ -177,7 +182,7 @@ fn preserves_policy_order_including_pass() {
     let mut backend = backend();
     let input = NNInput {
         board_dim: MAX_BOARD_DIM,
-        spatial: std::array::from_fn(|i| i as f32 / 100.0),
+        spatial: std::array::from_fn(spatial_feature),
         global: [0.0; NUM_GLOBAL_FEATURES],
         include_ownership: false,
     };
@@ -187,10 +192,17 @@ fn preserves_policy_order_including_pass() {
     output.process_in_place(Player::White, &[true; MAX_POLICY_SIZE], MAX_BOARD_DIM);
     let probabilities = output.policy_probs();
     for i in 0..MAX_BOARD_AREA {
-        assert!((probabilities[i] / probabilities[0] - (i as f32 / 100.0).exp()).abs() < 1e-5);
+        assert!(
+            (probabilities[i] / probabilities[0] - f32::from(spatial_feature(i)).exp()).abs()
+                < 1e-5
+        );
     }
     assert_eq!(
         probabilities[MAX_BOARD_DIM * MAX_BOARD_DIM],
         probabilities[0]
     );
+}
+
+fn spatial_feature(i: usize) -> u8 {
+    ((i * 13 + i / 5 + i / 17) % 2) as u8
 }

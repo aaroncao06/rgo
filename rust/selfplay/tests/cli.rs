@@ -232,11 +232,9 @@ mod unix {
             assert_eq!(u32::from_le_bytes(bytes[20..24].try_into().unwrap()), 2);
             let mut offset = 24;
             for _ in 0..records {
-                assert_eq!(
-                    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()),
-                    9
-                );
-                offset += 4 + (3 * 81 + 2 + 82 + 3) * 4 + 81;
+                assert_eq!(bytes[offset], 9);
+                offset +=
+                    1 + 3 * 81_usize.div_ceil(8) + (2 + 82 + 3) * 4 + (2 * 81_usize).div_ceil(8);
             }
             assert_eq!(offset, checksum_offset);
             assert_eq!(

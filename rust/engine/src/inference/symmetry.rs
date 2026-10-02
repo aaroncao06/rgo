@@ -32,7 +32,7 @@ impl Symmetry {
     }
 
     /// Transform each active spatial square in place, leaving padding untouched.
-    pub(super) fn transform_planes(self, values: &mut [f32], board_dim: usize) {
+    pub(super) fn transform_planes<T>(self, values: &mut [T], board_dim: usize) {
         let (planes, remainder) = values.as_chunks_mut::<MAX_BOARD_AREA>();
         debug_assert!(remainder.is_empty());
         debug_assert!(board_dim <= MAX_BOARD_DIM);
@@ -46,7 +46,7 @@ impl Symmetry {
     }
 
     /// Restore an active spatial square in place, using its storage stride.
-    pub(super) fn restore_output(self, values: &mut [f32], board_dim: usize, stride: usize) {
+    pub(super) fn restore_output<T>(self, values: &mut [T], board_dim: usize, stride: usize) {
         debug_assert_eq!(values.len(), stride * stride);
         debug_assert!(board_dim <= stride);
         if self == Self::Identity {
@@ -57,7 +57,7 @@ impl Symmetry {
         self.flip(values, board_dim, stride);
     }
 
-    fn transpose(self, values: &mut [f32], board_dim: usize, stride: usize) {
+    fn transpose<T>(self, values: &mut [T], board_dim: usize, stride: usize) {
         if self as u8 & 0b100 != 0 {
             for y in 0..board_dim {
                 for x in 0..y {
@@ -67,7 +67,7 @@ impl Symmetry {
         }
     }
 
-    fn flip(self, values: &mut [f32], board_dim: usize, stride: usize) {
+    fn flip<T>(self, values: &mut [T], board_dim: usize, stride: usize) {
         if self as u8 & 0b010 != 0 {
             for row in values.chunks_exact_mut(stride).take(board_dim) {
                 row[..board_dim].reverse();
@@ -88,7 +88,7 @@ mod tests {
 
     #[test]
     fn input_transforms_match_coordinates_and_preserve_padding() {
-        let original: [f32; 3 * MAX_BOARD_AREA] = std::array::from_fn(|index| (index + 1) as f32);
+        let original: [u8; 3 * MAX_BOARD_AREA] = std::array::from_fn(|index| index as u8);
         for dim in 1..=MAX_BOARD_DIM {
             for symmetry in Symmetry::ALL {
                 let mut expected = original;

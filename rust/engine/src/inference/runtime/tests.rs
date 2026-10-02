@@ -340,6 +340,7 @@ impl InferenceBackend for EchoSpatialOwnershipBackend {
             let ownership = crate::inference::policy::active_rows(plane, input.board_dim)
                 .flatten()
                 .copied()
+                .map(f32::from)
                 .collect();
             outputs.push(Arc::new(
                 NNOutput::from_raw([0.0; MAX_POLICY_SIZE].into(), 0.0, 0.0, 0.0)

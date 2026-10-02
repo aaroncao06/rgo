@@ -343,12 +343,9 @@ mod tests {
 
             let center_policy = loc_to_policy(game_state.board(), center);
             let center_spatial = loc_to_spatial(game_state.board(), center);
-            assert_eq!(samples[0].input.spatial[center_spatial], 0.0);
-            assert_eq!(
-                samples[1].input.spatial[MAX_BOARD_AREA + center_spatial],
-                1.0
-            );
-            assert_eq!(samples[2].input.spatial[center_spatial], 1.0);
+            assert_eq!(samples[0].input.spatial[center_spatial], 0);
+            assert_eq!(samples[1].input.spatial[MAX_BOARD_AREA + center_spatial], 1);
+            assert_eq!(samples[2].input.spatial[center_spatial], 1);
             assert_eq!(samples[0].policy_target[center_policy], 1.0);
 
             assert_eq!(samples[0].value_target.win_probability, 0.1);

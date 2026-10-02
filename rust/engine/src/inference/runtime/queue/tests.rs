@@ -51,7 +51,7 @@ async fn reencoding_reuses_slot_storage_and_clears_old_features() {
         slot.start();
         slot.visit_input(&mut |input| {
             assert_eq!(input.spatial.as_ptr(), address);
-            assert!(input.spatial.iter().all(|&value| value == 0.0));
+            assert!(input.spatial.iter().all(|&value| value == 0));
             assert!(!input.include_ownership);
         });
         slot.complete(Ok(test_output()));

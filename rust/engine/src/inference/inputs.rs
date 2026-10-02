@@ -12,7 +12,8 @@ pub struct NNInput {
     pub board_dim: usize,
     /// Request metadata, NOT a model feature. Only roots need ownership output.
     pub include_ownership: bool,
-    pub spatial: [f32; NUM_SPATIAL_FEATURES * MAX_BOARD_AREA],
+    /// Binary features (0 or 1), expanded to floats when gathering ONNX inputs.
+    pub spatial: [u8; NUM_SPATIAL_FEATURES * MAX_BOARD_AREA],
     pub global: [f32; NUM_GLOBAL_FEATURES],
 }
 
@@ -26,7 +27,7 @@ impl NNInput {
     pub(super) fn empty() -> Self {
         Self {
             board_dim: crate::game::board::MAX_BOARD_DIM,
-            spatial: [0.0; NUM_SPATIAL_FEATURES * MAX_BOARD_AREA],
+            spatial: [0; NUM_SPATIAL_FEATURES * MAX_BOARD_AREA],
             global: [0.0; NUM_GLOBAL_FEATURES],
             include_ownership: false,
         }
@@ -47,24 +48,24 @@ impl NNInput {
         self.include_ownership = false;
 
         // encode spatial maps
-        self.spatial.fill(0.0);
+        self.spatial.fill(0);
         for loc in game_state.board().locs() {
             let color = game_state.board().color_at(loc);
             let spatial_idx = loc_to_spatial(game_state.board(), loc);
 
             if color == current_color {
-                self.spatial[spatial_idx] = 1_f32;
+                self.spatial[spatial_idx] = 1;
             } else if color == opponent_color {
-                self.spatial[MAX_BOARD_AREA + spatial_idx] = 1_f32;
+                self.spatial[MAX_BOARD_AREA + spatial_idx] = 1;
             }
             if game_state.is_superko_banned(loc) {
-                self.spatial[2 * MAX_BOARD_AREA + spatial_idx] = 1_f32;
+                self.spatial[2 * MAX_BOARD_AREA + spatial_idx] = 1;
             }
         }
     }
 
     /// Active rows in channel-major order, without storage padding.
-    pub fn spatial_rows(&self) -> impl Iterator<Item = &[f32]> {
+    pub fn spatial_rows(&self) -> impl Iterator<Item = &[u8]> {
         self.spatial
             .as_chunks::<MAX_BOARD_AREA>()
             .0
@@ -101,7 +102,7 @@ mod tests {
     fn empty_position_has_empty_planes_and_black_relative_komi() {
         let inputs = NNInput::encode(&GameState::new(rules()));
         assert_eq!(inputs.board_dim, 9);
-        assert_eq!(inputs.spatial, [0.0; NUM_SPATIAL_FEATURES * MAX_BOARD_AREA]);
+        assert_eq!(inputs.spatial, [0; NUM_SPATIAL_FEATURES * MAX_BOARD_AREA]);
         assert_eq!(inputs.global, [-7.5, 0.0]);
     }
 
@@ -133,7 +134,7 @@ mod tests {
             input.apply_symmetry_in_place(symmetry);
             for plane in input.spatial.as_chunks::<MAX_BOARD_AREA>().0 {
                 for (i, &value) in plane.iter().enumerate() {
-                    if value != 0.0 {
+                    if value != 0 {
                         let point = state
                             .board()
                             .loc(
@@ -161,7 +162,7 @@ mod tests {
         assert!(game_state.play(black_stone));
         let white_turn_inputs = NNInput::encode(&game_state);
         let black_pos = loc_to_spatial(game_state.board(), black_stone);
-        assert_eq!(white_turn_inputs.spatial[MAX_BOARD_AREA + black_pos], 1.0);
+        assert_eq!(white_turn_inputs.spatial[MAX_BOARD_AREA + black_pos], 1);
         assert_eq!(white_turn_inputs.global, [7.5, 0.0]);
 
         assert!(game_state.play(white_stone));
@@ -170,10 +171,10 @@ mod tests {
         let inputs = NNInput::encode(&game_state);
         let white_pos = loc_to_spatial(game_state.board(), white_stone);
 
-        assert_eq!(inputs.spatial[black_pos], 1.0);
-        assert_eq!(inputs.spatial[MAX_BOARD_AREA + white_pos], 1.0);
-        assert_eq!(inputs.spatial[MAX_BOARD_AREA + black_pos], 0.0);
-        assert_eq!(inputs.spatial[white_pos], 0.0);
+        assert_eq!(inputs.spatial[black_pos], 1);
+        assert_eq!(inputs.spatial[MAX_BOARD_AREA + white_pos], 1);
+        assert_eq!(inputs.spatial[MAX_BOARD_AREA + black_pos], 0);
+        assert_eq!(inputs.spatial[white_pos], 0);
         assert_eq!(inputs.global, [-7.5, 0.0]);
     }
 
@@ -200,6 +201,6 @@ mod tests {
         let recapture_pos = loc_to_spatial(game_state.board(), recapture);
 
         assert!(game_state.is_superko_banned(recapture));
-        assert_eq!(inputs.spatial[2 * MAX_BOARD_AREA + recapture_pos], 1.0);
+        assert_eq!(inputs.spatial[2 * MAX_BOARD_AREA + recapture_pos], 1);
     }
 }
