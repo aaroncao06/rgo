@@ -44,8 +44,14 @@ fn partial_algorithm_overrides_preserve_other_defaults() {
 
 #[test]
 fn board_dim_must_be_supported_and_fit_storage() {
-    SelfPlayConfig::from_toml(&format!("{EXAMPLE}\n[self_play.rules]\nboard_dim = 9\n")).unwrap();
-    for dim in [0, 1, 5, 7, 8, 10, 13, 19, usize::MAX] {
+    for dim in [9, 13, 19] {
+        let config = SelfPlayConfig::from_toml(&format!(
+            "{EXAMPLE}\n[self_play.rules]\nboard_dim = {dim}\n"
+        ))
+        .unwrap();
+        assert_eq!(config.self_play.rules.board_dim, dim);
+    }
+    for dim in [0, 1, 5, 7, 8, 10, 20, usize::MAX] {
         assert!(matches!(
             SelfPlayConfig::from_toml(&format!(
                 "{EXAMPLE}\n[self_play.rules]\nboard_dim = {dim}\n"

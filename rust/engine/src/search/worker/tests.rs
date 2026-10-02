@@ -31,7 +31,12 @@ impl InferenceBackend for TestBackend {
             return Err(InferenceError::ExecutionFailed);
         }
         inputs.for_each_input(&mut |input| {
-            let mut output = NNOutput::from_raw(self.policy_logits.into(), 0.0, 0.0, 0.0);
+            let mut output = NNOutput::from_raw(
+                self.policy_logits[..input.board_dim * input.board_dim + 1].into(),
+                0.0,
+                0.0,
+                0.0,
+            );
             if input.include_ownership {
                 output = output
                     .with_ownership_logits(vec![0.0; input.board_dim * input.board_dim].into());
@@ -84,8 +89,13 @@ impl InferenceBackend for OneShotBackend {
         self.evaluated = true;
         inputs.for_each_input(&mut |input| {
             // This fixture also supports cache-first tests that later request a root.
-            let output = NNOutput::from_raw(self.policy_logits.into(), 0.0, 0.0, 0.0)
-                .with_ownership_logits(vec![0.0; input.board_dim * input.board_dim].into());
+            let output = NNOutput::from_raw(
+                self.policy_logits[..input.board_dim * input.board_dim + 1].into(),
+                0.0,
+                0.0,
+                0.0,
+            )
+            .with_ownership_logits(vec![0.0; input.board_dim * input.board_dim].into());
             outputs.push(Arc::new(output));
         });
         Ok(())
@@ -122,8 +132,9 @@ fn node_budget(max_nodes: usize) -> SearchBudget {
 }
 
 fn processed_output(policy_logits: [f32; MAX_POLICY_SIZE], white_win_logit: f32) -> Arc<NNOutput> {
+    let board_dim = Rules::TROMP_TAYLORISH_9.board_dim;
     let mut output = Arc::new(NNOutput::from_raw(
-        policy_logits.into(),
+        policy_logits[..board_dim * board_dim + 1].into(),
         white_win_logit,
         0.0,
         -20.0,
@@ -131,7 +142,7 @@ fn processed_output(policy_logits: [f32; MAX_POLICY_SIZE], white_win_logit: f32)
     Arc::get_mut(&mut output).unwrap().process_in_place(
         Player::White,
         &[true; MAX_POLICY_SIZE],
-        crate::game::board::MAX_BOARD_DIM,
+        board_dim,
     );
     output
 }

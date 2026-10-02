@@ -1,7 +1,7 @@
 use super::hash::{Hash128, board_dim_hash, stone_hash};
 
 /// Maximum board side length, independent of a game's active dimension.
-pub const MAX_BOARD_DIM: usize = 9;
+pub const MAX_BOARD_DIM: usize = 19;
 /// Number of intersections at the maximum board dimension, excluding walls.
 pub const MAX_BOARD_AREA: usize = MAX_BOARD_DIM * MAX_BOARD_DIM;
 const STRIDE: usize = MAX_BOARD_DIM + 1; // first element of each row is the wall

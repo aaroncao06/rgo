@@ -1,8 +1,5 @@
 use super::*;
-use crate::{
-    game::{board::Loc, rules::Rules},
-    inference::policy::MAX_POLICY_SIZE,
-};
+use crate::game::{board::Loc, rules::Rules};
 use std::{
     path::PathBuf,
     sync::{
@@ -81,7 +78,12 @@ async fn load_starts_configured_onnx_executors_and_evaluates() {
     let output = client.evaluate(&state, true).await.unwrap();
     assert!(output.is_processed());
     assert!(output.has_ownership());
-    let mut expected = NNOutput::from_raw([0.0; MAX_POLICY_SIZE].into(), -3.75, -3.75, -3.75);
+    let mut expected = NNOutput::from_raw(
+        vec![0.0; state.board().dim().pow(2) + 1].into_boxed_slice(),
+        -3.75,
+        -3.75,
+        -3.75,
+    );
     expected.process_in_place(
         state.next_player(),
         &legal_mask(&state),
@@ -156,9 +158,9 @@ fn test_input() -> NNInput {
     NNInput::encode(&GameState::new(Rules::TROMP_TAYLORISH_9))
 }
 
-fn test_output() -> Arc<NNOutput> {
+fn test_output(board_dim: usize) -> Arc<NNOutput> {
     Arc::new(NNOutput::from_raw(
-        [0.0; MAX_POLICY_SIZE].into(),
+        vec![0.0; board_dim * board_dim + 1].into_boxed_slice(),
         0.0,
         0.0,
         0.0,
@@ -188,7 +190,7 @@ async fn executors_respect_individual_batch_limits_on_a_shared_queue() {
                 // Hold both executors' first batches until the queue is filled.
                 self.started.wait();
             }
-            inputs.for_each_input(&mut |_| outputs.push(test_output()));
+            inputs.for_each_input(&mut |input| outputs.push(test_output(input.board_dim)));
             Ok(())
         }
     }
@@ -211,7 +213,7 @@ async fn executors_respect_individual_batch_limits_on_a_shared_queue() {
     for slot in &slots {
         slot.queue(test_input());
         handle
-            .submit_request(slot.clone(), crate::game::board::MAX_BOARD_DIM)
+            .submit_request(slot.clone(), Rules::TROMP_TAYLORISH_9.board_dim)
             .unwrap();
     }
     started.wait();
@@ -275,7 +277,7 @@ async fn one_loaded_model_evaluates_all_supported_board_dims() {
 
 #[tokio::test]
 async fn an_executor_drains_requests_through_the_dynamic_onnx_model() {
-    let sizes = [9; 6];
+    let sizes = [9, 13, 19, 9, 13, 19];
     let states: Vec<_> = sizes
         .into_iter()
         .map(|board_dim| {
@@ -363,8 +365,13 @@ impl InferenceBackend for EchoSpatialOwnershipBackend {
                 .map(f32::from)
                 .collect();
             outputs.push(Arc::new(
-                NNOutput::from_raw([0.0; MAX_POLICY_SIZE].into(), 0.0, 0.0, 0.0)
-                    .with_ownership_logits(ownership),
+                NNOutput::from_raw(
+                    vec![0.0; input.board_dim * input.board_dim + 1].into_boxed_slice(),
+                    0.0,
+                    0.0,
+                    0.0,
+                )
+                .with_ownership_logits(ownership),
             ));
         });
         Ok(())
@@ -379,11 +386,16 @@ impl InferenceBackend for OwnershipBackend {
     ) -> Result<(), InferenceError> {
         inputs.for_each_input(&mut |input| {
             self.0.lock().unwrap().push(input.include_ownership);
-            let mut output = NNOutput::from_raw([0.0; MAX_POLICY_SIZE].into(), 0.0, 0.0, 0.0);
+            let mut output = NNOutput::from_raw(
+                vec![0.0; input.board_dim * input.board_dim + 1].into_boxed_slice(),
+                0.0,
+                0.0,
+                0.0,
+            );
             if input.include_ownership {
                 // Deliberately different predictions, as randomized inference
                 // could produce. An ownership upgrade must preserve the old ones.
-                let mut policy = [0.0; MAX_POLICY_SIZE];
+                let mut policy = vec![0.0; input.board_dim * input.board_dim + 1];
                 policy[0] = 5.0;
                 output = NNOutput::from_raw(policy.into(), 2.0, 3.0, 1.0)
                     .with_ownership_logits(vec![1.0; input.board_dim * input.board_dim].into());
@@ -601,8 +613,8 @@ impl InferenceBackend for TestBackend {
             return Err(InferenceError::ExecutionFailed);
         }
 
-        inputs.for_each_input(&mut |_input| {
-            outputs.push(test_output());
+        inputs.for_each_input(&mut |input| {
+            outputs.push(test_output(input.board_dim));
         });
         Ok(())
     }
@@ -615,7 +627,7 @@ async fn inference_executor_processes_batches_and_completes_every_slot() {
     for slot in &slots {
         slot.queue(test_input());
         queue
-            .submit_request(slot.clone(), crate::game::board::MAX_BOARD_DIM)
+            .submit_request(slot.clone(), Rules::TROMP_TAYLORISH_9.board_dim)
             .unwrap();
     }
     queue.close();
@@ -645,7 +657,7 @@ async fn inference_executor_returns_backend_errors_to_every_slot() {
     for slot in &slots {
         slot.queue(test_input());
         queue
-            .submit_request(slot.clone(), crate::game::board::MAX_BOARD_DIM)
+            .submit_request(slot.clone(), Rules::TROMP_TAYLORISH_9.board_dim)
             .unwrap();
     }
     queue.close();

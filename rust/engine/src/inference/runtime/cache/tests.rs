@@ -1,12 +1,13 @@
 use super::*;
 use crate::{
     game::{board::Loc, rules::Rules},
-    inference::policy::{MAX_POLICY_SIZE, legal_mask},
+    inference::policy::legal_mask,
 };
 
 fn test_output() -> Arc<NNOutput> {
+    let board_dim = Rules::TROMP_TAYLORISH_9.board_dim;
     Arc::new(NNOutput::from_raw(
-        [0.0; MAX_POLICY_SIZE].into(),
+        vec![0.0; board_dim * board_dim + 1].into_boxed_slice(),
         0.0,
         0.0,
         0.0,

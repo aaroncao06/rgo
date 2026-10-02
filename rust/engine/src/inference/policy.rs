@@ -60,10 +60,17 @@ mod tests {
     #[test]
     fn corner_policy_indices_are_row_major() {
         let board = Board::new(MAX_BOARD_DIM);
+        let last = MAX_BOARD_DIM - 1;
         assert_eq!(loc_to_policy(&board, board.loc(0, 0).unwrap()), 0);
-        assert_eq!(loc_to_policy(&board, board.loc(8, 0).unwrap()), 8);
-        assert_eq!(loc_to_policy(&board, board.loc(0, 8).unwrap()), 72);
-        assert_eq!(loc_to_policy(&board, board.loc(8, 8).unwrap()), 80);
+        assert_eq!(loc_to_policy(&board, board.loc(last, 0).unwrap()), last);
+        assert_eq!(
+            loc_to_policy(&board, board.loc(0, last).unwrap()),
+            last * MAX_BOARD_DIM
+        );
+        assert_eq!(
+            loc_to_policy(&board, board.loc(last, last).unwrap()),
+            MAX_BOARD_AREA - 1
+        );
     }
 
     #[test]
@@ -102,7 +109,7 @@ mod tests {
     #[test]
     fn empty_board_legal_mask_allows_every_policy_slot() {
         let game_state = GameState::new(Rules {
-            board_dim: 9,
+            board_dim: MAX_BOARD_DIM,
             komi: 7.5,
             multi_stone_suicide_legal: true,
         });
