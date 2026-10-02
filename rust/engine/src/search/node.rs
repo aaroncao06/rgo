@@ -108,8 +108,9 @@ impl SearchNode {
             .policy_probs()
     }
     /// Prepare the root policy before creating children. Clones the inference
-    /// output if it is shared, so cached outputs remain unchanged. Existing
-    /// edges retain their own priors and would not reflect later policy edits.
+    /// output and policy if shared, retaining shared ownership predictions so
+    /// cached outputs remain unchanged. Existing edges retain their own priors
+    /// and would not reflect later policy edits.
     pub(super) fn policy_probs_mut(&mut self) -> &mut [f32] {
         std::sync::Arc::make_mut(
             self.nn_output

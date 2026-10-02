@@ -34,9 +34,8 @@ impl InferenceBackend for TestBackend {
         for input in inputs {
             let mut output = NNOutput::from_raw(self.policy_logits.into(), 0.0, 0.0, 0.0);
             if input.include_ownership {
-                output = output.with_ownership_logits(
-                    vec![0.0; input.board_dim * input.board_dim].into_boxed_slice(),
-                );
+                output = output
+                    .with_ownership_logits(vec![0.0; input.board_dim * input.board_dim].into());
             }
             outputs.push(Arc::new(output));
         }
@@ -87,9 +86,7 @@ impl InferenceBackend for OneShotBackend {
         for input in inputs {
             // This fixture also supports cache-first tests that later request a root.
             let output = NNOutput::from_raw(self.policy_logits.into(), 0.0, 0.0, 0.0)
-                .with_ownership_logits(
-                    vec![0.0; input.board_dim * input.board_dim].into_boxed_slice(),
-                );
+                .with_ownership_logits(vec![0.0; input.board_dim * input.board_dim].into());
             outputs.push(Arc::new(output));
         }
         Ok(())
@@ -224,6 +221,10 @@ async fn root_preprocessing_preserves_shared_cached_output() {
     let root = &worker.search_graph.root.as_ref().unwrap().node;
     assert_ne!(root.policy_probs(), &original_policy);
     assert_eq!(cached.policy_probs(), &original_policy);
+    assert_eq!(
+        root.nn_output().white_ownership().unwrap().as_ptr(),
+        cached.white_ownership().unwrap().as_ptr(),
+    );
     assert_eq!(root.nn_output().white_win_prob(), cached.white_win_prob());
     assert_eq!(
         root.nn_output().white_score_mean(),
@@ -236,6 +237,28 @@ async fn root_preprocessing_preserves_shared_cached_output() {
     let cached_again = client.evaluate(&state, false).await.unwrap();
     assert!(Arc::ptr_eq(&cached, &cached_again));
     assert_eq!(cached_again.policy_probs(), &original_policy);
+}
+
+#[test]
+fn root_preprocessing_keeps_shared_output_when_temperature_and_noise_have_no_effect() {
+    let state = GameState::new(Rules::TROMP_TAYLORISH_9);
+    for temperature in [1.0, 1.0 + f64::EPSILON] {
+        for (noise_enabled, noise_weight) in [(false, 0.25), (true, 0.0)] {
+            let mut worker = worker();
+            worker.params.root_policy_temperature_early = temperature;
+            worker.params.root_policy_temperature = temperature;
+            worker.params.root_noise_enabled = noise_enabled;
+            worker.params.root_dirichlet_noise_weight = noise_weight;
+            let cached = processed_output(focused_policy(), 0.0);
+            worker.search_graph.reset(&state, cached.clone(), 0.0, 16);
+
+            let mut rng = SmallRng::seed_from_u64(17);
+            worker.apply_root_policy_temperature_and_noise(&state, &mut rng);
+
+            let root = &worker.search_graph.root.as_ref().unwrap().node;
+            assert!(std::ptr::eq(root.nn_output(), cached.as_ref()));
+        }
+    }
 }
 
 #[tokio::test]

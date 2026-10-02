@@ -1,5 +1,6 @@
 use crate::game::board::Player;
 use crate::inference::symmetry::Symmetry;
+use std::sync::Arc;
 
 const SCORE_MULTIPLIER: f32 = 20.0;
 
@@ -24,8 +25,8 @@ pub struct NNOutput {
     score_mean: f32,    // score mean -> white score mean
     score_aux: f32,     // stdev logit -> white score mean sq
     processed: bool,    //just to be safe now that we are modifying in place
-    // Optional logits -> signed white ownership; no inline map on ordinary evaluations.
-    ownership: Option<Box<[f32]>>,
+    // Processed exclusively, then shared unchanged when root policy is cloned.
+    ownership: Option<Arc<[f32]>>,
 }
 
 fn masked_softmax_in_place(policy: &mut [f32], legal_mask: &[bool]) {
@@ -112,7 +113,9 @@ impl NNOutput {
             ownership: None,
         }
     }
-    pub fn with_ownership_logits(mut self, logits: Box<[f32]>) -> Self {
+    /// Ownership must remain exclusively owned through symmetry restoration
+    /// and processing. After processing, output clones share the immutable map.
+    pub fn with_ownership_logits(mut self, logits: Arc<[f32]>) -> Self {
         debug_assert!(!self.processed);
         debug_assert!(
             logits.iter().all(|v| v.is_finite()),
@@ -127,6 +130,8 @@ impl NNOutput {
         let spatial_policy = &mut self.policy[..board_dim * board_dim];
         symmetry.restore_output(spatial_policy, board_dim, board_dim);
         if let Some(ownership) = self.ownership.as_mut() {
+            let ownership =
+                Arc::get_mut(ownership).expect("raw ownership must be exclusively owned");
             symmetry.restore_output(ownership, board_dim, board_dim);
         }
     }
@@ -182,6 +187,8 @@ impl NNOutput {
 
     fn process_ownership_in_place(&mut self, next_player: Player, board_dim: usize) {
         if let Some(ownership) = self.ownership.as_mut() {
+            let ownership =
+                Arc::get_mut(ownership).expect("raw ownership must be exclusively owned");
             debug_assert_eq!(ownership.len(), board_dim * board_dim);
             for value in ownership.iter_mut() {
                 *value = signed_value_to_white(value.tanh(), next_player);
@@ -331,7 +338,7 @@ mod tests {
                         2.0,
                         -1.0,
                     )
-                    .with_ownership_logits(vec![2.0; board_dim * board_dim].into_boxed_slice());
+                    .with_ownership_logits(vec![2.0; board_dim * board_dim].into());
                     let address = output.ownership.as_ref().unwrap().as_ptr();
                     let policy_address = output.policy.as_ptr();
                     if upgrade {
@@ -375,6 +382,11 @@ mod tests {
             let mut cloned = output.clone();
             cloned.policy_probs_mut()[0] = 0.0;
             assert_eq!(cloned.white_ownership(), output.white_ownership());
+            assert!(Arc::ptr_eq(
+                cloned.ownership.as_ref().unwrap(),
+                output.ownership.as_ref().unwrap(),
+            ));
+            assert_ne!(cloned.policy.as_ptr(), output.policy.as_ptr());
             assert_ne!(cloned.policy_probs()[0], output.policy_probs()[0]);
         }
         let mut output = NNOutput::from_raw([0.0; MAX_POLICY_SIZE].into(), 0.0, 0.0, 0.0);

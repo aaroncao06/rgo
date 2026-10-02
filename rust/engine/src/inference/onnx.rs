@@ -148,6 +148,7 @@ impl OnnxBackend {
             if input.include_ownership {
                 let ownership_logits =
                     &ownership_batch.unwrap()[i * board_area..(i + 1) * board_area];
+                // Allocate the ownership Arc directly from the tensor slice.
                 output = output.with_ownership_logits(ownership_logits.into());
             }
             outputs.push(Arc::new(output));

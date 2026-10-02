@@ -522,9 +522,8 @@ mod tests {
                 logits[board_area] = 100.0;
                 let mut output = NNOutput::from_raw(logits, 0.0, 0.0, 0.0);
                 if input.include_ownership {
-                    output = output.with_ownership_logits(
-                        vec![0.0; input.board_dim * input.board_dim].into_boxed_slice(),
-                    );
+                    output = output
+                        .with_ownership_logits(vec![0.0; input.board_dim * input.board_dim].into());
                 }
                 outputs.push(Arc::new(output));
             }

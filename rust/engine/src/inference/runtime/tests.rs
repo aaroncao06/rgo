@@ -364,9 +364,8 @@ impl InferenceBackend for OwnershipBackend {
                 // could produce. An ownership upgrade must preserve the old ones.
                 let mut policy = [0.0; MAX_POLICY_SIZE];
                 policy[0] = 5.0;
-                output = NNOutput::from_raw(policy.into(), 2.0, 3.0, 1.0).with_ownership_logits(
-                    vec![1.0; input.board_dim * input.board_dim].into_boxed_slice(),
-                );
+                output = NNOutput::from_raw(policy.into(), 2.0, 3.0, 1.0)
+                    .with_ownership_logits(vec![1.0; input.board_dim * input.board_dim].into());
             }
             outputs.push(Arc::new(output));
         }

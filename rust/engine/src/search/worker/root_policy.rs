@@ -207,6 +207,11 @@ impl<N: NodeStore> SearchWorker<N> {
             params.root_policy_temperature,
             params.chosen_move_temperature_halflife,
         );
+        if (temperature - 1.0).abs() <= f64::EPSILON
+            && (!params.root_noise_enabled || params.root_dirichlet_noise_weight == 0.0)
+        {
+            return;
+        }
         let legal = crate::inference::policy::legal_mask(game_state);
         let root = self
             .search_graph
