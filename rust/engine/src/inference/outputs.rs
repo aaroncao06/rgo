@@ -350,7 +350,17 @@ mod tests {
                     assert_eq!(output.policy_probs().as_ptr(), policy_address);
                     assert_eq!(output.policy_probs().len(), board_dim * board_dim + 1);
                     assert_eq!(output.policy_probs()[0], 0.0);
-                    assert!((output.policy_probs().iter().sum::<f32>() - 1.0).abs() < 1e-6);
+                    assert!(
+                        (output
+                            .policy_probs()
+                            .iter()
+                            .copied()
+                            .map(f64::from)
+                            .sum::<f64>()
+                            - 1.0)
+                            .abs()
+                            < 1e-6
+                    );
                     let ownership = output.white_ownership().unwrap();
                     assert_eq!(ownership.as_ptr(), address);
                     assert_eq!(ownership.len(), board_dim * board_dim);

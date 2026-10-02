@@ -254,7 +254,17 @@ async fn one_loaded_model_evaluates_all_supported_board_dims() {
         for (&probability, allowed) in output.policy_probs().iter().zip(legal) {
             assert_eq!(probability > 0.0, allowed);
         }
-        assert!((output.policy_probs().iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        assert!(
+            (output
+                .policy_probs()
+                .iter()
+                .copied()
+                .map(f64::from)
+                .sum::<f64>()
+                - 1.0)
+                .abs()
+                < 1e-6
+        );
         assert!(output.has_ownership());
         assert!(Arc::ptr_eq(
             &output,
@@ -310,7 +320,17 @@ async fn an_executor_drains_requests_through_the_dynamic_onnx_model() {
             assert_eq!(probability > 0.0, allowed);
         }
         assert!(output.has_ownership());
-        assert!((output.policy_probs().iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        assert!(
+            (output
+                .policy_probs()
+                .iter()
+                .copied()
+                .map(f64::from)
+                .sum::<f64>()
+                - 1.0)
+                .abs()
+                < 1e-6
+        );
     }
     executor.join().unwrap();
 }
