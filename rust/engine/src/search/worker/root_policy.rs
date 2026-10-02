@@ -44,7 +44,7 @@ impl<N: NodeStore> SearchWorker<N> {
             .game_state;
         let temperature = move_selection::temperature(
             game_state.turn_number(),
-            game_state.board().size(),
+            game_state.board().dim(),
             self.params.chosen_move_temperature_early,
             self.params.chosen_move_temperature,
             self.params.chosen_move_temperature_halflife,
@@ -202,7 +202,7 @@ impl<N: NodeStore> SearchWorker<N> {
         let params = self.params;
         let temperature = move_selection::temperature(
             game_state.turn_number(),
-            game_state.board().size(),
+            game_state.board().dim(),
             params.root_policy_temperature_early,
             params.root_policy_temperature,
             params.chosen_move_temperature_halflife,

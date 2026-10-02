@@ -1,7 +1,7 @@
 //! Reusable request slots and the shared batch queue.
 
 use crate::inference::{
-    SUPPORTED_BOARD_SIZES, backend::InferenceError, inputs::NNInput, outputs::NNOutput,
+    SUPPORTED_BOARD_DIMS, backend::InferenceError, inputs::NNInput, outputs::NNOutput,
 };
 use std::{
     collections::VecDeque,
@@ -27,9 +27,9 @@ pub(super) struct BatchQueue {
     capacity: usize,
 }
 struct QueueInner {
-    requests: [VecDeque<Arc<EvalSlot>>; SUPPORTED_BOARD_SIZES.len()],
-    // Each nonempty size appears once. Rotate after dispatch to avoid starvation.
-    ready_sizes: VecDeque<usize>,
+    requests: [VecDeque<Arc<EvalSlot>>; SUPPORTED_BOARD_DIMS.len()],
+    // Each nonempty board dimension appears once. Rotate after dispatch to avoid starvation.
+    ready_dims: VecDeque<usize>,
     closed: bool, // executor exits thread when queue is closed and empty, instead of waiting
 }
 
@@ -113,7 +113,7 @@ impl BatchQueue {
         Self {
             inner: Mutex::new(QueueInner {
                 requests: std::array::from_fn(|_| VecDeque::new()),
-                ready_sizes: VecDeque::with_capacity(SUPPORTED_BOARD_SIZES.len()),
+                ready_dims: VecDeque::with_capacity(SUPPORTED_BOARD_DIMS.len()),
                 closed: false,
             }),
             state_changed: Condvar::new(),
@@ -123,12 +123,12 @@ impl BatchQueue {
     pub(super) fn submit_request(
         &self,
         request: Arc<EvalSlot>,
-        board_size: usize,
+        board_dim: usize,
     ) -> Result<(), InferenceError> {
-        let size_index = SUPPORTED_BOARD_SIZES
+        let dim_index = SUPPORTED_BOARD_DIMS
             .iter()
-            .position(|&size| size == board_size)
-            .ok_or(InferenceError::UnsupportedBoardSize(board_size))?;
+            .position(|&dim| dim == board_dim)
+            .ok_or(InferenceError::UnsupportedBoardDim(board_dim))?;
         let mut queue_inner = self.inner.lock().expect("batch queue mutex poisoned");
         if queue_inner.closed {
             return Err(InferenceError::RuntimeClosed);
@@ -139,11 +139,11 @@ impl BatchQueue {
             "batch queue capacity exceeded"
         );
 
-        // not currently in ready sizes so push it now
-        if queue_inner.requests[size_index].is_empty() {
-            queue_inner.ready_sizes.push_back(size_index);
+        // An empty queue is not in ready_dims yet.
+        if queue_inner.requests[dim_index].is_empty() {
+            queue_inner.ready_dims.push_back(dim_index);
         }
-        queue_inner.requests[size_index].push_back(request);
+        queue_inner.requests[dim_index].push_back(request);
         drop(queue_inner);
 
         self.state_changed.notify_one();
@@ -159,31 +159,31 @@ impl BatchQueue {
         batch.clear(); //outside the mutex
 
         let mut queue_inner = self.inner.lock().expect("batch queue mutex poisoned");
-        while queue_inner.ready_sizes.is_empty() && !queue_inner.closed {
+        while queue_inner.ready_dims.is_empty() && !queue_inner.closed {
             queue_inner = self
                 .state_changed
                 .wait(queue_inner)
                 .expect("batch queue mutex poisoned");
         }
-        if queue_inner.ready_sizes.is_empty() {
+        if queue_inner.ready_dims.is_empty() {
             debug_assert!(queue_inner.closed);
             return false;
         }
-        let size_index = queue_inner
-            .ready_sizes
+        let dim_index = queue_inner
+            .ready_dims
             .pop_front()
-            .expect("a size is ready");
+            .expect("a board dimension is ready");
         while batch.len() < max_batch_size {
-            let Some(request) = queue_inner.requests[size_index].pop_front() else {
+            let Some(request) = queue_inner.requests[dim_index].pop_front() else {
                 break;
             };
             batch.push(request);
         }
 
-        if !queue_inner.requests[size_index].is_empty() {
-            queue_inner.ready_sizes.push_back(size_index);
+        if !queue_inner.requests[dim_index].is_empty() {
+            queue_inner.ready_dims.push_back(dim_index);
         }
-        let requests_remain = !queue_inner.ready_sizes.is_empty();
+        let requests_remain = !queue_inner.ready_dims.is_empty();
         drop(queue_inner);
         if requests_remain {
             self.state_changed.notify_one();

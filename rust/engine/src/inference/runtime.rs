@@ -73,9 +73,9 @@ impl ModelHandle {
     fn submit_request(
         &self,
         request: Arc<EvalSlot>,
-        board_size: usize,
+        board_dim: usize,
     ) -> Result<(), InferenceError> {
-        self.0.queue.submit_request(request, board_size)
+        self.0.queue.submit_request(request, board_dim)
     }
     fn lookup(&self, key: EvaluationKey) -> Option<Arc<NNOutput>> {
         self.0.cache.lookup(key)
@@ -169,7 +169,7 @@ impl InferenceClient {
         // send a clone of the arc pointer
         if let Err(error) = self
             .model_handle()
-            .submit_request(self.slot.clone(), game_state.board().size())
+            .submit_request(self.slot.clone(), game_state.board().dim())
         {
             self.slot.cancel_queued();
             return Err(error);
@@ -183,7 +183,7 @@ impl InferenceClient {
         );
         let fresh = Arc::get_mut(&mut output).expect("raw NN output must be exclusively owned");
         if let Some(symmetry) = symmetry {
-            fresh.restore_symmetry_in_place(symmetry, game_state.board().size());
+            fresh.restore_symmetry_in_place(symmetry, game_state.board().dim());
         }
         if let Some(cached) = cached {
             // Preserve the original predictions when only ownership was missing.
@@ -191,10 +191,10 @@ impl InferenceClient {
             fresh.process_with_cached_values_in_place(
                 next_player,
                 &cached,
-                game_state.board().size(),
+                game_state.board().dim(),
             );
         } else {
-            fresh.process_in_place(next_player, &legal_mask, game_state.board().size());
+            fresh.process_in_place(next_player, &legal_mask, game_state.board().dim());
         }
 
         self.model_handle().insert(key, output.clone());

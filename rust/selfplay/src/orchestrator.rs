@@ -517,13 +517,13 @@ mod tests {
             outputs: &mut Vec<Arc<NNOutput>>,
         ) -> Result<(), InferenceError> {
             for input in inputs {
-                let points = input.board_size * input.board_size;
-                let mut logits = vec![-100.0; points + 1].into_boxed_slice();
-                logits[points] = 100.0;
+                let board_area = input.board_dim * input.board_dim;
+                let mut logits = vec![-100.0; board_area + 1].into_boxed_slice();
+                logits[board_area] = 100.0;
                 let mut output = NNOutput::from_raw(logits, 0.0, 0.0, 0.0);
                 if input.include_ownership {
                     output = output.with_ownership_logits(
-                        vec![0.0; input.board_size * input.board_size].into_boxed_slice(),
+                        vec![0.0; input.board_dim * input.board_dim].into_boxed_slice(),
                     );
                 }
                 outputs.push(Arc::new(output));

@@ -173,7 +173,7 @@ mod tests {
                 win_probability: 0.5,
                 score_mean: 0.0,
                 score_stdev: 1.0,
-                ownership: [1; crate::game::board::MAX_BOARD_POINTS],
+                ownership: [1; crate::game::board::MAX_BOARD_AREA],
             },
         }
     }

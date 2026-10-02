@@ -3,12 +3,12 @@ use std::f64::consts::PI;
 pub(super) const EXTRA_SCORE_DISTRIBUTION_RADIUS: usize = 60;
 // KataGo builds this table at its compile-time maximum board size, currently
 // 19, and rescales lookups for the actual board area.
-pub(super) const TABLE_ASSUMED_BOARD_SIZE: usize = 19;
+pub(super) const TABLE_ASSUMED_BOARD_DIM: usize = 19;
 pub(super) const TABLE_MEAN_RADIUS: usize =
-    TABLE_ASSUMED_BOARD_SIZE * TABLE_ASSUMED_BOARD_SIZE + EXTRA_SCORE_DISTRIBUTION_RADIUS;
+    TABLE_ASSUMED_BOARD_DIM * TABLE_ASSUMED_BOARD_DIM + EXTRA_SCORE_DISTRIBUTION_RADIUS;
 pub(super) const TABLE_MEAN_LEN: usize = TABLE_MEAN_RADIUS * 2;
 pub(super) const TABLE_STDEV_LEN: usize =
-    TABLE_ASSUMED_BOARD_SIZE * TABLE_ASSUMED_BOARD_SIZE + EXTRA_SCORE_DISTRIBUTION_RADIUS;
+    TABLE_ASSUMED_BOARD_DIM * TABLE_ASSUMED_BOARD_DIM + EXTRA_SCORE_DISTRIBUTION_RADIUS;
 pub(super) const STEPS_PER_UNIT: i32 = 10;
 pub(super) const BOUND_STDEVS: i32 = 5;
 
@@ -33,7 +33,7 @@ pub(super) fn build_expected_score_value_table() -> Box<[f64]> {
     let score_values: Vec<f64> = (min_score_step..=max_score_step)
         .map(|step| {
             let score = f64::from(step) / f64::from(STEPS_PER_UNIT);
-            score_value(score, 0.0, 1.0, TABLE_ASSUMED_BOARD_SIZE as f64)
+            score_value(score, 0.0, 1.0, TABLE_ASSUMED_BOARD_DIM as f64)
         })
         .collect();
 

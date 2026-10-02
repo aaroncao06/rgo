@@ -1,6 +1,6 @@
 use super::policy::{active_rows, loc_to_spatial};
 use super::symmetry::Symmetry;
-use crate::game::board::{Color, MAX_BOARD_POINTS};
+use crate::game::board::{Color, MAX_BOARD_AREA};
 use crate::game::game_state::GameState;
 
 pub const NUM_SPATIAL_FEATURES: usize = 3; // player stones, opponent stones, superko
@@ -9,10 +9,10 @@ pub const NUM_GLOBAL_FEATURES: usize = 2; // komi, passes
 // takes in current board,
 pub struct NNInput {
     /// Active tensor dimensions; storage retains the maximum board stride.
-    pub board_size: usize,
+    pub board_dim: usize,
     /// Request metadata, NOT a model feature. Only roots need ownership output.
     pub include_ownership: bool,
-    pub spatial: [f32; NUM_SPATIAL_FEATURES * MAX_BOARD_POINTS],
+    pub spatial: [f32; NUM_SPATIAL_FEATURES * MAX_BOARD_AREA],
     pub global: [f32; NUM_GLOBAL_FEATURES],
 }
 
@@ -31,22 +31,22 @@ impl NNInput {
         global[1] = game_state.consecutive_ending_passes() as f32;
 
         // encode spatial maps
-        let mut spatial = [0_f32; NUM_SPATIAL_FEATURES * MAX_BOARD_POINTS];
+        let mut spatial = [0_f32; NUM_SPATIAL_FEATURES * MAX_BOARD_AREA];
         for loc in game_state.board().locs() {
             let color = game_state.board().color_at(loc);
-            let policy_idx: usize = loc_to_spatial(game_state.board(), loc);
+            let spatial_idx = loc_to_spatial(game_state.board(), loc);
 
             if color == current_color {
-                spatial[policy_idx] = 1_f32;
+                spatial[spatial_idx] = 1_f32;
             } else if color == opponent_color {
-                spatial[MAX_BOARD_POINTS + policy_idx] = 1_f32;
+                spatial[MAX_BOARD_AREA + spatial_idx] = 1_f32;
             }
             if game_state.is_superko_banned(loc) {
-                spatial[2 * MAX_BOARD_POINTS + policy_idx] = 1_f32;
+                spatial[2 * MAX_BOARD_AREA + spatial_idx] = 1_f32;
             }
         }
         Self {
-            board_size: game_state.board().size(),
+            board_dim: game_state.board().dim(),
             spatial,
             global,
             include_ownership: false,
@@ -56,14 +56,14 @@ impl NNInput {
     /// Active rows in channel-major order, without storage padding.
     pub fn spatial_rows(&self) -> impl Iterator<Item = &[f32]> {
         self.spatial
-            .as_chunks::<MAX_BOARD_POINTS>()
+            .as_chunks::<MAX_BOARD_AREA>()
             .0
             .iter()
-            .flat_map(|plane| active_rows(plane, self.board_size))
+            .flat_map(|plane| active_rows(plane, self.board_dim))
     }
 
     pub(super) fn apply_symmetry_in_place(&mut self, symmetry: Symmetry) {
-        symmetry.transform_planes(&mut self.spatial, self.board_size);
+        symmetry.transform_planes(&mut self.spatial, self.board_dim);
     }
 }
 
@@ -75,7 +75,7 @@ mod tests {
 
     fn rules() -> Rules {
         Rules {
-            board_size: 9,
+            board_dim: 9,
             komi: 7.5,
             multi_stone_suicide_legal: true,
         }
@@ -90,32 +90,29 @@ mod tests {
     #[test]
     fn empty_position_has_empty_planes_and_black_relative_komi() {
         let inputs = NNInput::encode(&GameState::new(rules()));
-        assert_eq!(inputs.board_size, 9);
-        assert_eq!(
-            inputs.spatial,
-            [0.0; NUM_SPATIAL_FEATURES * MAX_BOARD_POINTS]
-        );
+        assert_eq!(inputs.board_dim, 9);
+        assert_eq!(inputs.spatial, [0.0; NUM_SPATIAL_FEATURES * MAX_BOARD_AREA]);
         assert_eq!(inputs.global, [-7.5, 0.0]);
     }
 
     #[test]
     fn active_rows_exclude_padding_for_every_supported_size() {
-        for size in 1..=crate::game::board::MAX_BOARD_SIZE {
+        for dim in 1..=crate::game::board::MAX_BOARD_DIM {
             let state = GameState::new(Rules {
-                board_size: size,
+                board_dim: dim,
                 ..rules()
             });
             let input = NNInput::encode(&state);
-            assert_eq!(input.board_size, size);
-            assert_eq!(input.spatial_rows().count(), NUM_SPATIAL_FEATURES * size);
-            assert!(input.spatial_rows().all(|row| row.len() == size));
+            assert_eq!(input.board_dim, dim);
+            assert_eq!(input.spatial_rows().count(), NUM_SPATIAL_FEATURES * dim);
+            assert!(input.spatial_rows().all(|row| row.len() == dim));
         }
     }
 
     #[test]
     fn symmetries_keep_stones_inside_the_active_board_and_restore_them() {
         let mut state = GameState::new(Rules {
-            board_size: 5,
+            board_dim: 5,
             ..rules()
         });
         assert!(state.play(state.board().loc(0, 0).unwrap()));
@@ -124,26 +121,22 @@ mod tests {
         for symmetry in Symmetry::ALL {
             let mut input = NNInput::encode(&state);
             input.apply_symmetry_in_place(symmetry);
-            for plane in input.spatial.as_chunks::<MAX_BOARD_POINTS>().0 {
+            for plane in input.spatial.as_chunks::<MAX_BOARD_AREA>().0 {
                 for (i, &value) in plane.iter().enumerate() {
                     if value != 0.0 {
                         let point = state
                             .board()
                             .loc(
-                                i % crate::game::board::MAX_BOARD_SIZE,
-                                i / crate::game::board::MAX_BOARD_SIZE,
+                                i % crate::game::board::MAX_BOARD_DIM,
+                                i / crate::game::board::MAX_BOARD_DIM,
                             )
                             .unwrap();
                         assert!(state.board().is_on_board(point));
                     }
                 }
             }
-            for plane in input.spatial.as_chunks_mut::<MAX_BOARD_POINTS>().0 {
-                symmetry.restore_output(
-                    plane,
-                    input.board_size,
-                    crate::game::board::MAX_BOARD_SIZE,
-                );
+            for plane in input.spatial.as_chunks_mut::<MAX_BOARD_AREA>().0 {
+                symmetry.restore_output(plane, input.board_dim, crate::game::board::MAX_BOARD_DIM);
             }
             assert_eq!(input.spatial, canonical.spatial, "{symmetry:?}");
         }
@@ -158,7 +151,7 @@ mod tests {
         assert!(game_state.play(black_stone));
         let white_turn_inputs = NNInput::encode(&game_state);
         let black_pos = loc_to_spatial(game_state.board(), black_stone);
-        assert_eq!(white_turn_inputs.spatial[MAX_BOARD_POINTS + black_pos], 1.0);
+        assert_eq!(white_turn_inputs.spatial[MAX_BOARD_AREA + black_pos], 1.0);
         assert_eq!(white_turn_inputs.global, [7.5, 0.0]);
 
         assert!(game_state.play(white_stone));
@@ -168,8 +161,8 @@ mod tests {
         let white_pos = loc_to_spatial(game_state.board(), white_stone);
 
         assert_eq!(inputs.spatial[black_pos], 1.0);
-        assert_eq!(inputs.spatial[MAX_BOARD_POINTS + white_pos], 1.0);
-        assert_eq!(inputs.spatial[MAX_BOARD_POINTS + black_pos], 0.0);
+        assert_eq!(inputs.spatial[MAX_BOARD_AREA + white_pos], 1.0);
+        assert_eq!(inputs.spatial[MAX_BOARD_AREA + black_pos], 0.0);
         assert_eq!(inputs.spatial[white_pos], 0.0);
         assert_eq!(inputs.global, [-7.5, 0.0]);
     }
@@ -197,6 +190,6 @@ mod tests {
         let recapture_pos = loc_to_spatial(game_state.board(), recapture);
 
         assert!(game_state.is_superko_banned(recapture));
-        assert_eq!(inputs.spatial[2 * MAX_BOARD_POINTS + recapture_pos], 1.0);
+        assert_eq!(inputs.spatial[2 * MAX_BOARD_AREA + recapture_pos], 1.0);
     }
 }

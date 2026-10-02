@@ -1,6 +1,6 @@
 //! The V0 ONNX tensor boundary. No model architecture or search processing lives here.
 
-use crate::game::board::MAX_BOARD_SIZE;
+use crate::game::board::MAX_BOARD_DIM;
 use std::{path::Path, sync::Arc};
 
 use ort::{
@@ -93,18 +93,18 @@ impl OnnxBackend {
     ) -> ort::Result<()> {
         debug_assert!(outputs.is_empty());
         debug_assert!(!inputs.is_empty(), "cannot evaluate an empty batch");
-        let board_size = inputs[0].board_size;
-        debug_assert!((1..=MAX_BOARD_SIZE).contains(&board_size));
+        let board_dim = inputs[0].board_dim;
+        debug_assert!((1..=MAX_BOARD_DIM).contains(&board_dim));
         debug_assert!(
-            inputs.iter().all(|input| input.board_size == board_size),
+            inputs.iter().all(|input| input.board_dim == board_dim),
             "batch mixes board sizes"
         );
-        let board_points = board_size * board_size;
-        let policy_size = board_points + 1;
+        let board_area = board_dim * board_dim;
+        let policy_size = board_area + 1;
         self.spatial.clear();
         self.global.clear();
         self.spatial
-            .reserve(inputs.len() * NUM_SPATIAL_FEATURES * board_points);
+            .reserve(inputs.len() * NUM_SPATIAL_FEATURES * board_area);
         self.global.reserve(inputs.len() * NUM_GLOBAL_FEATURES);
         for input in inputs {
             for row in input.spatial_rows() {
@@ -115,7 +115,7 @@ impl OnnxBackend {
         let n = inputs.len();
         let include_ownership = inputs.iter().any(|input| input.include_ownership);
         let tensors = ort::inputs![
-            "spatial" => TensorRef::from_array_view(([n, NUM_SPATIAL_FEATURES, board_size, board_size], self.spatial.as_slice()))?,
+            "spatial" => TensorRef::from_array_view(([n, NUM_SPATIAL_FEATURES, board_dim, board_dim], self.spatial.as_slice()))?,
             "global" => TensorRef::from_array_view(([n, NUM_GLOBAL_FEATURES], self.global.as_slice()))?,
         ];
         let batch = if include_ownership {
@@ -131,7 +131,7 @@ impl OnnxBackend {
             Some(tensor(
                 &batch,
                 "ownership_logits",
-                &[n, 1, board_size, board_size],
+                &[n, 1, board_dim, board_dim],
             )?)
         } else {
             None
@@ -147,7 +147,7 @@ impl OnnxBackend {
             );
             if input.include_ownership {
                 let ownership_logits =
-                    &ownership_batch.unwrap()[i * board_points..(i + 1) * board_points];
+                    &ownership_batch.unwrap()[i * board_area..(i + 1) * board_area];
                 output = output.with_ownership_logits(ownership_logits.into());
             }
             outputs.push(Arc::new(output));

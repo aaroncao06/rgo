@@ -9,7 +9,7 @@ pub enum InferenceError {
     ExecutionFailed,
     MismatchedBatchOutput,
     RuntimeClosed,
-    UnsupportedBoardSize(usize),
+    UnsupportedBoardDim(usize),
     Onnx(Arc<ort::Error>),
 }
 pub trait InferenceBackend {
@@ -24,11 +24,11 @@ pub trait InferenceBackend {
     /// invariant checked with debug assertions, not a release-time tensor scan.
     /// Each output must be unprocessed and exclusively owned: do not retain
     /// other strong or weak Arc references or share one output between rows.
-    /// Policy contains exactly board_size² active row-major logits, then pass.
+    /// Policy contains exactly board_dim² active row-major logits, then pass.
     /// The client uses Arc::get_mut to apply legal masking and perspective/score
     /// transformations before sharing the result with the model cache and search.
     /// When input.include_ownership is true, attach current-player ownership
-    /// logits as an exact-size, row-major boxed plane of board_size² values
+    /// logits as an exact-size, row-major boxed plane of board_dim² values
     /// via with_ownership_logits. Other requests may omit that output.
     fn evaluate_batch(
         &mut self,
@@ -54,14 +54,14 @@ impl InferenceBackend for DummyInferenceBackend {
         // outputs.reserve(inputs.len()); //should be noop if you are keeping consistent batch sizes, safeguard
         for input in inputs {
             let mut output = NNOutput::from_raw(
-                vec![0.0; input.board_size * input.board_size + 1].into_boxed_slice(),
+                vec![0.0; input.board_dim * input.board_dim + 1].into_boxed_slice(),
                 0.0,
                 0.0,
                 0.0,
             );
             if input.include_ownership {
                 output = output.with_ownership_logits(
-                    vec![0.0; input.board_size * input.board_size].into_boxed_slice(),
+                    vec![0.0; input.board_dim * input.board_dim].into_boxed_slice(),
                 );
             }
             outputs.push(Arc::new(output));

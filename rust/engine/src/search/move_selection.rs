@@ -108,16 +108,16 @@ pub(super) fn prune_weights(weights: &mut [f64], subtract: f64, prune: f64) {
     }
 }
 
-/// Interpolate on a square board whose side length is `board_size`.
+/// Interpolate on a square board whose side length is `board_dim`.
 pub(super) fn temperature(
     turn_number: usize,
-    board_size: usize,
+    board_dim: usize,
     early: f64,
     late: f64,
     halflife: f64,
 ) -> f64 {
     let raw_halflives = turn_number as f64 / halflife;
-    let halflives = raw_halflives * 19.0 / board_size as f64;
+    let halflives = raw_halflives * 19.0 / board_dim as f64;
     late + (early - late) * 0.5_f64.powf(halflives)
 }
 

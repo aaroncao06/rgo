@@ -257,7 +257,7 @@ mod tests {
             .process_in_place(
                 Player::White,
                 &[true; MAX_POLICY_SIZE],
-                crate::game::board::MAX_BOARD_SIZE,
+                crate::game::board::MAX_BOARD_DIM,
             );
         output
     }

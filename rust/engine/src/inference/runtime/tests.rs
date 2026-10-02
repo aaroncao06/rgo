@@ -85,7 +85,7 @@ async fn load_starts_configured_onnx_executors_and_evaluates() {
     expected.process_in_place(
         state.next_player(),
         &legal_mask(&state),
-        state.board().size(),
+        state.board().dim(),
     );
     assert_eq!(output.white_win_prob(), expected.white_win_prob());
     assert_eq!(output.white_score_mean(), expected.white_score_mean());
@@ -211,7 +211,7 @@ async fn executors_respect_individual_batch_limits_on_a_shared_queue() {
     for slot in &slots {
         slot.queue(test_input());
         handle
-            .submit_request(slot.clone(), crate::game::board::MAX_BOARD_SIZE)
+            .submit_request(slot.clone(), crate::game::board::MAX_BOARD_DIM)
             .unwrap();
     }
     started.wait();
@@ -237,16 +237,16 @@ fn loc(x: usize, y: usize) -> Loc {
 }
 
 #[tokio::test]
-async fn one_loaded_model_evaluates_all_supported_board_sizes() {
+async fn one_loaded_model_evaluates_all_supported_board_dims() {
     let models = TestModelDir::new();
     let handle = ModelRuntime::load(42, 1, &models.config()).unwrap();
     let mut client = InferenceClient::new(handle, Some(0));
-    for size in crate::inference::SUPPORTED_BOARD_SIZES
+    for dim in crate::inference::SUPPORTED_BOARD_DIMS
         .into_iter()
-        .filter(|&size| size <= crate::game::board::MAX_BOARD_SIZE)
+        .filter(|&dim| dim <= crate::game::board::MAX_BOARD_DIM)
     {
         let state = GameState::new(Rules {
-            board_size: size,
+            board_dim: dim,
             ..Rules::default()
         });
         let output = client.evaluate(&state, true).await.unwrap();
@@ -268,9 +268,9 @@ async fn an_executor_drains_requests_through_the_dynamic_onnx_model() {
     let sizes = [9; 6];
     let states: Vec<_> = sizes
         .into_iter()
-        .map(|board_size| {
+        .map(|board_dim| {
             GameState::new(Rules {
-                board_size,
+                board_dim,
                 ..Rules::default()
             })
         })
@@ -288,7 +288,7 @@ async fn an_executor_drains_requests_through_the_dynamic_onnx_model() {
     let queue = Arc::new(BatchQueue::new(slots.len()));
     for (slot, state) in slots.iter().zip(&states) {
         queue
-            .submit_request(slot.clone(), state.board().size())
+            .submit_request(slot.clone(), state.board().dim())
             .unwrap();
     }
     queue.close();
@@ -305,7 +305,7 @@ async fn an_executor_drains_requests_through_the_dynamic_onnx_model() {
         let mut output = slot.wait_for_result().await.unwrap();
         let output = Arc::get_mut(&mut output).unwrap();
         let legal = legal_mask(state);
-        output.process_in_place(state.next_player(), &legal, state.board().size());
+        output.process_in_place(state.next_player(), &legal, state.board().dim());
         for (&probability, allowed) in output.policy_probs().iter().zip(legal) {
             assert_eq!(probability > 0.0, allowed);
         }
@@ -335,9 +335,9 @@ impl InferenceBackend for EchoSpatialOwnershipBackend {
             assert!(input.include_ownership);
             let plane = input
                 .spatial
-                .first_chunk::<{ crate::game::board::MAX_BOARD_POINTS }>()
+                .first_chunk::<{ crate::game::board::MAX_BOARD_AREA }>()
                 .unwrap();
-            let ownership = crate::inference::policy::active_rows(plane, input.board_size)
+            let ownership = crate::inference::policy::active_rows(plane, input.board_dim)
                 .flatten()
                 .copied()
                 .collect();
@@ -365,7 +365,7 @@ impl InferenceBackend for OwnershipBackend {
                 let mut policy = [0.0; MAX_POLICY_SIZE];
                 policy[0] = 5.0;
                 output = NNOutput::from_raw(policy.into(), 2.0, 3.0, 1.0).with_ownership_logits(
-                    vec![1.0; input.board_size * input.board_size].into_boxed_slice(),
+                    vec![1.0; input.board_dim * input.board_dim].into_boxed_slice(),
                 );
             }
             outputs.push(Arc::new(output));
@@ -595,7 +595,7 @@ async fn inference_executor_processes_batches_and_completes_every_slot() {
     for slot in &slots {
         slot.queue(test_input());
         queue
-            .submit_request(slot.clone(), crate::game::board::MAX_BOARD_SIZE)
+            .submit_request(slot.clone(), crate::game::board::MAX_BOARD_DIM)
             .unwrap();
     }
     queue.close();
@@ -625,7 +625,7 @@ async fn inference_executor_returns_backend_errors_to_every_slot() {
     for slot in &slots {
         slot.queue(test_input());
         queue
-            .submit_request(slot.clone(), crate::game::board::MAX_BOARD_SIZE)
+            .submit_request(slot.clone(), crate::game::board::MAX_BOARD_DIM)
             .unwrap();
     }
     queue.close();
@@ -735,17 +735,17 @@ async fn multiple_clients_share_one_model_runtime() {
 }
 
 #[tokio::test]
-async fn unsupported_board_sizes_return_errors_and_leave_the_client_reusable() {
+async fn unsupported_board_dims_return_errors_and_leave_the_client_reusable() {
     let models = TestModelDir::new();
     let handle = ModelRuntime::load(42, 1, &models.config()).unwrap();
     let mut client = InferenceClient::new(handle, Some(0));
-    for size in 1..9 {
+    for dim in 1..9 {
         let state = GameState::new(Rules {
-            board_size: size,
+            board_dim: dim,
             ..Rules::default()
         });
         assert!(matches!(client.evaluate(&state, true).await,
-            Err(InferenceError::UnsupportedBoardSize(actual)) if actual == size));
+            Err(InferenceError::UnsupportedBoardDim(actual)) if actual == dim));
         assert!(client.slot.is_idle());
     }
     client

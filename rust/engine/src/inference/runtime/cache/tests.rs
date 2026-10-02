@@ -19,7 +19,7 @@ fn test_processed_output() -> Arc<NNOutput> {
     Arc::get_mut(&mut output).unwrap().process_in_place(
         game_state.next_player(),
         &legal_mask(&game_state),
-        game_state.board().size(),
+        game_state.board().dim(),
     );
     output
 }
@@ -61,7 +61,7 @@ fn evaluation_key_is_deterministic_and_changes_with_position_and_passes() {
 fn evaluation_key_changes_with_komi_and_suicide_rule() {
     let baseline = GameState::new(Rules::TROMP_TAYLORISH_9);
     let different_komi = GameState::new(Rules {
-        board_size: 9,
+        board_dim: 9,
         komi: 6.5,
         multi_stone_suicide_legal: true,
     });
@@ -78,10 +78,10 @@ fn evaluation_key_changes_with_komi_and_suicide_rule() {
 }
 
 #[test]
-fn evaluation_identity_distinguishes_board_sizes_with_the_same_stones() {
+fn evaluation_identity_distinguishes_board_dims_with_the_same_stones() {
     let mut larger = GameState::new(Rules::default());
     let mut smaller = GameState::new(Rules {
-        board_size: 5,
+        board_dim: 5,
         ..Rules::default()
     });
     let point = larger.board().loc(0, 0).unwrap();

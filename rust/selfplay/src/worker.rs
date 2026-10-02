@@ -9,7 +9,7 @@ use super::{
 };
 use crate::{
     game::{
-        board::{Color, Loc, MAX_BOARD_POINTS, Player},
+        board::{Color, Loc, MAX_BOARD_AREA, Player},
         game_state::GameState,
     },
     inference::{
@@ -260,10 +260,10 @@ fn build_training_samples(
 
 fn ownership_for_player(
     board: &crate::game::board::Board,
-    final_ownership: &[Color; crate::game::board::ARRAY_LEN],
+    final_ownership: &[Color; crate::game::board::BOARD_STORAGE_LEN],
     player: Player,
-) -> [u8; MAX_BOARD_POINTS] {
-    let mut ownership = [1; MAX_BOARD_POINTS];
+) -> [u8; MAX_BOARD_AREA] {
+    let mut ownership = [1; MAX_BOARD_AREA];
     for loc in board.locs() {
         ownership[loc_to_spatial(board, loc)] = match (final_ownership[loc.index()], player) {
             (Color::Empty, _) => 1,
@@ -302,15 +302,15 @@ mod tests {
 
     #[test]
     fn finished_game_replay_builds_player_relative_training_samples() {
-        for board_size in [5, 9] {
+        for board_dim in [5, 9] {
             let rules = Rules {
-                board_size,
+                board_dim,
                 ..Rules::TROMP_TAYLORISH_9
             };
             let mut game_state = GameState::new(rules);
             let center = game_state
                 .board()
-                .loc(board_size / 2, board_size / 2)
+                .loc(board_dim / 2, board_dim / 2)
                 .unwrap();
             let moves = [center, Loc::PASS, Loc::PASS];
             let mut records = Vec::new();
@@ -345,7 +345,7 @@ mod tests {
             let center_spatial = loc_to_spatial(game_state.board(), center);
             assert_eq!(samples[0].input.spatial[center_spatial], 0.0);
             assert_eq!(
-                samples[1].input.spatial[MAX_BOARD_POINTS + center_spatial],
+                samples[1].input.spatial[MAX_BOARD_AREA + center_spatial],
                 1.0
             );
             assert_eq!(samples[2].input.spatial[center_spatial], 1.0);
@@ -357,16 +357,16 @@ mod tests {
             assert_eq!(samples[0].value_target.ownership[center_spatial], 2);
             assert_eq!(samples[1].value_target.ownership[center_spatial], 0);
             for sample in &samples {
-                assert_eq!(sample.input.board_size, board_size);
+                assert_eq!(sample.input.board_dim, board_dim);
                 assert!(
-                    sample.policy_target[board_size * board_size + 1..]
+                    sample.policy_target[board_dim * board_dim + 1..]
                         .iter()
                         .all(|&p| p == 0.0)
                 );
-                for i in 0..MAX_BOARD_POINTS {
-                    let x = i % crate::game::board::MAX_BOARD_SIZE;
-                    let y = i / crate::game::board::MAX_BOARD_SIZE;
-                    if x >= board_size || y >= board_size {
+                for i in 0..MAX_BOARD_AREA {
+                    let x = i % crate::game::board::MAX_BOARD_DIM;
+                    let y = i / crate::game::board::MAX_BOARD_DIM;
+                    if x >= board_dim || y >= board_dim {
                         assert_eq!(sample.value_target.ownership[i], 1);
                     }
                 }

@@ -1,9 +1,9 @@
 //! Read-only area scoring and pass-alive analysis.
 
-use super::{ARRAY_LEN, Board, Color, Loc, MAX_BOARD_SIZE, Player};
+use super::{BOARD_STORAGE_LEN, Board, Color, Loc, MAX_BOARD_DIM, Player};
 
-const MAX_PLAYER_HEADS: usize = (MAX_BOARD_SIZE * MAX_BOARD_SIZE + 1) / 2;
-const MAX_REGIONS: usize = (MAX_BOARD_SIZE * MAX_BOARD_SIZE + 1) / 2 + 1;
+const MAX_PLAYER_HEADS: usize = (MAX_BOARD_DIM * MAX_BOARD_DIM + 1) / 2;
+const MAX_REGIONS: usize = (MAX_BOARD_DIM * MAX_BOARD_DIM + 1) / 2 + 1;
 const VITAL_FOR_CHAIN_HEADS_MAX_LEN: usize = MAX_REGIONS * 4; // max number of (region, chain-head) vital relations for a player
 
 impl Board {
@@ -11,8 +11,8 @@ impl Board {
     pub(crate) fn calculate_pass_alive_area(
         &self,
         multi_stone_suicide_legal: bool,
-    ) -> [Color; ARRAY_LEN] {
-        let mut result = [Color::Empty; ARRAY_LEN];
+    ) -> [Color; BOARD_STORAGE_LEN] {
+        let mut result = [Color::Empty; BOARD_STORAGE_LEN];
         for player in [Player::Black, Player::White] {
             self.calculate_area_for_player(
                 player,
@@ -31,7 +31,7 @@ impl Board {
         &self,
         loc: Loc,
         player: Player,
-        area: &[Color; ARRAY_LEN],
+        area: &[Color; BOARD_STORAGE_LEN],
     ) -> bool {
         let color = Color::from(player);
         if self.colors[loc.index()] != Color::Empty || area[loc.index()] == color {
@@ -52,8 +52,8 @@ impl Board {
     pub(in crate::game) fn calculate_area(
         &self,
         multi_stone_suicide_legal: bool,
-    ) -> [Color; ARRAY_LEN] {
-        let mut result = [Color::Empty; ARRAY_LEN];
+    ) -> [Color; BOARD_STORAGE_LEN] {
+        let mut result = [Color::Empty; BOARD_STORAGE_LEN];
         self.calculate_area_for_player(
             Player::Black,
             true,
@@ -83,13 +83,13 @@ impl Board {
         safe_big: bool,
         unsafe_big: bool,
         multi_stone_suicide_legal: bool,
-        result: &mut [Color; ARRAY_LEN],
+        result: &mut [Color; BOARD_STORAGE_LEN],
     ) {
         let player_color = Color::from(player);
         let opponent_color = Color::from(player.opponent());
 
-        let mut region_idx_by_loc = [-1_i16; ARRAY_LEN]; //index regions; -1 means not in region
-        let mut next_in_region = [Loc::NULL; ARRAY_LEN]; // basically next_in_chain but for regions. region contains either empty or opponent
+        let mut region_idx_by_loc = [-1_i16; BOARD_STORAGE_LEN]; //index regions; -1 means not in region
+        let mut next_in_region = [Loc::NULL; BOARD_STORAGE_LEN]; // basically next_in_chain but for regions. region contains either empty or opponent
 
         let mut borders_non_pass_alive = [false; MAX_REGIONS]; // if a region head is touching a "dead" group
         let mut vital_for_chain_heads = [Loc::NULL; VITAL_FOR_CHAIN_HEADS_MAX_LEN]; // for each region what chain heads are they vital for
@@ -105,7 +105,7 @@ impl Board {
         let mut num_internal_spaces_max_2 = [0_u8; MAX_REGIONS]; // how many cells in the region don't touch the current player's stones, cap at 2
         let mut contains_opponent = [false; MAX_REGIONS]; // does the region contain any opponent stones
 
-        let mut build_region_queue = [Loc::NULL; ARRAY_LEN];
+        let mut build_region_queue = [Loc::NULL; BOARD_STORAGE_LEN];
         let mut player_has_stones = false;
 
         //BUILD REGIONS
@@ -224,7 +224,7 @@ impl Board {
         }
         // track elimination state
         let mut chain_killed = [false; MAX_PLAYER_HEADS]; // whether that player head is killed
-        let mut vital_count_by_head = [0_u16; ARRAY_LEN]; // map chain head loc index to number of vital regions
+        let mut vital_count_by_head = [0_u16; BOARD_STORAGE_LEN]; // map chain head loc index to number of vital regions
 
         // count (region, chain-head) vital relations
         for region_idx in 0..num_regions {

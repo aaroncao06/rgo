@@ -25,7 +25,7 @@ fn example_reuses_algorithm_defaults() {
         SearchParams::default().cpuct_exploration
     );
     assert!(config.self_play.randomize_inference_symmetry);
-    assert_eq!(config.self_play.rules.board_size, 9);
+    assert_eq!(config.self_play.rules.board_dim, 9);
 }
 
 #[test]
@@ -37,18 +37,18 @@ fn partial_algorithm_overrides_preserve_other_defaults() {
     assert!(!config.self_play.randomize_inference_symmetry);
     assert_eq!(config.self_play.rules.komi, 6.5);
     assert!(config.self_play.rules.multi_stone_suicide_legal);
-    assert_eq!(config.self_play.rules.board_size, 9);
+    assert_eq!(config.self_play.rules.board_dim, 9);
     assert_eq!(config.search.cpuct_exploration, 1.2);
     assert_eq!(config.search.lcb_stdevs, SearchParams::default().lcb_stdevs);
 }
 
 #[test]
-fn board_size_must_be_supported_and_fit_storage() {
-    SelfPlayConfig::from_toml(&format!("{EXAMPLE}\n[self_play.rules]\nboard_size = 9\n")).unwrap();
-    for size in [0, 1, 5, 7, 8, 10, 13, 19, usize::MAX] {
+fn board_dim_must_be_supported_and_fit_storage() {
+    SelfPlayConfig::from_toml(&format!("{EXAMPLE}\n[self_play.rules]\nboard_dim = 9\n")).unwrap();
+    for dim in [0, 1, 5, 7, 8, 10, 13, 19, usize::MAX] {
         assert!(matches!(
             SelfPlayConfig::from_toml(&format!(
-                "{EXAMPLE}\n[self_play.rules]\nboard_size = {size}\n"
+                "{EXAMPLE}\n[self_play.rules]\nboard_dim = {dim}\n"
             )),
             Err(ConfigError::Invalid(_)) | Err(ConfigError::Parse(_))
         ));

@@ -1,6 +1,6 @@
 use super::*;
 
-const TEST_BOARD_SIZE: usize = 9;
+const TEST_BOARD_DIM: usize = 9;
 
 fn loc(x: usize, y: usize) -> Loc {
     crate::game::board::Board::new(9)
@@ -13,9 +13,9 @@ fn play(board: &mut Board, x: usize, y: usize, player: Player) {
 }
 
 fn assert_position_hash_matches_recomputation(board: &Board) {
-    let mut recomputed = super::board_size_hash(board.size());
+    let mut recomputed = super::board_dim_hash(board.dim());
 
-    for i in 0..ARRAY_LEN {
+    for i in 0..BOARD_STORAGE_LEN {
         let color = board.colors[i];
         if color == Color::Black || color == Color::White {
             recomputed ^= super::stone_hash(Board::loc_from_index(i), color);
@@ -26,7 +26,7 @@ fn assert_position_hash_matches_recomputation(board: &Board) {
 }
 
 fn assert_chain_metadata_matches_recomputation(board: &Board) {
-    let mut visited = [false; ARRAY_LEN];
+    let mut visited = [false; BOARD_STORAGE_LEN];
 
     for start in board.locs() {
         let start_i = start.index();
@@ -35,9 +35,9 @@ fn assert_chain_metadata_matches_recomputation(board: &Board) {
             continue;
         }
 
-        let mut component = [false; ARRAY_LEN];
-        let mut liberties = [false; ARRAY_LEN];
-        let mut queue = [Loc::NULL; ARRAY_LEN];
+        let mut component = [false; BOARD_STORAGE_LEN];
+        let mut liberties = [false; BOARD_STORAGE_LEN];
+        let mut queue = [Loc::NULL; BOARD_STORAGE_LEN];
         let mut queue_head = 0;
         let mut queue_tail = 1;
         queue[0] = start;
@@ -68,9 +68,9 @@ fn assert_chain_metadata_matches_recomputation(board: &Board) {
         assert_eq!(board.get_num_liberties(start), expected_liberties);
         assert_eq!(board.colors[head.index()], color);
 
-        let mut linked_list = [false; ARRAY_LEN];
+        let mut linked_list = [false; BOARD_STORAGE_LEN];
         let mut linked_list_size = 0;
-        for chain_loc in board.chain_iter(head).take(ARRAY_LEN) {
+        for chain_loc in board.chain_iter(head).take(BOARD_STORAGE_LEN) {
             let chain_i = chain_loc.index();
             assert!(!linked_list[chain_i], "chain list repeated before closing");
             assert_eq!(board.colors[chain_i], color);
@@ -83,12 +83,12 @@ fn assert_chain_metadata_matches_recomputation(board: &Board) {
     }
 }
 
-fn board_from_ascii(rows: [&str; TEST_BOARD_SIZE]) -> Board {
+fn board_from_ascii(rows: [&str; TEST_BOARD_DIM]) -> Board {
     let mut board = Board::new(9);
 
     for (stone, player) in [('x', Player::Black), ('o', Player::White)] {
         for (y, row) in rows.iter().enumerate() {
-            assert_eq!(row.len(), TEST_BOARD_SIZE);
+            assert_eq!(row.len(), TEST_BOARD_DIM);
             for (x, cell) in row.bytes().enumerate() {
                 if cell == stone as u8 {
                     board.play_move_assume_legal(loc(x, y), player);
@@ -113,9 +113,9 @@ fn board_from_ascii(rows: [&str; TEST_BOARD_SIZE]) -> Board {
     board
 }
 
-fn assert_area_rows(area: &[Color; ARRAY_LEN], expected: [&str; TEST_BOARD_SIZE]) {
+fn assert_area_rows(area: &[Color; BOARD_STORAGE_LEN], expected: [&str; TEST_BOARD_DIM]) {
     for (y, row) in expected.iter().enumerate() {
-        assert_eq!(row.len(), TEST_BOARD_SIZE);
+        assert_eq!(row.len(), TEST_BOARD_DIM);
         for (x, cell) in row.bytes().enumerate() {
             let expected_color = match cell {
                 b'X' => Color::Black,
@@ -141,14 +141,14 @@ fn board_round_trips_coordinates_and_checks_bounds() {
 }
 
 #[test]
-fn active_geometry_and_wall_padding_follow_the_board_size() {
-    for size in 1..=MAX_BOARD_SIZE {
-        let board = Board::new(size);
-        assert_eq!(board.size(), size);
-        assert_eq!(board.locs().count(), size * size);
+fn active_geometry_and_wall_padding_follow_the_board_dim() {
+    for dim in 1..=MAX_BOARD_DIM {
+        let board = Board::new(dim);
+        assert_eq!(board.dim(), dim);
+        assert_eq!(board.locs().count(), dim * dim);
         for (i, &color) in board.colors.iter().enumerate() {
             let point = Board::loc_from_index(i);
-            let active = (1..=size).contains(&(i % STRIDE)) && (1..=size).contains(&(i / STRIDE));
+            let active = (1..=dim).contains(&(i % STRIDE)) && (1..=dim).contains(&(i / STRIDE));
             assert_eq!(board.is_on_board(point), active);
             assert_eq!(color, if active { Color::Empty } else { Color::Wall });
         }
@@ -156,11 +156,11 @@ fn active_geometry_and_wall_padding_follow_the_board_size() {
             let (x, y) = board.coords(point).unwrap();
             assert_eq!(board.loc(x, y), Some(point));
             for neighbor in Board::adjacent_indices(point.index()) {
-                assert!(neighbor < ARRAY_LEN);
+                assert!(neighbor < BOARD_STORAGE_LEN);
             }
         }
-        assert!(board.loc(size, 0).is_none());
-        assert!(board.loc(0, size).is_none());
+        assert!(board.loc(dim, 0).is_none());
+        assert!(board.loc(0, dim).is_none());
     }
 }
 
@@ -457,8 +457,8 @@ fn multi_stone_suicide_rule_changes_legality_and_removes_the_chain() {
 
 #[test]
 fn randomized_play_preserves_incremental_chain_and_hash_invariants() {
-    for size in 1..=MAX_BOARD_SIZE {
-        let mut board = Board::new(size);
+    for dim in 1..=MAX_BOARD_DIM {
+        let mut board = Board::new(dim);
         let mut player = Player::Black;
         let mut random_state = 0x7267_6f5f_7465_7374_u64;
 
@@ -466,11 +466,11 @@ fn randomized_play_preserves_incremental_chain_and_hash_invariants() {
             random_state = random_state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            let action = (random_state as usize) % (size * size + 1);
-            let move_loc = if action == size * size {
+            let action = (random_state as usize) % (dim * dim + 1);
+            let move_loc = if action == dim * dim {
                 Loc::PASS
             } else {
-                board.loc(action % size, action / size).unwrap()
+                board.loc(action % dim, action / dim).unwrap()
             };
 
             if !board.is_legal(move_loc, player, true) {
@@ -581,7 +581,7 @@ fn strict_area_rejects_a_chain_without_two_vital_regions() {
     let stone = loc(4, 4);
     play(&mut board, 4, 4, Player::Black);
 
-    let mut strict_area = [Color::Empty; ARRAY_LEN];
+    let mut strict_area = [Color::Empty; BOARD_STORAGE_LEN];
     board.calculate_area_for_player(Player::Black, false, false, true, &mut strict_area);
 
     assert_eq!(strict_area[stone.index()], Color::Empty);
@@ -611,7 +611,7 @@ fn strict_area_keeps_a_two_eye_group_and_its_eyes() {
         play(&mut board, x, y, Player::Black);
     }
 
-    let mut strict_area = [Color::Empty; ARRAY_LEN];
+    let mut strict_area = [Color::Empty; BOARD_STORAGE_LEN];
     board.calculate_area_for_player(Player::Black, false, false, true, &mut strict_area);
 
     assert_eq!(strict_area[loc(4, 4).index()], Color::Black);

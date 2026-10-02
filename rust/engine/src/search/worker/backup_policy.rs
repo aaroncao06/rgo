@@ -28,7 +28,7 @@ impl<N: NodeStore> SearchWorker<N> {
         &mut self,
         node: &mut SearchNode,
         player: Player,
-        board_size: usize,
+        board_dim: usize,
     ) {
         let contributions = &mut self.child_contributions;
         contributions.clear();
@@ -89,7 +89,7 @@ impl<N: NodeStore> SearchWorker<N> {
             direct_white_score_mean_sq,
             self.recent_score_center,
             self.params,
-            board_size,
+            board_dim,
         );
 
         let mut white_win_sum = direct_white_win;

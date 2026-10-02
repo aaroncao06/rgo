@@ -1,5 +1,5 @@
 use super::*;
-use crate::game::board::MAX_BOARD_POINTS;
+use crate::game::board::MAX_BOARD_AREA;
 
 fn loc(x: usize, y: usize) -> Loc {
     crate::game::board::Board::new(9).loc(x, y).unwrap()
@@ -7,27 +7,23 @@ fn loc(x: usize, y: usize) -> Loc {
 
 fn root_worker(
     state: &GameState,
-    ownership: [f32; MAX_BOARD_POINTS],
+    ownership: [f32; MAX_BOARD_AREA],
 ) -> SearchWorker<FixedArenaNodeStore> {
     let mut worker = worker();
     // Explicit White-perspective fixture; normal inference orients by next_player.
     let mut output = NNOutput::from_raw(
-        vec![0.0; state.board().size() * state.board().size() + 1].into_boxed_slice(),
+        vec![0.0; state.board().dim() * state.board().dim() + 1].into_boxed_slice(),
         0.0,
         0.0,
         -20.0,
     )
     .with_ownership_logits(
-        crate::inference::policy::active_rows(&ownership, state.board().size())
+        crate::inference::policy::active_rows(&ownership, state.board().dim())
             .flatten()
             .map(|v| v.clamp(-0.999999, 0.999999).atanh())
             .collect(),
     );
-    output.process_in_place(
-        Player::White,
-        &[true; MAX_POLICY_SIZE],
-        state.board().size(),
-    );
+    output.process_in_place(Player::White, &[true; MAX_POLICY_SIZE], state.board().dim());
     worker.search_graph.reset(state, Arc::new(output), 0.0, 16);
     worker
 }
@@ -49,7 +45,7 @@ fn ending_bonus_thresholds_perspectives_and_disabled_cases() {
             assert!(state.play(Loc::PASS));
         }
         for ownership in [-0.975_f32, -0.95, 0.0, 0.95, 0.975] {
-            let mut worker = root_worker(&state, [ownership; MAX_BOARD_POINTS]);
+            let mut worker = root_worker(&state, [ownership; MAX_BOARD_AREA]);
             let actual_ownership = worker
                 .search_graph
                 .root
@@ -86,7 +82,7 @@ fn ending_bonus_thresholds_perspectives_and_disabled_cases() {
 fn ending_bonus_reads_compact_ownership_with_the_active_board_stride() {
     for player in [Player::Black, Player::White] {
         let mut state = GameState::new(Rules {
-            board_size: 5,
+            board_dim: 5,
             ..Rules::default()
         });
         if player == Player::White {
@@ -94,7 +90,7 @@ fn ending_bonus_reads_compact_ownership_with_the_active_board_stride() {
         }
         let point = state.board().loc(4, 4).unwrap();
         let other = state.board().loc(3, 4).unwrap();
-        let mut ownership = [0.0; MAX_BOARD_POINTS];
+        let mut ownership = [0.0; MAX_BOARD_AREA];
         ownership[crate::inference::policy::loc_to_spatial(state.board(), point)] = 0.975;
         let worker = root_worker(&state, ownership);
         let compact = worker
@@ -119,10 +115,10 @@ fn ending_bonus_preserves_captures_cleanup_and_unsettled_connections() {
     let mut state = GameState::new(Rules::TROMP_TAYLORISH_9);
     assert!(state.play(loc(1, 0)));
     assert!(state.play(loc(0, 0)));
-    let opponent_owned = root_worker(&state, [0.99; MAX_BOARD_POINTS]);
+    let opponent_owned = root_worker(&state, [0.99; MAX_BOARD_AREA]);
     assert_eq!(bonus(&opponent_owned, loc(0, 1)), 0.0); // Captures White.
     assert!(bonus(&opponent_owned, loc(8, 8)) > 0.0);
-    let self_owned = root_worker(&state, [-0.99; MAX_BOARD_POINTS]);
+    let self_owned = root_worker(&state, [-0.99; MAX_BOARD_AREA]);
     assert_eq!(bonus(&self_owned, loc(0, 1)), 0.0); // Adjacent opponent cleanup.
 
     let mut state = GameState::new(Rules::TROMP_TAYLORISH_9);
@@ -130,14 +126,14 @@ fn ending_bonus_preserves_captures_cleanup_and_unsettled_connections() {
         assert!(state.play(point));
         assert!(state.play(Loc::PASS));
     }
-    let worker = root_worker(&state, [-0.99; MAX_BOARD_POINTS]);
+    let worker = root_worker(&state, [-0.99; MAX_BOARD_AREA]);
     assert_eq!(bonus(&worker, loc(4, 4)), 0.0); // Connects two unsettled groups.
     assert!(bonus(&worker, loc(3, 5)) > 0.0); // Just one group.
     for point in [loc(3, 3), loc(4, 3), loc(5, 3)] {
         assert!(state.play(point));
         assert!(state.play(Loc::PASS));
     }
-    let worker = root_worker(&state, [-0.99; MAX_BOARD_POINTS]);
+    let worker = root_worker(&state, [-0.99; MAX_BOARD_AREA]);
     assert!(bonus(&worker, loc(4, 4)) > 0.0); // Same group touches on several sides.
 }
 
@@ -158,11 +154,11 @@ fn active_simple_ko_disables_the_ending_bonus_for_all_moves() {
         assert!(state.play(point));
     }
     assert!(state.board().simple_ko().is_some());
-    let worker = root_worker(&state, [0.99; MAX_BOARD_POINTS]);
+    let worker = root_worker(&state, [0.99; MAX_BOARD_AREA]);
     assert_eq!(bonus(&worker, loc(8, 8)), 0.0);
     assert!(state.play(Loc::PASS));
     assert!(state.board().simple_ko().is_none());
-    let worker = root_worker(&state, [0.99; MAX_BOARD_POINTS]);
+    let worker = root_worker(&state, [0.99; MAX_BOARD_AREA]);
     assert!(bonus(&worker, loc(8, 8)) > 0.0);
 }
 
@@ -198,7 +194,7 @@ fn pass_alive_position() -> GameState {
 fn root_pruning_filters_search_and_direct_policy_but_not_legality_or_interior() {
     let state = pass_alive_position();
     assert!(state.opponent_passed_last_four_turns());
-    let mut worker = root_worker(&state, [0.0; MAX_BOARD_POINTS]);
+    let mut worker = root_worker(&state, [0.0; MAX_BOARD_AREA]);
     let eye = loc(4, 4);
     let root = worker.search_graph.root.as_mut().unwrap();
     assert_eq!(root.safe_area[eye.index()], Color::Black);
@@ -228,7 +224,7 @@ fn ending_bonus_changes_root_selection_and_lcb_without_changing_graph_stats() {
     let state = GameState::new(Rules::TROMP_TAYLORISH_9);
     let bad = loc(3, 3);
     let good = loc(4, 4);
-    let mut ownership = [0.0; MAX_BOARD_POINTS];
+    let mut ownership = [0.0; MAX_BOARD_AREA];
     ownership[crate::inference::policy::loc_to_spatial(state.board(), bad)] = -0.99;
     let mut worker = root_worker(&state, ownership);
     worker.params.root_desired_per_child_visits_coeff = 0.0;

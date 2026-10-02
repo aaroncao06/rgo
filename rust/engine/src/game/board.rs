@@ -1,11 +1,12 @@
-use super::hash::{Hash128, board_size_hash, stone_hash};
+use super::hash::{Hash128, board_dim_hash, stone_hash};
 
-/// Storage capacity, independent of a game's active board size.
-pub const MAX_BOARD_SIZE: usize = 9;
-/// Number of playable points at the maximum storage capacity.
-pub const MAX_BOARD_POINTS: usize = MAX_BOARD_SIZE * MAX_BOARD_SIZE;
-const STRIDE: usize = MAX_BOARD_SIZE + 1; // first element of each row is the wall
-pub const ARRAY_LEN: usize = STRIDE * STRIDE + STRIDE + 1; //need bottom row of walls and bottom corner
+/// Maximum board side length, independent of a game's active dimension.
+pub const MAX_BOARD_DIM: usize = 9;
+/// Number of intersections at the maximum board dimension, excluding walls.
+pub const MAX_BOARD_AREA: usize = MAX_BOARD_DIM * MAX_BOARD_DIM;
+const STRIDE: usize = MAX_BOARD_DIM + 1; // first element of each row is the wall
+/// Number of internal location slots, including wall padding.
+pub const BOARD_STORAGE_LEN: usize = STRIDE * STRIDE + STRIDE + 1;
 
 mod scoring;
 
@@ -72,24 +73,24 @@ struct ChainData {
 
 #[derive(Clone)]
 pub struct Board {
-    size: usize,
-    colors: [Color; ARRAY_LEN], // flat board array
-    chain_data: [ChainData; ARRAY_LEN],
-    chain_head: [Loc; ARRAY_LEN],
-    next_in_chain: [Loc; ARRAY_LEN],
+    dim: usize,
+    colors: [Color; BOARD_STORAGE_LEN], // flat board array
+    chain_data: [ChainData; BOARD_STORAGE_LEN],
+    chain_head: [Loc; BOARD_STORAGE_LEN],
+    next_in_chain: [Loc; BOARD_STORAGE_LEN],
     simple_ko: Option<Loc>,
     position_hash: Hash128,
 }
 
 impl Board {
-    pub fn new(size: usize) -> Self {
+    pub fn new(dim: usize) -> Self {
         assert!(
-            (1..=MAX_BOARD_SIZE).contains(&size),
-            "board size must fit the board storage capacity"
+            (1..=MAX_BOARD_DIM).contains(&dim),
+            "board dimension must fit the board storage capacity"
         );
-        let mut colors = [Color::Wall; ARRAY_LEN];
-        for y in 1..=size {
-            for x in 1..=size {
+        let mut colors = [Color::Wall; BOARD_STORAGE_LEN];
+        for y in 1..=dim {
+            for x in 1..=dim {
                 colors[x + y * STRIDE] = Color::Empty;
             }
         }
@@ -99,20 +100,20 @@ impl Board {
             num_liberties: 0,
         };
         Self {
-            size,
+            dim,
             colors,
-            chain_data: [init_data; ARRAY_LEN],
-            chain_head: [Loc::NULL; ARRAY_LEN],
-            next_in_chain: [Loc::NULL; ARRAY_LEN],
+            chain_data: [init_data; BOARD_STORAGE_LEN],
+            chain_head: [Loc::NULL; BOARD_STORAGE_LEN],
+            next_in_chain: [Loc::NULL; BOARD_STORAGE_LEN],
             simple_ko: None,
-            position_hash: board_size_hash(size),
+            position_hash: board_dim_hash(dim),
         }
     }
-    pub fn size(&self) -> usize {
-        self.size
+    pub fn dim(&self) -> usize {
+        self.dim
     }
     pub fn loc(&self, x: usize, y: usize) -> Option<Loc> {
-        if x < self.size && y < self.size {
+        if x < self.dim && y < self.dim {
             Some(self.loc_assume_on_board(x, y))
         } else {
             None
@@ -123,7 +124,7 @@ impl Board {
             .then(|| self.coords_assume_on_board(loc))
     }
     pub(crate) fn loc_assume_on_board(&self, x: usize, y: usize) -> Loc {
-        debug_assert!(x < self.size && y < self.size);
+        debug_assert!(x < self.dim && y < self.dim);
         Self::loc_from_index((x + 1) + (y + 1) * STRIDE)
     }
     pub(crate) fn coords_assume_on_board(&self, loc: Loc) -> (usize, usize) {
@@ -133,14 +134,14 @@ impl Board {
     pub fn is_on_board(&self, loc: Loc) -> bool {
         let padded_x = loc.index() % STRIDE;
         let padded_y = loc.index() / STRIDE;
-        padded_x > 0 && padded_x <= self.size && padded_y > 0 && padded_y <= self.size
+        padded_x > 0 && padded_x <= self.dim && padded_y > 0 && padded_y <= self.dim
     }
     pub fn locs(&self) -> impl Iterator<Item = Loc> + use<> {
-        let size = self.size;
-        (1..=size).flat_map(move |y| (1..=size).map(move |x| Self::loc_from_index(x + y * STRIDE)))
+        let dim = self.dim;
+        (1..=dim).flat_map(move |y| (1..=dim).map(move |x| Self::loc_from_index(x + y * STRIDE)))
     }
     fn loc_from_index(index: usize) -> Loc {
-        debug_assert!(index < ARRAY_LEN);
+        debug_assert!(index < BOARD_STORAGE_LEN);
         Loc(index as u16)
     }
     fn adjacent_indices(i: usize) -> [usize; 4] {
@@ -424,7 +425,7 @@ impl Board {
     fn empty_region_pushes_count_over_bound(
         &self,
         initial_loc: Loc,
-        counted: &mut [bool; ARRAY_LEN],
+        counted: &mut [bool; BOARD_STORAGE_LEN],
         count: &mut usize,
         bound: usize,
     ) -> bool {
@@ -439,7 +440,7 @@ impl Board {
             return true;
         }
 
-        let mut queue = [Loc::NULL; ARRAY_LEN];
+        let mut queue = [Loc::NULL; BOARD_STORAGE_LEN];
         let mut queue_head = 0;
         let mut queue_tail = 1;
         queue[0] = initial_loc;
@@ -484,7 +485,7 @@ impl Board {
             }
         }
 
-        let mut counted = [false; ARRAY_LEN];
+        let mut counted = [false; BOARD_STORAGE_LEN];
 
         if loc_color == Color::Empty {
             !self.empty_region_pushes_count_over_bound(loc, &mut counted, &mut count, bound)

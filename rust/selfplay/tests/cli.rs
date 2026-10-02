@@ -50,10 +50,10 @@ mod unix {
         }
 
         fn start(model: Option<&str>, make_model_dir: bool) -> Self {
-            Self::start_with_size(model, make_model_dir, 9)
+            Self::start_with_dim(model, make_model_dir, 9)
         }
 
-        fn start_with_size(model: Option<&str>, make_model_dir: bool, board_size: usize) -> Self {
+        fn start_with_dim(model: Option<&str>, make_model_dir: bool, board_dim: usize) -> Self {
             let dir = std::env::temp_dir().join(format!(
                 "rgo-cli-test-{}-{}",
                 std::process::id(),
@@ -75,7 +75,7 @@ mod unix {
                 .replace("self_play_chunks", "output/chunks");
             fs::write(
                 dir.join("config.toml"),
-                format!("{config}\n[self_play]\nsearch_budget_policy = [{{ probability = 1.0, budget = {{ max_nodes = 0, max_playouts = 0 }} }}]\n[self_play.rules]\nboard_size = {board_size}\n"),
+                format!("{config}\n[self_play]\nsearch_budget_policy = [{{ probability = 1.0, budget = {{ max_nodes = 0, max_playouts = 0 }} }}]\n[self_play.rules]\nboard_dim = {board_dim}\n"),
             )
             .unwrap();
             let log = fs::File::create(dir.join("stderr.log")).unwrap();
@@ -185,7 +185,7 @@ mod unix {
 
     #[test]
     fn model_commands_publish_compact_chunks_and_drain() {
-        let mut run = TestProcess::start_with_size(None, true, 9);
+        let mut run = TestProcess::start_with_dim(None, true, 9);
         run.ready();
         let fixture =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../engine/tests/data/v0.onnx");

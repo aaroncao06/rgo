@@ -80,8 +80,8 @@ inherit the defaults defined in Rust (`SelfPlayParams::default()` and
 `SearchParams::KATAGO_SELFPLAY8_MAIN_B18`). Unknown fields and invalid values are
 rejected before workers are started.
 
-`self_play.rules.board_size` defaults to 9 and must be 9, 13, or 19, within
-`MAX_BOARD_SIZE` (currently 9, so only 9 is available). V0 models receive an exact-size tensor
+`self_play.rules.board_dim` defaults to 9 and must be 9, 13, or 19, within
+`MAX_BOARD_DIM` (currently 9, so only 9 is available). V0 models receive an exact-size tensor
 with three spatial channels. Requests are batched by board size; all sizes use
 the same loaded model. Checkpoints must export the dynamic-spatial
 `rgo.io_version = "0"` contract; incompatible declarations are rejected at loading.

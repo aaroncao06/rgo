@@ -1,48 +1,45 @@
-use crate::game::board::{Board, Loc, MAX_BOARD_POINTS, MAX_BOARD_SIZE};
+use crate::game::board::{Board, Loc, MAX_BOARD_AREA, MAX_BOARD_DIM};
 use crate::game::game_state::GameState;
 
-/// Capacity for fixed policy scratch arrays; actual policies have board_size² + 1 entries.
-pub const MAX_POLICY_SIZE: usize = MAX_BOARD_POINTS + 1;
+/// Capacity for fixed policy scratch arrays; actual policies have board_dim² + 1 entries.
+pub const MAX_POLICY_SIZE: usize = MAX_BOARD_AREA + 1;
 
 /// Convert an active-board location or pass to the compact policy.
 pub fn loc_to_policy(board: &Board, loc: Loc) -> usize {
     // Map a Loc action to its index in the dense NN policy.
     debug_assert!(loc != Loc::NULL);
     if loc == Loc::PASS {
-        return board.size() * board.size();
+        return board.dim() * board.dim();
     }
     let (x, y) = board.coords_assume_on_board(loc);
-    x + y * board.size()
+    x + y * board.dim()
 }
 
 /// Convert an active-board policy index or pass to a location.
 pub fn policy_to_loc(board: &Board, i: usize) -> Loc {
-    let size = board.size();
-    debug_assert!(i <= size * size);
-    if i == size * size {
+    let dim = board.dim();
+    debug_assert!(i <= dim * dim);
+    if i == dim * dim {
         return Loc::PASS;
     }
-    board.loc_assume_on_board(i % size, i / size)
+    board.loc_assume_on_board(i % dim, i / dim)
 }
 
 /// Index an active point in a fixed-capacity spatial plane.
 pub fn loc_to_spatial(board: &Board, loc: Loc) -> usize {
     let (x, y) = board.coords_assume_on_board(loc);
-    x + y * MAX_BOARD_SIZE
+    x + y * MAX_BOARD_DIM
 }
 
 /// Active rows of a fixed-capacity plane, without the trailing storage columns.
-pub fn active_rows<T>(
-    plane: &[T; MAX_BOARD_POINTS],
-    board_size: usize,
-) -> impl Iterator<Item = &[T]> {
-    debug_assert!((1..=MAX_BOARD_SIZE).contains(&board_size));
+pub fn active_rows<T>(plane: &[T; MAX_BOARD_AREA], board_dim: usize) -> impl Iterator<Item = &[T]> {
+    debug_assert!((1..=MAX_BOARD_DIM).contains(&board_dim));
     plane
-        .as_chunks::<MAX_BOARD_SIZE>()
+        .as_chunks::<MAX_BOARD_DIM>()
         .0
         .iter()
-        .take(board_size)
-        .map(move |row| &row[..board_size])
+        .take(board_dim)
+        .map(move |row| &row[..board_dim])
 }
 
 /// Compact policy mask in a fixed-capacity scratch array; the unused tail is false.
@@ -62,7 +59,7 @@ mod tests {
 
     #[test]
     fn corner_policy_indices_are_row_major() {
-        let board = Board::new(MAX_BOARD_SIZE);
+        let board = Board::new(MAX_BOARD_DIM);
         assert_eq!(loc_to_policy(&board, board.loc(0, 0).unwrap()), 0);
         assert_eq!(loc_to_policy(&board, board.loc(8, 0).unwrap()), 8);
         assert_eq!(loc_to_policy(&board, board.loc(0, 8).unwrap()), 72);
@@ -71,9 +68,9 @@ mod tests {
 
     #[test]
     fn every_policy_slot_round_trips_to_its_location() {
-        for size in 1..=MAX_BOARD_SIZE {
-            let board = Board::new(size);
-            for i in 0..=size * size {
+        for dim in 1..=MAX_BOARD_DIM {
+            let board = Board::new(dim);
+            for i in 0..=dim * dim {
                 assert_eq!(loc_to_policy(&board, policy_to_loc(&board, i)), i);
             }
         }
@@ -82,7 +79,7 @@ mod tests {
     #[test]
     fn compact_policy_uses_the_active_stride_and_masks_the_unused_scratch_tail() {
         let state = GameState::new(Rules {
-            board_size: 5,
+            board_dim: 5,
             ..Rules::default()
         });
         let board = state.board();
@@ -99,13 +96,13 @@ mod tests {
         assert_eq!(policy_to_loc(board, 25), Loc::PASS);
         let corner = board.loc(4, 4).unwrap();
         assert_eq!(loc_to_policy(board, corner), 24);
-        assert_eq!(loc_to_spatial(board, corner), 4 + 4 * MAX_BOARD_SIZE);
+        assert_eq!(loc_to_spatial(board, corner), 4 + 4 * MAX_BOARD_DIM);
     }
 
     #[test]
     fn empty_board_legal_mask_allows_every_policy_slot() {
         let game_state = GameState::new(Rules {
-            board_size: 9,
+            board_dim: 9,
             komi: 7.5,
             multi_stone_suicide_legal: true,
         });

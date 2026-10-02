@@ -35,7 +35,7 @@ impl InferenceBackend for TestBackend {
             let mut output = NNOutput::from_raw(self.policy_logits.into(), 0.0, 0.0, 0.0);
             if input.include_ownership {
                 output = output.with_ownership_logits(
-                    vec![0.0; input.board_size * input.board_size].into_boxed_slice(),
+                    vec![0.0; input.board_dim * input.board_dim].into_boxed_slice(),
                 );
             }
             outputs.push(Arc::new(output));
@@ -88,7 +88,7 @@ impl InferenceBackend for OneShotBackend {
             // This fixture also supports cache-first tests that later request a root.
             let output = NNOutput::from_raw(self.policy_logits.into(), 0.0, 0.0, 0.0)
                 .with_ownership_logits(
-                    vec![0.0; input.board_size * input.board_size].into_boxed_slice(),
+                    vec![0.0; input.board_dim * input.board_dim].into_boxed_slice(),
                 );
             outputs.push(Arc::new(output));
         }
@@ -135,7 +135,7 @@ fn processed_output(policy_logits: [f32; MAX_POLICY_SIZE], white_win_logit: f32)
     Arc::get_mut(&mut output).unwrap().process_in_place(
         Player::White,
         &[true; MAX_POLICY_SIZE],
-        crate::game::board::MAX_BOARD_SIZE,
+        crate::game::board::MAX_BOARD_DIM,
     );
     output
 }
@@ -503,10 +503,10 @@ fn new_worker_has_no_active_graph_or_scratch_state() {
 }
 
 #[test]
-fn selection_and_root_fallback_visit_only_active_board_points_and_pass() {
+fn selection_and_root_fallback_visit_only_active_board_area_and_pass() {
     let mut worker = worker();
     let state = GameState::new(Rules {
-        board_size: 5,
+        board_dim: 5,
         ..Rules::default()
     });
     let preferred = state.board().loc(2, 2).unwrap();
@@ -1001,7 +1001,7 @@ async fn integer_terminal_scores_use_katago_gridded_second_moment() {
                 score * score + 0.25,
                 worker.recent_score_center,
                 worker.params,
-                root_state.board().size(),
+                root_state.board().dim(),
             );
             assert!((terminal.white_utility() - expected_utility).abs() < 1e-12);
         }

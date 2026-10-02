@@ -1,4 +1,4 @@
-use crate::game::board::ARRAY_LEN;
+use crate::game::board::BOARD_STORAGE_LEN;
 
 use super::board::{Board, Color, Loc, Player};
 use super::hash::{Hash128, pass_hash, player_hash, superko_hash};
@@ -16,16 +16,16 @@ pub struct GameState {
     // Each player's consecutive passes on their own turns, capped at four.
     // Root pruning needs this, not just consecutive passes by either player.
     passes_by_player: [u8; 2],
-    superko_banned: [bool; ARRAY_LEN],
+    superko_banned: [bool; BOARD_STORAGE_LEN],
     seen_position_hashes: HashSet<Hash128>,
 }
 
 impl GameState {
     pub fn new(rules: Rules) -> Self {
-        let board = Board::new(rules.board_size);
+        let board = Board::new(rules.board_dim);
         let mut seen_position_hashes = HashSet::new();
         seen_position_hashes.insert(board.position_hash());
-        let superko_banned = [false; ARRAY_LEN];
+        let superko_banned = [false; BOARD_STORAGE_LEN];
         Self {
             board,
             rules,
@@ -43,7 +43,7 @@ impl GameState {
 
     /// Starts a fresh game while retaining reusable history allocation.
     pub fn reset(&mut self, rules: Rules) {
-        self.board = Board::new(rules.board_size);
+        self.board = Board::new(rules.board_dim);
         self.rules = rules;
         self.next_player = Player::Black;
         self.turn_number = 0;
@@ -180,7 +180,7 @@ impl GameState {
     }
 
     /// Final area ownership on the board's padded coordinate array.
-    pub fn final_ownership(&self) -> [Color; ARRAY_LEN] {
+    pub fn final_ownership(&self) -> [Color; BOARD_STORAGE_LEN] {
         debug_assert!(self.is_finished(), "cannot score an unfinished game");
         self.board
             .calculate_area(self.rules.multi_stone_suicide_legal)
@@ -193,7 +193,7 @@ mod tests {
 
     fn rules() -> Rules {
         Rules {
-            board_size: 9,
+            board_dim: 9,
             komi: 7.5,
             multi_stone_suicide_legal: true,
         }
@@ -208,7 +208,7 @@ mod tests {
     #[test]
     fn a_location_from_a_larger_board_is_rejected_without_changing_state() {
         let mut state = GameState::new(Rules {
-            board_size: 5,
+            board_dim: 5,
             ..rules()
         });
         let outside = Board::new(9).loc(5, 0).unwrap();
@@ -228,12 +228,12 @@ mod tests {
         let outside = state.board.loc(8, 8).unwrap();
         assert!(state.play(outside));
         let smaller_rules = Rules {
-            board_size: 3,
+            board_dim: 3,
             ..rules()
         };
         state.reset(smaller_rules);
-        assert_eq!(state.board.size(), 3);
-        assert_eq!(state.rules().board_size, 3);
+        assert_eq!(state.board.dim(), 3);
+        assert_eq!(state.rules().board_dim, 3);
         assert!(!state.is_legal(outside));
         assert_eq!(state.turn_number(), 0);
         assert_eq!(state.seen_position_hashes.len(), 1);
@@ -243,8 +243,8 @@ mod tests {
 
         let mut scratch = GameState::new(rules());
         scratch.reset_from(&state);
-        assert_eq!(scratch.board.size(), 3);
-        assert_eq!(scratch.rules().board_size, 3);
+        assert_eq!(scratch.board.dim(), 3);
+        assert_eq!(scratch.rules().board_dim, 3);
         assert_eq!(scratch.current_state_hash(), state.current_state_hash());
         assert_eq!(scratch.seen_position_hashes, state.seen_position_hashes);
         assert!(!scratch.is_legal(outside));
@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn positional_superko_applies_on_a_smaller_board() {
         let mut state = GameState::new(Rules {
-            board_size: 4,
+            board_dim: 4,
             ..rules()
         });
         for (x, y) in [
@@ -333,7 +333,7 @@ mod tests {
 
         assert_eq!(
             state.board.position_hash(),
-            Board::new(rules().board_size).position_hash()
+            Board::new(rules().board_dim).position_hash()
         );
         assert_eq!(state.rules.komi, rules().komi);
         assert_eq!(

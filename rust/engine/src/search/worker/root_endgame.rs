@@ -63,7 +63,7 @@ impl<N: NodeStore> SearchWorker<N> {
             root.ending_white_score_bonus(loc, self.params),
             self.recent_score_center,
             self.params,
-            root.game_state.board().size(),
+            root.game_state.board().dim(),
         )
     }
 }

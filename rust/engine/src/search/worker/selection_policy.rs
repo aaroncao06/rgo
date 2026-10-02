@@ -138,7 +138,7 @@ impl<N: NodeStore> SearchWorker<N> {
             f64::from(direct_output.white_score_mean_sq()),
             self.recent_score_center,
             self.params,
-            game_state.board().size(),
+            game_state.board().dim(),
         );
         let backed_up_weight = visited_policy_mass
             .powf(self.params.fpu_parent_weight_by_visited_policy_pow)

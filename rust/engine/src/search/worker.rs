@@ -6,7 +6,7 @@ use std::{collections::HashSet, ptr::NonNull, sync::Arc};
 
 use crate::{
     game::{
-        board::{ARRAY_LEN, Color, Loc, Player},
+        board::{BOARD_STORAGE_LEN, Color, Loc, Player},
         game_state::GameState,
     },
     inference::{
@@ -32,7 +32,7 @@ struct SearchRoot {
     game_state: GameState, // playouts will start from this
     key: GraphKey,
     node: Box<SearchNode>, // owned separately from the rest of the nodestore
-    safe_area: [Color; ARRAY_LEN],
+    safe_area: [Color; BOARD_STORAGE_LEN],
 }
 
 /// Owns the root position and stored graph nodes. Self-play resets the graph
@@ -228,7 +228,7 @@ impl<N: NodeStore> SearchWorker<N> {
         let score_center = recent_score_center(
             f64::from(root_output.white_score_mean()),
             self.params,
-            root_game_state.board().size(),
+            root_game_state.board().dim(),
         );
         let root_utility = white_utility(
             f64::from(root_output.white_win_prob()),
@@ -236,7 +236,7 @@ impl<N: NodeStore> SearchWorker<N> {
             f64::from(root_output.white_score_mean_sq()),
             score_center,
             self.params,
-            root_game_state.board().size(),
+            root_game_state.board().dim(),
         );
 
         match self.scratch_game_state.as_mut() {
@@ -403,7 +403,7 @@ impl<N: NodeStore> SearchWorker<N> {
                             f64::from(output.white_score_mean_sq()),
                             self.recent_score_center,
                             self.params,
-                            self.scratch_game_state().board().size(),
+                            self.scratch_game_state().board().dim(),
                         );
                         let child = unsafe { child.as_mut() };
                         child.initialize_from_nn_eval(output, utility);
@@ -432,7 +432,7 @@ impl<N: NodeStore> SearchWorker<N> {
                             white_score_mean_sq,
                             self.recent_score_center,
                             self.params,
-                            self.scratch_game_state().board().size(),
+                            self.scratch_game_state().board().dim(),
                         );
                         unsafe { child.as_mut() }.record_visit(
                             white_win,
@@ -464,11 +464,7 @@ impl<N: NodeStore> SearchWorker<N> {
             let mut parent = step.parent;
             let parent = unsafe { parent.as_mut() };
             parent.edge_mut(step.edge_index).record_visit();
-            self.recompute_node_stats(
-                parent,
-                step.player,
-                self.scratch_game_state().board().size(),
-            );
+            self.recompute_node_stats(parent, step.player, self.scratch_game_state().board().dim());
         }
     }
 }

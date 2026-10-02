@@ -1,4 +1,4 @@
-use super::board::{ARRAY_LEN, Color, Loc, Player};
+use super::board::{BOARD_STORAGE_LEN, Color, Loc, Player};
 
 static ZOBRIST: Zobrist = Zobrist::new();
 
@@ -8,7 +8,7 @@ const SUPERKO_HASH_SEED: u64 = u64::from_be_bytes(*b"superko!");
 const SUICIDE_HASH_SEED: u64 = u64::from_be_bytes(*b"suicide."); // for the binary rule
 const KOMI_HASH_SEED: u64 = u64::from_be_bytes(*b"komi!!!!");
 const PASS_HASH_SEED: u64 = u64::from_be_bytes(*b"passes!!");
-const BOARD_SIZE_HASH_SEED: u64 = u64::from_be_bytes(*b"boardsz!");
+const BOARD_DIM_HASH_SEED: u64 = u64::from_be_bytes(*b"boardsz!");
 const SPLITMIX64_INCREMENT: u64 = 0x9E37_79B9_7F4A_7C15;
 
 const fn splitmix64_finalize(mut value: u64) -> u64 {
@@ -48,8 +48,8 @@ impl SplitMix64 {
 }
 pub(crate) type Hash128 = u128;
 struct Zobrist {
-    stone_hashes: [[Hash128; 4]; ARRAY_LEN],
-    superko_hashes: [Hash128; ARRAY_LEN],
+    stone_hashes: [[Hash128; 4]; BOARD_STORAGE_LEN],
+    superko_hashes: [Hash128; BOARD_STORAGE_LEN],
     player_hashes: [Hash128; 4],
     suicide_hash: Hash128,
 }
@@ -62,22 +62,22 @@ impl Zobrist {
             suicide_hash: Self::build_suicide_hash(),
         }
     }
-    const fn build_stone_hashes() -> [[Hash128; 4]; ARRAY_LEN] {
+    const fn build_stone_hashes() -> [[Hash128; 4]; BOARD_STORAGE_LEN] {
         let mut rng = SplitMix64::new(STONE_HASH_SEED);
-        let mut stone_hashes = [[0; 4]; ARRAY_LEN];
+        let mut stone_hashes = [[0; 4]; BOARD_STORAGE_LEN];
         let mut i = 0;
-        while i < ARRAY_LEN {
+        while i < BOARD_STORAGE_LEN {
             stone_hashes[i][Color::Black as usize] = rng.next_hash();
             stone_hashes[i][Color::White as usize] = rng.next_hash();
             i += 1;
         }
         stone_hashes
     }
-    const fn build_superko_hashes() -> [Hash128; ARRAY_LEN] {
+    const fn build_superko_hashes() -> [Hash128; BOARD_STORAGE_LEN] {
         let mut rng = SplitMix64::new(SUPERKO_HASH_SEED);
-        let mut superko_hashes = [0; ARRAY_LEN];
+        let mut superko_hashes = [0; BOARD_STORAGE_LEN];
         let mut i = 0;
-        while i < ARRAY_LEN {
+        while i < BOARD_STORAGE_LEN {
             superko_hashes[i] = rng.next_hash();
             i += 1;
         }
@@ -124,6 +124,6 @@ pub(super) fn pass_hash(count: u8) -> Hash128 {
     scalar_hash(PASS_HASH_SEED, count as u64)
 }
 
-pub(super) fn board_size_hash(size: usize) -> Hash128 {
-    scalar_hash(BOARD_SIZE_HASH_SEED, size as u64)
+pub(super) fn board_dim_hash(dim: usize) -> Hash128 {
+    scalar_hash(BOARD_DIM_HASH_SEED, dim as u64)
 }

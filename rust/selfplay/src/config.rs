@@ -86,8 +86,8 @@ impl SelfPlayConfig {
             }
         }
         self.inference.validate()?;
-        if !crate::inference::SUPPORTED_BOARD_SIZES.contains(&self.self_play.rules.board_size) {
-            return Err("self-play board_size must be 9, 13, or 19");
+        if !crate::inference::SUPPORTED_BOARD_DIMS.contains(&self.self_play.rules.board_dim) {
+            return Err("self-play board_dim must be 9, 13, or 19");
         }
         self.self_play.rules.validate()?;
         self.self_play.search_budget_policy.validate()?;

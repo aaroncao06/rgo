@@ -79,13 +79,13 @@ fn receive_batch_is_fifo_and_respects_max_batch_size() {
     let third = Arc::new(EvalSlot::new());
 
     queue
-        .submit_request(Arc::clone(&first), crate::game::board::MAX_BOARD_SIZE)
+        .submit_request(Arc::clone(&first), crate::game::board::MAX_BOARD_DIM)
         .unwrap();
     queue
-        .submit_request(Arc::clone(&second), crate::game::board::MAX_BOARD_SIZE)
+        .submit_request(Arc::clone(&second), crate::game::board::MAX_BOARD_DIM)
         .unwrap();
     queue
-        .submit_request(Arc::clone(&third), crate::game::board::MAX_BOARD_SIZE)
+        .submit_request(Arc::clone(&third), crate::game::board::MAX_BOARD_DIM)
         .unwrap();
 
     let mut batch = Vec::new();
@@ -103,8 +103,8 @@ fn receive_batch_is_fifo_and_respects_max_batch_size() {
 fn batches_group_by_size_keep_fifo_order_and_rotate_between_sizes() {
     let queue = BatchQueue::new(7);
     let slots: Vec<_> = (0..7).map(|_| Arc::new(EvalSlot::new())).collect();
-    for (slot, board_size) in slots.iter().zip([9, 13, 9, 19, 9, 13, 9]) {
-        queue.submit_request(slot.clone(), board_size).unwrap();
+    for (slot, board_dim) in slots.iter().zip([9, 13, 9, 19, 9, 13, 9]) {
+        queue.submit_request(slot.clone(), board_dim).unwrap();
     }
     queue.close();
     let mut batch = Vec::new();
@@ -123,15 +123,12 @@ fn closed_queue_drains_requests_then_stops() {
     let queue = BatchQueue::new(1);
     let request = Arc::new(EvalSlot::new());
     queue
-        .submit_request(Arc::clone(&request), crate::game::board::MAX_BOARD_SIZE)
+        .submit_request(Arc::clone(&request), crate::game::board::MAX_BOARD_DIM)
         .unwrap();
     queue.close();
 
     assert!(matches!(
-        queue.submit_request(
-            Arc::new(EvalSlot::new()),
-            crate::game::board::MAX_BOARD_SIZE
-        ),
+        queue.submit_request(Arc::new(EvalSlot::new()), crate::game::board::MAX_BOARD_DIM),
         Err(InferenceError::RuntimeClosed)
     ));
 
@@ -161,7 +158,7 @@ fn submission_wakes_a_waiting_receiver() {
 
     started_rx.recv().unwrap();
     queue
-        .submit_request(Arc::clone(&request), crate::game::board::MAX_BOARD_SIZE)
+        .submit_request(Arc::clone(&request), crate::game::board::MAX_BOARD_DIM)
         .unwrap();
 
     let (received, batch) = result_rx
@@ -201,10 +198,10 @@ fn close_wakes_a_waiting_receiver() {
 #[test]
 fn unsupported_sizes_are_rejected_without_queuing() {
     let queue = BatchQueue::new(1);
-    for size in [0, 1, 5, 7, 8, 10, 12, 14, 18, 20, usize::MAX] {
+    for dim in [0, 1, 5, 7, 8, 10, 12, 14, 18, 20, usize::MAX] {
         assert!(matches!(
-            queue.submit_request(Arc::new(EvalSlot::new()), size),
-            Err(InferenceError::UnsupportedBoardSize(actual)) if actual == size
+            queue.submit_request(Arc::new(EvalSlot::new()), dim),
+            Err(InferenceError::UnsupportedBoardDim(actual)) if actual == dim
         ));
     }
     queue.close();
