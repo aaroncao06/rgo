@@ -45,44 +45,48 @@ pub(super) struct TrainingSample {
     pub(super) value_target: ValueTarget,
 }
 
-pub(super) struct EncodedChunk {
-    pub(super) bytes: Vec<u8>,
-    pub(super) records: usize,
-}
-
 /// Builds one versioned chunk directly in its final byte representation.
 ///
 /// Full chunks hash each record as it is encoded. Only the final partial chunk
 /// needs a second hashing pass because its record count is not known when its
 /// header is initialized.
+/// Finished bytes stay in the encoder; reset it after publication to reuse the
+/// allocation for the next chunk.
 pub(super) struct ChunkEncoder {
     record_capacity: usize,
     record_count: usize,
     bytes: Vec<u8>,
     checksum: Sha256,
+    finished: bool,
 }
 
 impl ChunkEncoder {
     pub(super) fn new(record_capacity: usize) -> Self {
-        Self::with_buffer(record_capacity, Vec::new())
+        let mut encoder = Self {
+            record_capacity: 0,
+            record_count: 0,
+            bytes: Vec::new(),
+            checksum: Sha256::new(),
+            finished: false,
+        };
+        encoder.reset(record_capacity);
+        encoder
     }
 
-    pub(super) fn with_buffer(record_capacity: usize, mut bytes: Vec<u8>) -> Self {
+    pub(super) fn reset(&mut self, record_capacity: usize) {
         assert!(record_capacity > 0, "training chunks must be nonempty");
         let header = chunk_header(record_capacity);
-        bytes.clear();
-        bytes.reserve(CHUNK_HEADER_SIZE + CHUNK_CHECKSUM_SIZE);
-        bytes.extend_from_slice(&header);
-        let mut checksum = Sha256::new();
-        checksum.update(header);
-        Self {
-            record_capacity,
-            record_count: 0,
-            bytes,
-            checksum,
-        }
+        self.bytes.clear();
+        self.bytes.reserve(CHUNK_HEADER_SIZE + CHUNK_CHECKSUM_SIZE);
+        self.bytes.extend_from_slice(&header);
+        self.checksum = Sha256::new();
+        self.checksum.update(header);
+        self.record_capacity = record_capacity;
+        self.record_count = 0;
+        self.finished = false;
     }
 
+    /// Records awaiting finalization; finishing clears this count.
     pub(super) fn record_count(&self) -> usize {
         self.record_count
     }
@@ -92,6 +96,10 @@ impl ChunkEncoder {
     }
 
     pub(super) fn push(&mut self, sample: &TrainingSample) {
+        debug_assert!(
+            !self.finished,
+            "reset the encoder before pushing more records"
+        );
         debug_assert!(
             self.record_count < self.record_capacity,
             "training chunk capacity exceeded"
@@ -140,20 +148,20 @@ impl ChunkEncoder {
         self.record_count += 1;
     }
 
-    pub(super) fn finish(mut self) -> EncodedChunk {
+    pub(super) fn finish(&mut self) -> &[u8] {
+        debug_assert!(!self.finished, "chunk already finished");
         debug_assert!(self.record_count > 0, "cannot finish an empty chunk");
 
         let checksum = if self.record_count == self.record_capacity {
-            self.checksum.finalize()
+            std::mem::take(&mut self.checksum).finalize()
         } else {
             self.bytes[..CHUNK_HEADER_SIZE].copy_from_slice(&chunk_header(self.record_count));
             Sha256::digest(&self.bytes)
         };
         self.bytes.extend_from_slice(&checksum);
-        EncodedChunk {
-            bytes: self.bytes,
-            records: self.record_count,
-        }
+        self.record_count = 0;
+        self.finished = true;
+        &self.bytes
     }
 }
 
@@ -219,7 +227,7 @@ pub(super) fn encode_chunk(samples: &[TrainingSample]) -> Vec<u8> {
     for sample in samples {
         encoder.push(sample);
     }
-    encoder.finish().bytes
+    encoder.finish().to_vec()
 }
 
 #[cfg(test)]
@@ -398,16 +406,57 @@ mod tests {
             for board_dim in [9, 3, 5] {
                 encoder.push(&sample(board_dim));
             }
-            let chunk = encoder.finish();
-            assert_eq!(chunk.records, 3);
-            assert_eq!(read_u32(&chunk.bytes, 16), 3);
+            assert_eq!(encoder.record_count(), 3);
+            let bytes = encoder.finish();
+            assert_eq!(read_u32(bytes, 16), 3);
             let mut offset = CHUNK_HEADER_SIZE;
             for board_dim in [9, 3, 5] {
-                assert_eq!(usize::from(chunk.bytes[offset]), board_dim);
+                assert_eq!(usize::from(bytes[offset]), board_dim);
                 offset += training_record_size(board_dim);
             }
-            assert_eq!(offset + CHUNK_CHECKSUM_SIZE, chunk.bytes.len());
-            assert!(verify_chunk_checksum(&chunk.bytes));
+            assert_eq!(offset + CHUNK_CHECKSUM_SIZE, bytes.len());
+            assert!(verify_chunk_checksum(bytes));
+        }
+    }
+
+    #[test]
+    fn encoder_reuses_allocation_across_full_and_partial_chunks() {
+        let mut encoder = ChunkEncoder::new(4);
+        let mut allocation = None;
+        // Start with the largest payload so subsequent resets need no growth.
+        // Alternate full and partial chunks, capacities, dimensions, and data.
+        for (capacity, board_dim, count) in
+            [(4, 19, 4), (6, 9, 2), (3, 3, 3), (1, 19, 1), (4, 9, 3)]
+        {
+            encoder.reset(capacity);
+            assert_eq!(encoder.record_count(), 0);
+            assert_eq!(encoder.remaining_capacity(), capacity);
+            let samples: Vec<_> = (0..count)
+                .map(|tag| {
+                    let mut sample = sample(board_dim);
+                    sample.value_target.score_mean = tag as f32 + capacity as f32;
+                    sample
+                })
+                .collect();
+            for sample in &samples {
+                encoder.push(sample);
+            }
+            assert_eq!(encoder.record_count(), count);
+            assert_eq!(encoder.remaining_capacity(), capacity - count);
+            let bytes = encoder.finish();
+            assert_eq!(read_u32(bytes, 16), count as u32);
+            assert_eq!(
+                bytes.len(),
+                CHUNK_HEADER_SIZE + count * training_record_size(board_dim) + CHUNK_CHECKSUM_SIZE
+            );
+            assert!(verify_chunk_checksum(bytes));
+            assert_eq!(bytes, encode_chunk(&samples));
+            assert_eq!(encoder.record_count(), 0);
+            let current = (encoder.bytes.as_ptr(), encoder.bytes.capacity());
+            if let Some(allocation) = allocation {
+                assert_eq!(current, allocation);
+            }
+            allocation = Some(current);
         }
     }
 

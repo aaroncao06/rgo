@@ -32,6 +32,8 @@ pub(super) enum Event {
     },
     ChunkReady {
         path: PathBuf,
+        // No production consumer yet; retained for possible client logging or
+        // size accounting. Can be removed if those uses do not materialize.
         bytes: usize,
         records: usize,
     },

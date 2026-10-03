@@ -52,10 +52,10 @@ fn mock_chunk(records: usize) -> Vec<u8> {
         sample.value_target.win_probability = (i % 101) as f32 / 100.0;
         encoder.push(&sample);
     }
-    let chunk = encoder.finish();
-    assert_eq!(chunk.records, records);
-    assert!(training_data::verify_chunk_checksum(&chunk.bytes));
-    chunk.bytes
+    assert_eq!(encoder.record_count(), records);
+    let bytes = encoder.finish();
+    assert!(training_data::verify_chunk_checksum(bytes));
+    bytes.to_vec()
 }
 
 // Columns: write, file sync, rename, directory sync, save total, read, save+read.

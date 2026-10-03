@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::{
     control::{Event, EventPublisher},
-    training_data::{ChunkEncoder, EncodedChunk, TrainingSample},
+    training_data::{ChunkEncoder, TrainingSample},
 };
 
 const PENDING_CHUNK_FILE: &str = ".pending-chunk.tmp";
@@ -49,8 +49,8 @@ impl From<io::Error> for ChunkWriterError {
 /// Encodes and durably publishes chunks on one dedicated OS thread.
 ///
 /// Workers submit completed games through a bounded queue and receive their
-/// emptied sample vectors back for reuse. One encoded byte allocation moves
-/// between the active encoder and publication, without overlapping writes.
+/// emptied sample vectors back for reuse. One reusable encoder owns the encoded
+/// byte allocation through publication, without overlapping writes.
 /// Closing the queue drains games and flushes the final partial fixed chunk.
 ///
 /// The caller must durably provision the output directory before starting.
@@ -62,8 +62,7 @@ pub(super) struct ChunkWriter {
     output_dir: PathBuf,
     completed_games_rx: mpsc::Receiver<CompletedGame>,
     events: EventPublisher,
-    active_chunk: Option<ChunkEncoder>,
-    bytes: Vec<u8>,
+    active_chunk: ChunkEncoder,
 }
 
 impl ChunkWriter {
@@ -74,8 +73,9 @@ impl ChunkWriter {
         events: EventPublisher,
     ) -> Self {
         let active_chunk = match mode {
-            ChunkMode::PerGame => None,
-            ChunkMode::FixedRecords(records) => Some(ChunkEncoder::new(records)),
+            // Per-game mode sets the actual capacity when a game arrives.
+            ChunkMode::PerGame => ChunkEncoder::new(1),
+            ChunkMode::FixedRecords(records) => ChunkEncoder::new(records),
         };
         Self {
             mode,
@@ -83,7 +83,6 @@ impl ChunkWriter {
             completed_games_rx,
             events,
             active_chunk,
-            bytes: Vec::new(),
         }
     }
 
@@ -104,10 +103,9 @@ impl ChunkWriter {
                 ChunkMode::FixedRecords(records) => self.append_game_fixed(game, records)?,
             }
         }
-        if let Some(chunk) = self.active_chunk.take()
-            && chunk.record_count() > 0
-        {
-            self.publish(chunk.finish())?;
+        if self.active_chunk.record_count() > 0 {
+            debug_assert!(matches!(self.mode, ChunkMode::FixedRecords(_)));
+            self.publish()?;
         }
         Ok(())
     }
@@ -117,15 +115,13 @@ impl ChunkWriter {
             let _ = game.recycle_tx.send(game.samples);
             return Ok(());
         }
-        let mut encoder =
-            ChunkEncoder::with_buffer(game.samples.len(), std::mem::take(&mut self.bytes));
+        self.active_chunk.reset(game.samples.len());
         for sample in &game.samples {
-            encoder.push(sample);
+            self.active_chunk.push(sample);
         }
         game.samples.clear();
-        let chunk = encoder.finish();
         let _ = game.recycle_tx.send(game.samples);
-        self.publish(chunk)
+        self.publish()
     }
 
     fn append_game_fixed(
@@ -134,55 +130,57 @@ impl ChunkWriter {
         records: usize,
     ) -> Result<(), ChunkWriterError> {
         loop {
-            let mut encoder = self.active_chunk.take().unwrap_or_else(|| {
-                ChunkEncoder::with_buffer(records, std::mem::take(&mut self.bytes))
-            });
             // Preserve tail-first consumption: independently sampled records
             // need no game order, and truncation does not shift remaining data.
-            let count = encoder.remaining_capacity().min(game.samples.len());
+            let count = self
+                .active_chunk
+                .remaining_capacity()
+                .min(game.samples.len());
             let remaining = game.samples.len() - count;
             for sample in &game.samples[remaining..] {
-                encoder.push(sample);
+                self.active_chunk.push(sample);
             }
             game.samples.truncate(remaining);
 
-            let chunk = if encoder.record_count() == records {
-                Some(encoder.finish())
-            } else {
-                self.active_chunk = Some(encoder);
-                None
-            };
             if game.samples.is_empty() {
                 // Let the worker start its next game before publishing this
                 // game's final chunk or waiting for the client pipe to flush.
                 let _ = game.recycle_tx.send(game.samples);
-                if let Some(chunk) = chunk {
-                    self.publish(chunk)?;
+                if self.active_chunk.record_count() == records {
+                    self.publish()?;
                 }
                 return Ok(());
             }
-            self.publish(chunk.expect("unfinished game must have filled a chunk"))?;
+            debug_assert!(
+                self.active_chunk.record_count() == records,
+                "unfinished game must have filled a chunk"
+            );
+            self.publish()?;
         }
     }
 
-    fn publish(&mut self, mut chunk: EncodedChunk) -> Result<(), ChunkWriterError> {
+    fn publish(&mut self) -> Result<(), ChunkWriterError> {
+        let records = self.active_chunk.record_count();
+        let bytes = self.active_chunk.finish();
         let id = random_chunk_id().map_err(ChunkWriterError::RandomnessUnavailable)?;
         let final_path = chunk_path(&self.output_dir, id);
         let temporary_path = self.output_dir.join(PENDING_CHUNK_FILE);
 
         let mut file = File::create(&temporary_path)?;
-        file.write_all(&chunk.bytes)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
         fs::rename(&temporary_path, &final_path)?;
         sync_directory(&self.output_dir)?;
         self.events.blocking_emit(Event::ChunkReady {
             path: final_path,
-            bytes: chunk.bytes.len(),
-            records: chunk.records,
+            bytes: bytes.len(),
+            records,
         })?;
-        chunk.bytes.clear();
-        self.bytes = chunk.bytes;
+        // Per-game mode resets when the next game supplies its capacity.
+        if let ChunkMode::FixedRecords(records) = self.mode {
+            self.active_chunk.reset(records);
+        }
         Ok(())
     }
 }

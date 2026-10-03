@@ -246,6 +246,10 @@ async fn per_game_publishes_without_waiting_for_queue_closure_or_splitting() {
         assert_eq!(samples.as_ptr(), allocation);
         assert_chunk(&next_event(&mut events).await, &expected);
     }
+    // An empty game must not republish the previous game's finished encoder.
+    let (empty, returned) = game(Vec::new());
+    tx.send(empty).await.unwrap();
+    assert!(recycled(returned).await.is_empty());
     drop(tx);
     writer.finish().await.unwrap();
     assert_eq!(dir.files().len(), 3);
@@ -323,12 +327,13 @@ async fn fixed_chunks_split_a_game_preserving_existing_tail_order() {
 }
 
 #[test]
-fn one_encoded_allocation_is_reused_across_publications() {
+fn repeated_games_reuse_the_encoder() {
     for mode in [ChunkMode::PerGame, ChunkMode::FixedRecords(3)] {
         let dir = TestDir::new();
         let (_tx, rx) = mpsc::channel(1);
-        let mut writer = ChunkWriter::new(mode, dir.0.clone(), rx, EventPublisher::discard());
-        let mut allocation = None;
+        let (output, mut events) = event_output();
+        let mut writer =
+            ChunkWriter::new(mode, dir.0.clone(), rx, EventPublisher::with_output(output));
         for _ in 0..4 {
             let (game, returned) = game((0..3).map(|tag| sample(19, tag)).collect());
             match mode {
@@ -338,15 +343,10 @@ fn one_encoded_allocation_is_reused_across_publications() {
                 }
             }
             assert!(returned.blocking_recv().unwrap().is_empty());
-            assert!(writer.active_chunk.is_none());
-            assert!(writer.bytes.is_empty());
-            assert!(writer.bytes.capacity() > 0);
-            let current = (writer.bytes.as_ptr(), writer.bytes.capacity());
-            if let Some(allocation) = allocation {
-                assert_eq!(current, allocation);
-            }
-            allocation = Some(current);
+            let expected: Vec<_> = (0..3).map(|tag| sample(19, tag)).collect();
+            assert_chunk(&events.try_recv().unwrap(), &encode_chunk(&expected));
         }
+        assert_eq!(dir.files().len(), 4);
     }
 }
 
