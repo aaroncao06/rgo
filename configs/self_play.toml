@@ -13,9 +13,12 @@ model_dir = "models"
 cache_capacity = 65536
 num_cache_shards = 16
 
-# Each entry starts one executor. Batch size is configured per device.
+# Each entry starts one executor. base_batch_size counts 19x19 positions;
+# smaller boards scale by area: floor(base_batch_size * 361 / board_dim^2).
+# A limit of 8 allows up to 35 positions at 9x9, 17 at 13x13, or 8 at 19x19.
+# Executors launch immediately with the available requests, even below the limit.
 [[inference.executors]]
-max_batch_size = 8
+base_batch_size = 8
 device = { type = "cpu", intra_threads = 1 }
 # CUDA alternative (build with --features cuda):
 # device = { type = "cuda", device_id = 0 }

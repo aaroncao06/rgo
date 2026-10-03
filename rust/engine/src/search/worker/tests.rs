@@ -64,7 +64,6 @@ fn inference_client_with_policy(
             },
             1,
         )],
-        1,
         16,
         1,
     )
@@ -112,7 +111,6 @@ fn one_shot_inference_client(policy_logits: [f32; MAX_POLICY_SIZE]) -> Inference
             },
             1,
         )],
-        1,
         16,
         1,
     )

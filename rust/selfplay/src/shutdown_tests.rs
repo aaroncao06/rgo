@@ -48,7 +48,6 @@ fn blocked_startup_child() {
                     },
                     1,
                 )],
-                1,
                 8,
                 1,
             )

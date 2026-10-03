@@ -22,6 +22,7 @@ mod cache;
 mod params;
 mod queue;
 use cache::{EvaluationCache, EvaluationKey};
+use params::batch_sizes;
 pub use params::{ExecutorConfig, ModelRuntimeConfig};
 use queue::{BatchQueue, EvalSlot};
 
@@ -60,7 +61,7 @@ pub struct InferenceClient {
 struct InferenceExecutor<B: InferenceBackend> {
     queue: Arc<BatchQueue>,
     backend: B,
-    max_batch_size: usize,
+    batch_sizes: [usize; super::SUPPORTED_BOARD_DIMS.len()],
 }
 impl ModelHandle {
     pub fn is_last_handle(&self) -> bool {
@@ -200,18 +201,17 @@ impl InferenceClient {
 }
 
 impl<B: InferenceBackend> InferenceExecutor<B> {
-    fn new(queue: Arc<BatchQueue>, backend: B, max_batch_size: usize) -> Self {
-        debug_assert!(max_batch_size > 0, "need positive batch size");
+    fn new(queue: Arc<BatchQueue>, backend: B, base_batch_size: usize) -> Self {
         Self {
             queue,
             backend,
-            max_batch_size,
+            batch_sizes: batch_sizes(base_batch_size).expect("invalid executor batch limit"),
         }
     }
     fn run(mut self) {
-        let mut requests: Vec<Arc<EvalSlot>> = Vec::with_capacity(self.max_batch_size);
-        let mut outputs: Vec<Arc<NNOutput>> = Vec::with_capacity(self.max_batch_size);
-        while self.queue.receive_batch(self.max_batch_size, &mut requests) {
+        let mut requests: Vec<Arc<EvalSlot>> = Vec::new();
+        let mut outputs: Vec<Arc<NNOutput>> = Vec::new();
+        while self.queue.receive_batch(&self.batch_sizes, &mut requests) {
             outputs.clear(); // backend expects it to be cleared beforehand
             let mut board_dim = 0;
             for slot in &requests {
@@ -273,21 +273,18 @@ impl ModelRuntime {
     /// Loads `<config.model_dir>/<model_version>.onnx`; versions identify immutable
     /// published models, not process-local runtime generations.
     ///
-    /// `queue_capacity` must cover the maximum concurrent client count; the queue
-    /// does not implement capacity backpressure. Dropping the last handle closes
-    /// and drains the queue, then joins the executor threads.
+    /// Dropping the last handle closes and drains the queue, then joins the
+    /// executor threads.
     pub fn load(
         model_version: ModelVersion,
-        queue_capacity: usize,
         config: &ModelRuntimeConfig,
     ) -> Result<ModelHandle, ModelLoadError> {
         config
             .validate()
             .map_err(|message| ModelStartupError::Backend(ort::Error::new(message)))?;
-        assert!(queue_capacity > 0, "need positive queue capacity");
 
         let checkpoint_path = model_path(&config.model_dir, model_version);
-        let queue = Arc::new(BatchQueue::new(queue_capacity));
+        let queue = Arc::new(BatchQueue::new());
         let cache = EvaluationCache::new(config.cache_capacity, config.num_cache_shards);
         let mut executor_threads = Vec::with_capacity(config.executors.len());
         let (startup_tx, startup_rx) = mpsc::channel();
@@ -300,7 +297,7 @@ impl ModelRuntime {
                     Ok(backend) => {
                         let _ = startup_tx.send(Ok(()));
                         drop(startup_tx);
-                        InferenceExecutor::new(queue, backend, executor.max_batch_size).run();
+                        InferenceExecutor::new(queue, backend, executor.base_batch_size).run();
                     }
                     Err(error) => {
                         let _ = startup_tx.send(Err(error));

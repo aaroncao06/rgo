@@ -1,4 +1,4 @@
-use crate::inference::onnx::InferenceDevice;
+use crate::inference::{SUPPORTED_BOARD_DIMS, onnx::InferenceDevice};
 use std::path::PathBuf;
 
 /// Device and batch limit for one backend/executor thread.
@@ -6,7 +6,10 @@ use std::path::PathBuf;
 #[serde(deny_unknown_fields)]
 pub struct ExecutorConfig {
     pub device: InferenceDevice,
-    pub max_batch_size: usize,
+    /// Maximum positions per 19×19 batch. Smaller boards scale by active area:
+    /// floor(base_batch_size * 361 / board_dim²). This bounds input volume,
+    /// not model compute, which can scale differently with board dimensions.
+    pub base_batch_size: usize,
 }
 
 /// Executors share the runtime's queue and cache.
@@ -22,11 +25,22 @@ pub struct ModelRuntimeConfig {
 
 impl ExecutorConfig {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.max_batch_size == 0 {
-            return Err("executor max_batch_size must be positive");
-        }
+        batch_sizes(self.base_batch_size)?;
         self.device.validate()
     }
+}
+
+/// Limits in SUPPORTED_BOARD_DIMS order, computed before batch dispatch.
+pub(super) fn batch_sizes(
+    base_batch_size: usize,
+) -> Result<[usize; SUPPORTED_BOARD_DIMS.len()], &'static str> {
+    if base_batch_size == 0 {
+        return Err("executor base_batch_size must be positive");
+    }
+    let max_batch_area = base_batch_size
+        .checked_mul(19 * 19)
+        .ok_or("executor base_batch_size overflows the 19×19 batch area")?;
+    Ok(SUPPORTED_BOARD_DIMS.map(|dim| max_batch_area / dim.pow(2)))
 }
 
 impl ModelRuntimeConfig {

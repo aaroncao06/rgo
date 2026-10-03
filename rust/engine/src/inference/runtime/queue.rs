@@ -30,7 +30,6 @@ pub(super) struct EvalSlot {
 pub(super) struct BatchQueue {
     inner: Mutex<QueueInner>,
     state_changed: Condvar, // signals either that it is non empty or that it is closed
-    capacity: usize,
 }
 struct QueueInner {
     requests: [VecDeque<Arc<EvalSlot>>; SUPPORTED_BOARD_DIMS.len()],
@@ -129,7 +128,7 @@ impl EvalSlot {
     }
 }
 impl BatchQueue {
-    pub(super) fn new(capacity: usize) -> Self {
+    pub(super) fn new() -> Self {
         Self {
             inner: Mutex::new(QueueInner {
                 requests: std::array::from_fn(|_| VecDeque::new()),
@@ -137,7 +136,6 @@ impl BatchQueue {
                 closed: false,
             }),
             state_changed: Condvar::new(),
-            capacity,
         }
     }
     pub(super) fn submit_request(
@@ -153,12 +151,6 @@ impl BatchQueue {
         if queue_inner.closed {
             return Err(InferenceError::RuntimeClosed);
         }
-        // stay debug since this should never be an issue, our queue should be exactly the size fo the number of workers, it is cheap
-        debug_assert!(
-            queue_inner.requests.iter().map(|q| q.len()).sum::<usize>() < self.capacity,
-            "batch queue capacity exceeded"
-        );
-
         // An empty queue is not in ready_dims yet.
         if queue_inner.requests[dim_index].is_empty() {
             queue_inner.ready_dims.push_back(dim_index);
@@ -171,11 +163,9 @@ impl BatchQueue {
     }
     pub(super) fn receive_batch(
         &self,
-        max_batch_size: usize,
+        batch_sizes: &[usize; SUPPORTED_BOARD_DIMS.len()],
         batch: &mut Vec<Arc<EvalSlot>>,
     ) -> bool {
-        // take up to max_batch_size requests and put them in slots. return whether it succeeded
-        debug_assert!(max_batch_size > 0);
         batch.clear(); //outside the mutex
 
         let mut queue_inner = self.inner.lock().expect("batch queue mutex poisoned");
@@ -193,7 +183,9 @@ impl BatchQueue {
             .ready_dims
             .pop_front()
             .expect("a board dimension is ready");
-        while batch.len() < max_batch_size {
+        let batch_size = batch_sizes[dim_index];
+        debug_assert!(batch_size > 0);
+        while batch.len() < batch_size {
             let Some(request) = queue_inner.requests[dim_index].pop_front() else {
                 break;
             };

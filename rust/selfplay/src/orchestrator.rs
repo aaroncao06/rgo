@@ -121,13 +121,11 @@ impl SelfPlayOrchestrator {
         latest_model_version_rx: watch::Receiver<Option<ModelVersion>>,
         finish_games_rx: watch::Receiver<bool>,
     ) -> Result<(), SelfPlayRunError> {
-        // Each configured worker can have one outstanding inference request.
-        let queue_capacity = self.resume_txs.len();
         self.run_inner(
             None,
             latest_model_version_rx,
             finish_games_rx,
-            |version, runtime_config| ModelRuntime::load(version, queue_capacity, runtime_config),
+            ModelRuntime::load,
         )
         .await
     }
@@ -479,7 +477,7 @@ mod tests {
             model_dir: PathBuf::from("unused-models"),
             executors: vec![crate::inference::runtime::ExecutorConfig {
                 device: crate::inference::onnx::InferenceDevice::Cpu { intra_threads: 1 },
-                max_batch_size: 4,
+                base_batch_size: 4,
             }],
             cache_capacity: 64,
             num_cache_shards: 1,
@@ -628,19 +626,14 @@ mod tests {
     async fn run_with_pass_model(
         orchestrator: SelfPlayOrchestrator,
         games_per_worker: usize,
-        worker_count: usize,
     ) -> Result<(), SelfPlayRunError> {
         let (_latest_tx, latest_rx) = watch::channel(Some(0));
         orchestrator
             .run_n_games_per_worker(games_per_worker, latest_rx, |_| {
-                Ok(start_test_runtime(
-                    0,
-                    vec![test_backend_factory(PassBackend, 8)],
-                    worker_count,
-                    64,
-                    1,
+                Ok(
+                    start_test_runtime(0, vec![test_backend_factory(PassBackend, 8)], 64, 1)
+                        .unwrap(),
                 )
-                .unwrap())
             })
             .await
     }
@@ -658,7 +651,7 @@ mod tests {
     #[tokio::test]
     async fn runs_workers_through_per_game_file_publication() {
         let dir = TestDir::new();
-        run_with_pass_model(orchestrator(dir.0.clone(), ChunkMode::PerGame, 2), 2, 2)
+        run_with_pass_model(orchestrator(dir.0.clone(), ChunkMode::PerGame, 2), 2)
             .await
             .unwrap();
         assert_eq!(written_record_counts(&dir), [2, 2, 2, 2]);
@@ -670,7 +663,6 @@ mod tests {
         run_with_pass_model(
             orchestrator_with_layout(dir.0.clone(), ChunkMode::PerGame, 2, 2),
             1,
-            4,
         )
         .await
         .unwrap();
@@ -683,7 +675,6 @@ mod tests {
         run_with_pass_model(
             orchestrator(dir.0.clone(), ChunkMode::FixedRecords(10), 1),
             1,
-            1,
         )
         .await
         .unwrap();
@@ -694,7 +685,7 @@ mod tests {
     async fn reports_sink_startup_failure() {
         let dir = TestDir::new();
         let missing = dir.0.join("missing");
-        let result = run_with_pass_model(orchestrator(missing, ChunkMode::PerGame, 1), 0, 1).await;
+        let result = run_with_pass_model(orchestrator(missing, ChunkMode::PerGame, 1), 0).await;
         assert!(
             matches!(
                 result,
@@ -714,7 +705,7 @@ mod tests {
         let result = orchestrator
             .run_inner(None, latest_rx, finish_rx, |_, _| {
                 Ok(
-                    start_test_runtime(0, vec![test_backend_factory(FailingBackend, 8)], 1, 64, 1)
+                    start_test_runtime(0, vec![test_backend_factory(FailingBackend, 8)], 64, 1)
                         .unwrap(),
                 )
             })
@@ -736,7 +727,7 @@ mod tests {
         let result = orchestrator
             .run_inner(None, latest_rx, finish_rx, |_, _| {
                 Ok(
-                    start_test_runtime(0, vec![test_backend_factory(PassBackend, 8)], 1, 64, 1)
+                    start_test_runtime(0, vec![test_backend_factory(PassBackend, 8)], 64, 1)
                         .unwrap(),
                 )
             })
@@ -768,14 +759,10 @@ mod tests {
         let (latest_tx, latest_rx) = watch::channel(None);
         let run = orchestrator.run_n_games_per_worker(1, latest_rx, |version| {
             assert_eq!(version, 42);
-            Ok(start_test_runtime(
-                version,
-                vec![test_backend_factory(PassBackend, 8)],
-                1,
-                64,
-                1,
+            Ok(
+                start_test_runtime(version, vec![test_backend_factory(PassBackend, 8)], 64, 1)
+                    .unwrap(),
             )
-            .unwrap())
         });
         let publish = async {
             tokio::task::yield_now().await;
@@ -874,7 +861,6 @@ mod tests {
                             },
                             8,
                         )],
-                        1,
                         64,
                         1,
                     )
@@ -912,7 +898,6 @@ mod tests {
                     let model = start_test_runtime(
                         0,
                         vec![test_backend_factory(DropTrackingBackend(drops.clone()), 8)],
-                        1,
                         64,
                         1,
                     )
@@ -923,7 +908,7 @@ mod tests {
                 1 => {
                     assert_eq!(drops.load(Ordering::SeqCst), 1);
                     Ok(
-                        start_test_runtime(1, vec![test_backend_factory(PassBackend, 8)], 1, 64, 1)
+                        start_test_runtime(1, vec![test_backend_factory(PassBackend, 8)], 64, 1)
                             .unwrap(),
                     )
                 }
@@ -947,7 +932,6 @@ mod tests {
                     let model = start_test_runtime(
                         0,
                         vec![test_backend_factory(DropTrackingBackend(drops.clone()), 8)],
-                        4,
                         64,
                         1,
                     )
@@ -958,7 +942,7 @@ mod tests {
                 1 => {
                     assert_eq!(drops.load(Ordering::SeqCst), 1);
                     Ok(
-                        start_test_runtime(1, vec![test_backend_factory(PassBackend, 8)], 4, 64, 1)
+                        start_test_runtime(1, vec![test_backend_factory(PassBackend, 8)], 64, 1)
                             .unwrap(),
                     )
                 }
@@ -979,7 +963,7 @@ mod tests {
             .run_n_games_per_worker(1, latest_rx, |version| {
                 if version == 0 {
                     let model =
-                        start_test_runtime(0, vec![test_backend_factory(PassBackend, 8)], 2, 64, 1)
+                        start_test_runtime(0, vec![test_backend_factory(PassBackend, 8)], 64, 1)
                             .unwrap();
                     latest_tx.send(Some(99)).unwrap();
                     Ok(model)
@@ -1004,7 +988,7 @@ mod tests {
             .run_n_games_per_worker(1, latest_rx, |version| {
                 assert_eq!(version, 0);
                 let model =
-                    start_test_runtime(0, vec![test_backend_factory(PassBackend, 8)], 1, 64, 1)
+                    start_test_runtime(0, vec![test_backend_factory(PassBackend, 8)], 64, 1)
                         .unwrap();
                 extra_handle = Some(model.clone());
                 latest_tx.send(Some(1)).unwrap();
@@ -1038,21 +1022,16 @@ mod tests {
                     },
                     8,
                 )],
-                1,
                 64,
                 1,
             )
             .unwrap()),
             103 => {
                 assert_eq!(drops.load(Ordering::SeqCst), 1);
-                Ok(start_test_runtime(
-                    version,
-                    vec![test_backend_factory(PassBackend, 8)],
-                    1,
-                    64,
-                    1,
+                Ok(
+                    start_test_runtime(version, vec![test_backend_factory(PassBackend, 8)], 64, 1)
+                        .unwrap(),
                 )
-                .unwrap())
             }
             _ => panic!("unexpected model version"),
         });

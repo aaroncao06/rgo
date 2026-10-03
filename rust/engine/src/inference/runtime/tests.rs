@@ -13,9 +13,9 @@ fn onnx_runtime_config() -> ModelRuntimeConfig {
     ModelRuntimeConfig {
         model_dir: PathBuf::from("unused-models"),
         executors: [1, 4]
-            .map(|max_batch_size| ExecutorConfig {
+            .map(|base_batch_size| ExecutorConfig {
                 device: crate::inference::onnx::InferenceDevice::Cpu { intra_threads: 1 },
-                max_batch_size,
+                base_batch_size,
             })
             .into(),
         cache_capacity: 64,
@@ -70,7 +70,7 @@ impl Drop for TestModelDir {
 #[tokio::test]
 async fn load_starts_configured_onnx_executors_and_evaluates() {
     let models = TestModelDir::new();
-    let handle = ModelRuntime::load(42, 2, &models.config()).unwrap();
+    let handle = ModelRuntime::load(42, &models.config()).unwrap();
     assert_eq!(handle.0.executor_threads.len(), 2);
     let state = GameState::new(Rules::TROMP_TAYLORISH_9);
     let mut client = InferenceClient::new(handle, None);
@@ -98,7 +98,7 @@ fn load_returns_checkpoint_errors_through_startup() {
     let models = TestModelDir::new();
     for version in [43, 44, 45] {
         assert!(matches!(
-            ModelRuntime::load(version, 2, &models.config()),
+            ModelRuntime::load(version, &models.config()),
             Err(ModelStartupError::Backend(_))
         ));
     }
@@ -111,14 +111,14 @@ fn load_rejects_unsupported_cuda_before_starting_executors() {
     let mut config = models.config();
     config.executors.push(ExecutorConfig {
         device: crate::inference::onnx::InferenceDevice::Cuda { device_id: 0 },
-        max_batch_size: 8,
+        base_batch_size: 8,
     });
     assert!(matches!(
-        ModelRuntime::load(42, 2, &config),
+        ModelRuntime::load(42, &config),
         Err(ModelStartupError::Backend(_))
     ));
     // Rejection leaves the loader usable for a supported configuration.
-    drop(ModelRuntime::load(42, 2, &models.config()).unwrap());
+    drop(ModelRuntime::load(42, &models.config()).unwrap());
 }
 
 #[test]
@@ -126,19 +126,21 @@ fn load_rejects_empty_executor_config() {
     let mut config = onnx_runtime_config();
     config.executors.clear();
     assert!(matches!(
-        ModelRuntime::load(0, 1, &config),
+        ModelRuntime::load(0, &config),
         Err(ModelStartupError::Backend(_))
     ));
 }
 
 #[test]
 fn load_validates_all_batch_limits_before_starting_executors() {
-    let mut config = onnx_runtime_config();
-    config.executors[1].max_batch_size = 0;
-    assert!(matches!(
-        ModelRuntime::load(0, 1, &config),
-        Err(ModelStartupError::Backend(_))
-    ));
+    for limit in [0, usize::MAX] {
+        let mut config = onnx_runtime_config();
+        config.executors[1].base_batch_size = limit;
+        assert!(matches!(
+            ModelRuntime::load(0, &config),
+            Err(ModelStartupError::Backend(_))
+        ));
+    }
 }
 
 #[test]
@@ -148,14 +150,17 @@ fn load_validates_cache_dimensions_before_allocating() {
         config.cache_capacity = capacity;
         config.num_cache_shards = shards;
         assert!(matches!(
-            ModelRuntime::load(0, 1, &config),
+            ModelRuntime::load(0, &config),
             Err(ModelStartupError::Backend(_))
         ));
     }
 }
 
-fn test_input() -> NNInput {
-    NNInput::encode(&GameState::new(Rules::TROMP_TAYLORISH_9))
+fn test_input(board_dim: usize) -> NNInput {
+    NNInput::encode(&GameState::new(Rules {
+        board_dim,
+        ..Rules::default()
+    }))
 }
 
 fn test_output(board_dim: usize) -> Arc<NNOutput> {
@@ -208,13 +213,11 @@ async fn executors_respect_individual_batch_limits_on_a_shared_queue() {
             limit,
         )
     });
-    let handle = start_test_runtime(0, factories.into(), 16, 8, 1).unwrap();
+    let handle = start_test_runtime(0, factories.into(), 8, 1).unwrap();
     let slots: Vec<_> = (0..16).map(|_| Arc::new(EvalSlot::new())).collect();
     for slot in &slots {
-        slot.queue(test_input());
-        handle
-            .submit_request(slot.clone(), Rules::TROMP_TAYLORISH_9.board_dim)
-            .unwrap();
+        slot.queue(test_input(19));
+        handle.submit_request(slot.clone(), 19).unwrap();
     }
     started.wait();
     for slot in slots {
@@ -241,7 +244,7 @@ fn loc(x: usize, y: usize) -> Loc {
 #[tokio::test]
 async fn one_loaded_model_evaluates_all_supported_board_dims() {
     let models = TestModelDir::new();
-    let handle = ModelRuntime::load(42, 1, &models.config()).unwrap();
+    let handle = ModelRuntime::load(42, &models.config()).unwrap();
     let mut client = InferenceClient::new(handle, Some(0));
     for dim in crate::inference::SUPPORTED_BOARD_DIMS
         .into_iter()
@@ -297,7 +300,7 @@ async fn an_executor_drains_requests_through_the_dynamic_onnx_model() {
             slot
         })
         .collect();
-    let queue = Arc::new(BatchQueue::new(slots.len()));
+    let queue = Arc::new(BatchQueue::new());
     for (slot, state) in slots.iter().zip(&states) {
         queue
             .submit_request(slot.clone(), state.board().dim())
@@ -412,7 +415,6 @@ async fn root_requests_upgrade_cached_outputs_without_mutating_interior_outputs(
     let handle = start_test_runtime(
         17,
         vec![test_backend_factory(OwnershipBackend(requests.clone()), 1)],
-        1,
         16,
         1,
     )
@@ -455,7 +457,6 @@ async fn randomized_symmetry_is_restored_before_caching() {
             EchoSpatialOwnershipBackend(requests.clone()),
             1,
         )],
-        1,
         16,
         1,
     )
@@ -503,7 +504,6 @@ fn client_can_disable_randomized_symmetry() {
             },
             1,
         )],
-        1,
         8,
         1,
     )
@@ -525,7 +525,6 @@ fn rebinding_a_client_preserves_its_slot_and_symmetry_sequence() {
             },
             1,
         )],
-        1,
         16,
         1,
     )
@@ -543,7 +542,6 @@ fn rebinding_a_client_preserves_its_slot_and_symmetry_sequence() {
                 },
                 1,
             )],
-            1,
             16,
             1,
         )
@@ -565,7 +563,6 @@ fn rebinding_a_client_preserves_its_slot_and_symmetry_sequence() {
             },
             1,
         )],
-        1,
         16,
         1,
     )
@@ -590,7 +587,6 @@ async fn missing_requested_ownership_violates_backend_contract() {
             },
             1,
         )],
-        1,
         16,
         1,
     )
@@ -622,43 +618,50 @@ impl InferenceBackend for TestBackend {
 
 #[tokio::test]
 async fn inference_executor_processes_batches_and_completes_every_slot() {
-    let queue = Arc::new(BatchQueue::new(3));
-    let slots: Vec<_> = (0..3).map(|_| Arc::new(EvalSlot::new())).collect();
-    for slot in &slots {
-        slot.queue(test_input());
-        queue
-            .submit_request(slot.clone(), Rules::TROMP_TAYLORISH_9.board_dim)
-            .unwrap();
+    // Check precomputed limits, including floor rounding for smaller boards.
+    for (base, dim, limit) in [
+        (2, 9, 8),
+        (2, 13, 4),
+        (2, 19, 2),
+        (32, 9, 142),
+        (32, 13, 68),
+        (32, 19, 32),
+    ] {
+        let count = 2 * limit + 1;
+        let queue = Arc::new(BatchQueue::new());
+        let slots: Vec<_> = (0..count).map(|_| Arc::new(EvalSlot::new())).collect();
+        for slot in &slots {
+            slot.queue(test_input(dim));
+            queue.submit_request(slot.clone(), dim).unwrap();
+        }
+        queue.close();
+
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+        let backend = TestBackend {
+            batch_sizes: batch_sizes.clone(),
+            fail: false,
+        };
+        let executor = InferenceExecutor::new(queue, backend, base);
+        let executor_thread = thread::spawn(move || executor.run());
+
+        for slot in &slots {
+            let output = slot.wait_for_result().await.unwrap();
+            assert!(!output.is_processed());
+            assert!(slot.is_idle());
+        }
+        executor_thread.join().unwrap();
+
+        assert_eq!(*batch_sizes.lock().unwrap(), [limit, limit, 1]);
     }
-    queue.close();
-
-    let batch_sizes = Arc::new(Mutex::new(Vec::new()));
-    let backend = TestBackend {
-        batch_sizes: batch_sizes.clone(),
-        fail: false,
-    };
-    let executor = InferenceExecutor::new(queue, backend, 2);
-    let executor_thread = thread::spawn(move || executor.run());
-
-    for slot in &slots {
-        let output = slot.wait_for_result().await.unwrap();
-        assert!(!output.is_processed());
-        assert!(slot.is_idle());
-    }
-    executor_thread.join().unwrap();
-
-    assert_eq!(*batch_sizes.lock().unwrap(), [2, 1]);
 }
 
 #[tokio::test]
 async fn inference_executor_returns_backend_errors_to_every_slot() {
-    let queue = Arc::new(BatchQueue::new(3));
+    let queue = Arc::new(BatchQueue::new());
     let slots: Vec<_> = (0..3).map(|_| Arc::new(EvalSlot::new())).collect();
     for slot in &slots {
-        slot.queue(test_input());
-        queue
-            .submit_request(slot.clone(), Rules::TROMP_TAYLORISH_9.board_dim)
-            .unwrap();
+        slot.queue(test_input(19));
+        queue.submit_request(slot.clone(), 19).unwrap();
     }
     queue.close();
 
@@ -689,8 +692,7 @@ async fn model_runtime_evaluates_through_a_client() {
         batch_sizes: batch_sizes.clone(),
         fail: false,
     };
-    let model_handle =
-        start_test_runtime(0, vec![test_backend_factory(backend, 4)], 1, 8, 2).unwrap();
+    let model_handle = start_test_runtime(0, vec![test_backend_factory(backend, 4)], 8, 2).unwrap();
     let queue = model_handle.0.queue.clone();
     let mut client = InferenceClient::new(model_handle, None);
 
@@ -711,8 +713,7 @@ async fn repeated_evaluation_uses_the_model_cache() {
         batch_sizes: batch_sizes.clone(),
         fail: false,
     };
-    let model_handle =
-        start_test_runtime(0, vec![test_backend_factory(backend, 4)], 1, 8, 2).unwrap();
+    let model_handle = start_test_runtime(0, vec![test_backend_factory(backend, 4)], 8, 2).unwrap();
     let mut client = InferenceClient::new(model_handle, None);
     let game_state = GameState::new(Rules::TROMP_TAYLORISH_9);
 
@@ -729,8 +730,7 @@ fn model_runtime_shuts_down_after_the_last_handle_is_dropped() {
         batch_sizes: Arc::new(Mutex::new(Vec::new())),
         fail: false,
     };
-    let first_handle =
-        start_test_runtime(0, vec![test_backend_factory(backend, 4)], 1, 8, 2).unwrap();
+    let first_handle = start_test_runtime(0, vec![test_backend_factory(backend, 4)], 8, 2).unwrap();
     let second_handle = first_handle.clone();
     let queue = first_handle.0.queue.clone();
 
@@ -748,8 +748,7 @@ async fn multiple_clients_share_one_model_runtime() {
         batch_sizes: batch_sizes.clone(),
         fail: false,
     };
-    let model_handle =
-        start_test_runtime(0, vec![test_backend_factory(backend, 2)], 2, 8, 2).unwrap();
+    let model_handle = start_test_runtime(0, vec![test_backend_factory(backend, 2)], 8, 2).unwrap();
     let mut first_client = InferenceClient::new(model_handle.clone(), None);
     let mut second_client = InferenceClient::new(model_handle, None);
     let first_game = GameState::new(Rules::TROMP_TAYLORISH_9);
@@ -769,7 +768,7 @@ async fn multiple_clients_share_one_model_runtime() {
 #[tokio::test]
 async fn unsupported_board_dims_return_errors_and_leave_the_client_reusable() {
     let models = TestModelDir::new();
-    let handle = ModelRuntime::load(42, 1, &models.config()).unwrap();
+    let handle = ModelRuntime::load(42, &models.config()).unwrap();
     let mut client = InferenceClient::new(handle, Some(0));
     for dim in 1..9 {
         let state = GameState::new(Rules {

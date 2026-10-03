@@ -100,7 +100,11 @@ fn invalid_operational_settings_return_errors_without_panicking() {
         EXAMPLE.replace("workers_per_thread = 4", "workers_per_thread = 0"),
         EXAMPLE.replace("cache_capacity = 65536", "cache_capacity = 3"),
         EXAMPLE.replace("num_cache_shards = 16", "num_cache_shards = 131072"),
-        EXAMPLE.replace("max_batch_size = 8", "max_batch_size = 0"),
+        EXAMPLE.replace("base_batch_size = 8", "base_batch_size = 0"),
+        EXAMPLE.replace(
+            "base_batch_size = 8",
+            &format!("base_batch_size = {}", usize::MAX),
+        ),
         EXAMPLE.replace("intra_threads = 1", "intra_threads = 0"),
         EXAMPLE.replace(
             "mode = \"per_game\"",
