@@ -9,6 +9,7 @@ use std::{
 
 use rgo_artifacts::{CHUNK_FILE_PREFIX, CHUNK_FILE_SUFFIX};
 use serde_json::Value;
+use tokio::sync::oneshot;
 
 use super::*;
 use crate::{
@@ -65,15 +66,8 @@ fn sample(dim: usize, tag: usize) -> TrainingSample {
     }
 }
 
-fn game(samples: Vec<TrainingSample>) -> (CompletedGame, oneshot::Receiver<Vec<TrainingSample>>) {
-    let (recycle_tx, recycle_rx) = oneshot::channel();
-    (
-        CompletedGame {
-            samples,
-            recycle_tx,
-        },
-        recycle_rx,
-    )
+fn game(samples: Vec<TrainingSample>) -> CompletedGame {
+    CompletedGame { samples }
 }
 
 // Checks that each announcement names a complete file before acknowledging it.
@@ -156,13 +150,6 @@ async fn next_event(rx: &mut mpsc::UnboundedReceiver<Value>) -> Value {
         .expect("event output stopped")
 }
 
-async fn recycled(rx: oneshot::Receiver<Vec<TrainingSample>>) -> Vec<TrainingSample> {
-    tokio::time::timeout(TIMEOUT, rx)
-        .await
-        .expect("writer did not recycle samples")
-        .expect("writer dropped samples")
-}
-
 fn assert_chunk(event: &Value, expected: &[u8]) {
     let path = Path::new(event["path"].as_str().unwrap());
     assert_eq!(fs::read(path).unwrap(), expected);
@@ -200,27 +187,15 @@ fn requires_an_existing_directory() {
 }
 
 #[test]
-fn empty_games_and_an_empty_queue_do_not_publish_chunks() {
+fn an_empty_queue_does_not_publish_chunks() {
     for mode in [ChunkMode::PerGame, ChunkMode::FixedRecords(2)] {
-        for submit_empty_game in [false, true] {
-            let dir = TestDir::new();
-            let (tx, rx) = mpsc::channel(1);
-            let returned = if submit_empty_game {
-                let (game, returned) = game(Vec::new());
-                tx.try_send(game).unwrap();
-                Some(returned)
-            } else {
-                None
-            };
-            drop(tx);
-            ChunkWriter::new(mode, dir.0.clone(), rx, EventPublisher::discard())
-                .run()
-                .unwrap();
-            if let Some(returned) = returned {
-                assert!(returned.blocking_recv().unwrap().is_empty());
-            }
-            assert!(dir.files().is_empty());
-        }
+        let dir = TestDir::new();
+        let (tx, rx) = mpsc::channel(1);
+        drop(tx);
+        ChunkWriter::new(mode, dir.0.clone(), rx, EventPublisher::discard())
+            .run()
+            .unwrap();
+        assert!(dir.files().is_empty());
     }
 }
 
@@ -238,18 +213,10 @@ async fn per_game_publishes_without_waiting_for_queue_closure_or_splitting() {
     for (dim, length) in [(9, 1), (13, 3), (19, 2)] {
         let samples: Vec<_> = (0..length).map(|tag| sample(dim, tag)).collect();
         let expected = encode_chunk(&samples);
-        let allocation = samples.as_ptr();
-        let (game, returned) = game(samples);
+        let game = game(samples);
         tx.send(game).await.unwrap();
-        let samples = recycled(returned).await;
-        assert!(samples.is_empty());
-        assert_eq!(samples.as_ptr(), allocation);
         assert_chunk(&next_event(&mut events).await, &expected);
     }
-    // An empty game must not republish the previous game's finished encoder.
-    let (empty, returned) = game(Vec::new());
-    tx.send(empty).await.unwrap();
-    assert!(recycled(returned).await.is_empty());
     drop(tx);
     writer.finish().await.unwrap();
     assert_eq!(dir.files().len(), 3);
@@ -269,17 +236,15 @@ async fn fixed_chunks_combine_games_and_flush_a_partial_chunk() {
     ));
     let mut expected_samples = Vec::new();
     for (dim, tag) in [(9, 1), (13, 2)] {
-        let (game, returned) = game(vec![sample(dim, tag)]);
+        let game = game(vec![sample(dim, tag)]);
         tx.send(game).await.unwrap();
-        assert!(recycled(returned).await.is_empty());
         expected_samples.push(sample(dim, tag));
     }
     assert!(events.try_recv().is_err());
     // The next game fills the old chunk from its tail, leaving one sample for
     // the final partial chunk. Neither dimension nor game boundaries split it.
-    let (game, returned) = game(vec![sample(19, 3), sample(19, 4)]);
+    let game = game(vec![sample(19, 3), sample(19, 4)]);
     tx.send(game).await.unwrap();
-    assert!(recycled(returned).await.is_empty());
     expected_samples.push(sample(19, 4));
     assert_chunk(
         &next_event(&mut events).await,
@@ -307,12 +272,8 @@ async fn fixed_chunks_split_a_game_preserving_existing_tail_order() {
         EventPublisher::with_output(output),
     ));
     let samples: Vec<_> = (0..5).map(|tag| sample(9, tag)).collect();
-    let allocation = samples.as_ptr();
-    let (game, returned) = game(samples);
+    let game = game(samples);
     tx.send(game).await.unwrap();
-    let samples = recycled(returned).await;
-    assert!(samples.is_empty());
-    assert_eq!(samples.as_ptr(), allocation);
     for tags in [[3, 4], [1, 2]] {
         let expected: Vec<_> = tags.map(|tag| sample(9, tag)).into();
         assert_chunk(&next_event(&mut events).await, &encode_chunk(&expected));
@@ -335,14 +296,13 @@ fn repeated_games_reuse_the_encoder() {
         let mut writer =
             ChunkWriter::new(mode, dir.0.clone(), rx, EventPublisher::with_output(output));
         for _ in 0..4 {
-            let (game, returned) = game((0..3).map(|tag| sample(19, tag)).collect());
+            let game = game((0..3).map(|tag| sample(19, tag)).collect());
             match mode {
                 ChunkMode::PerGame => writer.append_game_per_game(game).unwrap(),
                 ChunkMode::FixedRecords(records) => {
                     writer.append_game_fixed(game, records).unwrap()
                 }
             }
-            assert!(returned.blocking_recv().unwrap().is_empty());
             let expected: Vec<_> = (0..3).map(|tag| sample(19, tag)).collect();
             assert_chunk(&events.try_recv().unwrap(), &encode_chunk(&expected));
         }
@@ -363,10 +323,9 @@ async fn restarting_after_deletion_does_not_reuse_chunk_ids() {
             rx,
             EventPublisher::with_output(output),
         ));
-        let (game, returned) = game(vec![sample(9, 0)]);
+        let game = game(vec![sample(9, 0)]);
         tx.send(game).await.unwrap();
         drop(tx);
-        recycled(returned).await;
         writer.finish().await.unwrap();
         let event = next_event(&mut events).await;
         assert_chunk(&event, &encode_chunk(&[sample(9, 0)]));
@@ -378,22 +337,20 @@ async fn restarting_after_deletion_does_not_reuse_chunk_ids() {
 }
 
 #[test]
-fn file_failure_recycles_consumed_game_and_cancels_queued_games() {
+fn file_failure_closes_the_queue_and_cancels_queued_games() {
     for mode in [ChunkMode::PerGame, ChunkMode::FixedRecords(1)] {
         let dir = TestDir::new();
         fs::create_dir(dir.0.join(PENDING_CHUNK_FILE)).unwrap();
         let (tx, rx) = mpsc::channel(2);
         let (output, mut events) = event_output();
-        let (first, returned_first) = game(vec![sample(9, 0)]);
-        let (second, returned_second) = game(vec![sample(9, 1)]);
+        let first = game(vec![sample(9, 0)]);
+        let second = game(vec![sample(9, 1)]);
         tx.try_send(first).unwrap();
         tx.try_send(second).unwrap();
-        drop(tx);
         let result =
             ChunkWriter::new(mode, dir.0.clone(), rx, EventPublisher::with_output(output)).run();
         assert!(matches!(result, Err(ChunkWriterError::Io(_))));
-        assert!(returned_first.blocking_recv().unwrap().is_empty());
-        assert!(returned_second.blocking_recv().is_err());
+        assert!(tx.is_closed());
         assert!(events.try_recv().is_err());
         assert_eq!(dir.files(), [dir.0.join(PENDING_CHUNK_FILE)]);
     }
@@ -428,11 +385,10 @@ fn notification_failure_is_reported_after_file_publication() {
     for fail_on_flush in [false, true] {
         let dir = TestDir::new();
         let (tx, rx) = mpsc::channel(2);
-        let (first, returned_first) = game(vec![sample(9, 0)]);
-        let (second, returned_second) = game(vec![sample(9, 1)]);
+        let first = game(vec![sample(9, 0)]);
+        let second = game(vec![sample(9, 1)]);
         tx.try_send(first).unwrap();
         tx.try_send(second).unwrap();
-        drop(tx);
         let result = ChunkWriter::new(
             ChunkMode::PerGame,
             dir.0.clone(),
@@ -453,8 +409,7 @@ fn notification_failure_is_reported_after_file_publication() {
             }
         );
         assert!(error.to_string().contains("test pipe closed"));
-        assert!(returned_first.blocking_recv().unwrap().is_empty());
-        assert!(returned_second.blocking_recv().is_err());
+        assert!(tx.is_closed());
         let files = dir.files();
         assert_eq!(files.len(), 1);
         assert_eq!(fs::read(&files[0]).unwrap(), encode_chunk(&[sample(9, 0)]));
@@ -462,7 +417,7 @@ fn notification_failure_is_reported_after_file_publication() {
 }
 
 #[tokio::test]
-async fn blocked_publication_recycles_samples_but_backpressures_the_next_game() {
+async fn blocked_publication_backpressures_producers_when_the_queue_is_full() {
     for mode in [ChunkMode::PerGame, ChunkMode::FixedRecords(1)] {
         let dir = TestDir::new();
         let (tx, rx) = mpsc::channel(1);
@@ -476,22 +431,21 @@ async fn blocked_publication_recycles_samples_but_backpressures_the_next_game() 
             rx,
             EventPublisher::with_output(output),
         ));
-        let (first, returned_first) = game(vec![sample(9, 0)]);
+        let first = game(vec![sample(9, 0)]);
         tx.send(first).await.unwrap();
         tokio::time::timeout(TIMEOUT, reached_rx)
             .await
             .unwrap()
             .unwrap();
-        assert!(recycled(returned_first).await.is_empty());
-        let (second, mut returned_second) = game(vec![sample(9, 1)]);
+        let second = game(vec![sample(9, 1)]);
         tx.send(second).await.unwrap();
+        assert!(matches!(
+            tx.try_send(game(vec![sample(9, 2)])),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
         drop(tx);
         // The async runtime still handles timers while publication is blocked.
         tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(matches!(
-            returned_second.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
         assert!(events.try_recv().is_err());
         assert_eq!(dir.files().len(), 1);
         release_tx.send(()).unwrap();
@@ -499,7 +453,6 @@ async fn blocked_publication_recycles_samples_but_backpressures_the_next_game() 
             &next_event(&mut events).await,
             &encode_chunk(&[sample(9, 0)]),
         );
-        recycled(returned_second).await;
         writer.finish().await.unwrap();
         assert_chunk(
             &next_event(&mut events).await,
@@ -509,7 +462,7 @@ async fn blocked_publication_recycles_samples_but_backpressures_the_next_game() 
 }
 
 #[tokio::test]
-async fn a_split_game_keeps_its_sample_vector_until_all_records_are_encoded() {
+async fn a_split_game_resumes_encoding_after_blocked_publication() {
     let dir = TestDir::new();
     let (tx, rx) = mpsc::channel(1);
     let (mut output, mut events) = event_output();
@@ -522,20 +475,16 @@ async fn a_split_game_keeps_its_sample_vector_until_all_records_are_encoded() {
         rx,
         EventPublisher::with_output(output),
     ));
-    let (game, mut returned) = game((0..5).map(|tag| sample(9, tag)).collect());
+    let game = game((0..5).map(|tag| sample(9, tag)).collect());
     tx.send(game).await.unwrap();
     drop(tx);
     tokio::time::timeout(TIMEOUT, reached_rx)
         .await
         .unwrap()
         .unwrap();
-    assert!(matches!(
-        returned.try_recv(),
-        Err(oneshot::error::TryRecvError::Empty)
-    ));
+    assert!(events.try_recv().is_err());
     assert_eq!(dir.files().len(), 1);
     release_tx.send(()).unwrap();
-    assert!(recycled(returned).await.is_empty());
     writer.finish().await.unwrap();
     for tags in [vec![3, 4], vec![1, 2], vec![0]] {
         let samples: Vec<_> = tags.into_iter().map(|tag| sample(9, tag)).collect();
@@ -548,7 +497,7 @@ fn final_partial_chunk_publication_errors_are_propagated() {
     let dir = TestDir::new();
     fs::create_dir(dir.0.join(PENDING_CHUNK_FILE)).unwrap();
     let (tx, rx) = mpsc::channel(1);
-    let (game, returned) = game(vec![sample(9, 0)]);
+    let game = game(vec![sample(9, 0)]);
     tx.try_send(game).unwrap();
     drop(tx);
     let result = ChunkWriter::new(
@@ -559,6 +508,5 @@ fn final_partial_chunk_publication_errors_are_propagated() {
     )
     .run();
     assert!(matches!(result, Err(ChunkWriterError::Io(_))));
-    assert!(returned.blocking_recv().unwrap().is_empty());
     assert_eq!(dir.files(), [dir.0.join(PENDING_CHUNK_FILE)]);
 }

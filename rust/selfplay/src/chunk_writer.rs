@@ -6,7 +6,7 @@ use std::{
 
 use rand::{TryRng, rngs::SysError, rngs::SysRng};
 use rgo_artifacts::{ChunkId, chunk_path};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use super::{
     control::{Event, EventPublisher},
@@ -17,7 +17,6 @@ const PENDING_CHUNK_FILE: &str = ".pending-chunk.tmp";
 
 pub(super) struct CompletedGame {
     pub(super) samples: Vec<TrainingSample>,
-    pub(super) recycle_tx: oneshot::Sender<Vec<TrainingSample>>,
 }
 
 #[derive(Clone, Copy, serde::Deserialize)]
@@ -48,8 +47,8 @@ impl From<io::Error> for ChunkWriterError {
 
 /// Encodes and durably publishes chunks on one dedicated OS thread.
 ///
-/// Workers submit completed games through a bounded queue and receive their
-/// emptied sample vectors back for reuse. One reusable encoder owns the encoded
+/// Workers transfer completed games through a bounded queue. Sample vectors
+/// are freed after encoding. One reusable encoder owns the encoded
 /// byte allocation through publication, without overlapping writes.
 /// Closing the queue drains games and flushes the final partial fixed chunk.
 ///
@@ -110,17 +109,16 @@ impl ChunkWriter {
         Ok(())
     }
 
-    fn append_game_per_game(&mut self, mut game: CompletedGame) -> Result<(), ChunkWriterError> {
-        if game.samples.is_empty() {
-            let _ = game.recycle_tx.send(game.samples);
-            return Ok(());
-        }
+    fn append_game_per_game(&mut self, game: CompletedGame) -> Result<(), ChunkWriterError> {
+        debug_assert!(
+            !game.samples.is_empty(),
+            "completed games must have samples"
+        );
         self.active_chunk.reset(game.samples.len());
         for sample in &game.samples {
             self.active_chunk.push(sample);
         }
-        game.samples.clear();
-        let _ = game.recycle_tx.send(game.samples);
+        drop(game);
         self.publish()
     }
 
@@ -143,9 +141,8 @@ impl ChunkWriter {
             game.samples.truncate(remaining);
 
             if game.samples.is_empty() {
-                // Let the worker start its next game before publishing this
-                // game's final chunk or waiting for the client pipe to flush.
-                let _ = game.recycle_tx.send(game.samples);
+                // Release samples before publishing the game's final chunk.
+                drop(game);
                 if self.active_chunk.record_count() == records {
                     self.publish()?;
                 }

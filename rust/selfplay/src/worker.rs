@@ -1,5 +1,5 @@
 use rand::{SeedableRng, rngs::SmallRng};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, watch};
 
 use super::{
     RNG_SEED,
@@ -66,13 +66,10 @@ pub(super) struct WorkerModelControl {
     pub(super) resume_rx: mpsc::Receiver<ModelHandle>,
 }
 
-// training_samples and recycle_rx are option since they are sent to the chunk writer
 pub(super) struct SelfPlayWorker {
     game_state: GameState,
     records: Vec<SelfPlayRecord>,
-    training_samples: Option<Vec<TrainingSample>>,
     completed_games_tx: mpsc::Sender<CompletedGame>,
-    recycle_rx: Option<oneshot::Receiver<Vec<TrainingSample>>>,
     search_worker: SearchWorker<FixedArenaNodeStore>,
     inference_client: InferenceClient,
     model_control: WorkerModelControl,
@@ -105,9 +102,7 @@ impl SelfPlayWorker {
         Self {
             game_state,
             records: Vec::new(),
-            training_samples: Some(Vec::new()),
             completed_games_tx,
-            recycle_rx: None,
             search_worker: SearchWorker::new(node_store, search_params),
             inference_client,
             model_control,
@@ -180,36 +175,18 @@ impl SelfPlayWorker {
     }
 
     async fn submit_finished_game(&mut self) -> Result<(), SelfPlayError> {
-        // its none when the chunk writer took it and now you take it back
-        let mut samples = match self.training_samples.take() {
-            Some(samples) => samples,
-            None => self
-                .recycle_rx
-                .take()
-                .expect("submitted buffer has a recycle receiver")
-                .await
-                .map_err(|_| SelfPlayError::ChunkWriterClosed)?,
-        };
-        build_training_samples(&mut self.records, &mut self.game_state, &mut samples);
-        let (recycle_tx, recycle_rx) = oneshot::channel();
-        let completed_game = CompletedGame {
-            samples,
-            recycle_tx,
-        };
-        if let Err(error) = self.completed_games_tx.send(completed_game).await {
-            self.training_samples = Some(error.0.samples);
-            return Err(SelfPlayError::ChunkWriterClosed);
-        }
-        self.recycle_rx = Some(recycle_rx);
-        Ok(())
+        let samples = build_training_samples(&mut self.records, &mut self.game_state);
+        self.completed_games_tx
+            .send(CompletedGame { samples })
+            .await
+            .map_err(|_| SelfPlayError::ChunkWriterClosed)
     }
 }
 
 fn build_training_samples(
     records: &mut Vec<SelfPlayRecord>,
     game_state: &mut GameState,
-    samples: &mut Vec<TrainingSample>,
-) {
+) -> Vec<TrainingSample> {
     debug_assert!(
         game_state.is_finished(),
         "cannot finalize an unfinished game"
@@ -222,8 +199,7 @@ fn build_training_samples(
     let white_ownership = ownership_for_player(game_state.board(), &final_ownership, Player::White);
 
     game_state.reset(rules);
-    debug_assert!(samples.is_empty(), "recycled sample buffer must be empty");
-    samples.reserve(records.len());
+    let mut samples = Vec::with_capacity(records.len());
     for record in records.drain(..) {
         debug_assert_eq!(record.player, game_state.next_player());
         let ownership = match record.player {
@@ -258,6 +234,7 @@ fn build_training_samples(
         final_turn_number,
         "replayed game has the wrong length"
     );
+    samples
 }
 
 fn ownership_for_player(
@@ -335,8 +312,7 @@ mod tests {
             }
             assert!(game_state.is_finished());
 
-            let mut samples = Vec::new();
-            build_training_samples(&mut records, &mut game_state, &mut samples);
+            let samples = build_training_samples(&mut records, &mut game_state);
 
             assert!(records.is_empty());
             assert_eq!(samples.len(), 3);

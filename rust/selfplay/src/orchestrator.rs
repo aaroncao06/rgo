@@ -57,8 +57,7 @@ impl SelfPlayOrchestrator {
         let worker_count = worker_threads
             .checked_mul(workers_per_thread)
             .expect("self-play worker count overflow");
-        // Each worker can submit at most one finished game before awaiting its
-        // recycled sample buffer.
+        // Bound the backlog; workers await queue space when the writer falls behind.
         let (completed_games_tx, completed_games_rx) = mpsc::channel::<CompletedGame>(worker_count);
         let (pause_tx, pause_rx) = watch::channel(true);
         let (paused_tx, paused_rx) = mpsc::channel(worker_count);
