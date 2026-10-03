@@ -3,7 +3,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use super::{
     RNG_SEED,
-    chunk_assembler::CompletedGame,
+    chunk_writer::CompletedGame,
     params::SelfPlayParams,
     training_data::{TrainingSample, ValueTarget},
 };
@@ -48,7 +48,7 @@ struct SelfPlayRecord {
 #[derive(Debug)]
 pub(super) enum SelfPlayError {
     Search(SearchError),
-    ChunkAssemblerClosed,
+    ChunkWriterClosed,
     ModelCoordinatorClosed,
 }
 
@@ -188,7 +188,7 @@ impl SelfPlayWorker {
                 .take()
                 .expect("submitted buffer has a recycle receiver")
                 .await
-                .map_err(|_| SelfPlayError::ChunkAssemblerClosed)?,
+                .map_err(|_| SelfPlayError::ChunkWriterClosed)?,
         };
         build_training_samples(&mut self.records, &mut self.game_state, &mut samples);
         let (recycle_tx, recycle_rx) = oneshot::channel();
@@ -198,7 +198,7 @@ impl SelfPlayWorker {
         };
         if let Err(error) = self.completed_games_tx.send(completed_game).await {
             self.training_samples = Some(error.0.samples);
-            return Err(SelfPlayError::ChunkAssemblerClosed);
+            return Err(SelfPlayError::ChunkWriterClosed);
         }
         self.recycle_rx = Some(recycle_rx);
         Ok(())
@@ -222,7 +222,7 @@ fn build_training_samples(
     let white_ownership = ownership_for_player(game_state.board(), &final_ownership, Player::White);
 
     game_state.reset(rules);
-    samples.clear();
+    debug_assert!(samples.is_empty(), "recycled sample buffer must be empty");
     samples.reserve(records.len());
     for record in records.drain(..) {
         debug_assert_eq!(record.player, game_state.next_player());

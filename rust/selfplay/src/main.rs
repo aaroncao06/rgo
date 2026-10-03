@@ -9,8 +9,7 @@ use config::SelfPlayConfig;
 /// Change this one value to reproduce or vary all self-play randomness.
 const RNG_SEED: u64 = 0;
 
-mod chunk_assembler;
-mod chunk_sink;
+mod chunk_writer;
 mod config;
 mod control;
 mod orchestrator;
@@ -118,7 +117,7 @@ async fn with_shutdown<F: Future<Output = Result<(), String>>>(
     run(finish_tx, finish_rx).await
 }
 
-/// Provision directory entries durably before the file sink publishes chunks.
+/// Provision directory entries durably before the chunk writer publishes chunks.
 fn prepare_output_dir(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     let parents = {

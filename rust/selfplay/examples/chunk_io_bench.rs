@@ -1,8 +1,9 @@
 //! Run from the repository root:
 //! cargo run --offline --release --manifest-path rust/Cargo.toml \
 //!     -p rgo-selfplay --example chunk_io_bench -- [existing-output-parent]
-//! Uses the real encoder and the sink's Tokio write/sync/rename/directory-sync
-//! sequence. Encoding, validation, setup, and cleanup are outside timed regions.
+//! Uses the real encoder and the former sink's Tokio write/sync/rename/directory-sync
+//! sequence, retained as a historical benchmark. The current writer uses std::fs.
+//! Encoding, validation, setup, and cleanup are outside timed regions.
 //! Reads are immediate, warm-cache reads into a reusable 256 KiB upload buffer.
 //! The no-sync control is NOT a durable publication alternative.
 
@@ -189,7 +190,7 @@ fn main() -> io::Result<()> {
             "directory": parent.canonicalize()?,
             "read_buffer_bytes":buffer.len(),
             "warmup_iterations_per_mode":3,
-            "notes":"Real encoder; current Tokio sink I/O sequence without event delivery; immediate warm-cache reads; no network, no cold-cache or F_FULLFSYNC test; setup/encoding/validation/deletion excluded",
+            "notes":"Real encoder; historical Tokio sink I/O sequence without event delivery; immediate warm-cache reads; no network, no cold-cache or F_FULLFSYNC test; setup/encoding/validation/deletion excluded",
             "results":reports
         }))?);
         Ok(())

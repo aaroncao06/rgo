@@ -8,7 +8,7 @@ use std::{
 
 use serde::Deserialize;
 
-use super::{chunk_assembler::ChunkMode, params::SelfPlayParams};
+use super::{chunk_writer::ChunkMode, params::SelfPlayParams};
 use crate::{inference::runtime::ModelRuntimeConfig, search::params::SearchParams};
 
 /// Operational settings are explicit; algorithm settings inherit Rust defaults.

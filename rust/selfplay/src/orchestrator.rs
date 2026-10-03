@@ -3,14 +3,10 @@
 
 use std::thread;
 
-use tokio::{
-    sync::{mpsc, watch},
-    task::JoinHandle,
-};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use super::{
-    chunk_assembler::{ChunkAssembler, ChunkAssemblerError, CompletedGame, TrainingChunk},
-    chunk_sink::{FileChunkSink, FileChunkSinkError},
+    chunk_writer::{ChunkWriter, ChunkWriterError, CompletedGame},
     config::SelfPlayConfig,
     control::EventPublisher,
     worker::{SelfPlayError, WorkerModelControl},
@@ -25,8 +21,8 @@ use worker_group::{WorkerEvent, WorkerGroup, WorkerSpec};
 #[derive(Debug)]
 pub(super) enum SelfPlayRunError {
     Worker(SelfPlayError),
-    Assembler(ChunkAssemblerError),
-    Sink(FileChunkSinkError),
+    Writer(ChunkWriterError),
+    WriterStopped,
     Task(tokio::task::JoinError),
     ModelLoad(ModelLoadError),
     ModelSourceClosed,
@@ -36,13 +32,12 @@ pub(super) enum SelfPlayRunError {
     WorkerEventsClosed,
 }
 
-/// Owns one local self-play pipeline and one file sink for its output directory.
+/// Owns one local self-play pipeline and one chunk writer for its output directory.
 /// Each of the `worker_threads` OS threads runs `workers_per_thread` local tasks.
 pub(super) struct SelfPlayOrchestrator {
     runtime_config: ModelRuntimeConfig,
     worker_groups: Vec<WorkerGroup>,
-    assembler: ChunkAssembler,
-    sink: FileChunkSink,
+    writer: ChunkWriter,
     pause_tx: watch::Sender<bool>,
     paused_rx: mpsc::Receiver<usize>,
     resume_txs: Vec<mpsc::Sender<ModelHandle>>,
@@ -63,9 +58,8 @@ impl SelfPlayOrchestrator {
             .checked_mul(workers_per_thread)
             .expect("self-play worker count overflow");
         // Each worker can submit at most one finished game before awaiting its
-        // recycled sample buffer. A single encoded chunk may wait for the sink.
+        // recycled sample buffer.
         let (completed_games_tx, completed_games_rx) = mpsc::channel::<CompletedGame>(worker_count);
-        let (chunks_tx, chunks_rx) = mpsc::channel::<TrainingChunk>(1);
         let (pause_tx, pause_rx) = watch::channel(true);
         let (paused_tx, paused_rx) = mpsc::channel(worker_count);
         let mut resume_txs = Vec::with_capacity(worker_count);
@@ -99,8 +93,7 @@ impl SelfPlayOrchestrator {
         Self {
             runtime_config,
             worker_groups,
-            assembler: ChunkAssembler::new(chunk_mode, completed_games_rx, chunks_tx),
-            sink: FileChunkSink::new(output_dir, chunks_rx, events),
+            writer: ChunkWriter::new(chunk_mode, output_dir, completed_games_rx, events),
             pause_tx,
             paused_rx,
             resume_txs,
@@ -150,7 +143,7 @@ impl SelfPlayOrchestrator {
             max_games_per_worker,
             latest_model_version_rx,
             finish_games_rx,
-        );
+        )?;
         pipeline.drive(&mut load_model).await?;
         pipeline.drain().await
     }
@@ -192,8 +185,8 @@ struct RunningPipeline {
     resume_txs: Vec<mpsc::Sender<ModelHandle>>,
     events_rx: mpsc::UnboundedReceiver<WorkerEvent>,
     group_threads: Vec<thread::JoinHandle<()>>,
-    assembler_task: Option<JoinHandle<Result<(), ChunkAssemblerError>>>,
-    sink_task: Option<JoinHandle<Result<(), FileChunkSinkError>>>,
+    writer_thread: thread::JoinHandle<()>,
+    writer_result: Option<oneshot::Receiver<Result<(), ChunkWriterError>>>,
     active_workers: usize,
     model: Option<ModelHandle>,
 }
@@ -204,18 +197,22 @@ impl RunningPipeline {
         max_games_per_worker: Option<usize>,
         latest_model_version_rx: watch::Receiver<Option<ModelVersion>>,
         finish_games_rx: watch::Receiver<bool>,
-    ) -> Self {
+    ) -> Result<Self, SelfPlayRunError> {
         let SelfPlayOrchestrator {
             runtime_config,
             worker_groups,
-            assembler,
-            sink,
+            writer,
             pause_tx,
             paused_rx,
             resume_txs,
         } = orchestrator;
-        let sink_task = tokio::spawn(sink.run());
-        let assembler_task = tokio::spawn(assembler.run());
+        let (writer_tx, writer_result) = oneshot::channel();
+        let writer_thread = thread::Builder::new()
+            .name("selfplay-chunks".into())
+            .spawn(move || {
+                let _ = writer_tx.send(writer.run());
+            })
+            .map_err(|error| SelfPlayRunError::Writer(error.into()))?;
         let active_workers = resume_txs.len();
         // Each worker reports completion once, so this unbounded channel still
         // holds at most active_workers events.
@@ -232,7 +229,7 @@ impl RunningPipeline {
             .collect();
         drop(events_tx);
 
-        Self {
+        Ok(Self {
             runtime_config,
             pause_tx,
             latest_model_version_rx,
@@ -241,11 +238,11 @@ impl RunningPipeline {
             resume_txs,
             events_rx,
             group_threads,
-            assembler_task: Some(assembler_task),
-            sink_task: Some(sink_task),
+            writer_thread,
+            writer_result: Some(writer_result),
             active_workers,
             model: None,
-        }
+        })
     }
 
     async fn drive<F>(&mut self, load_model: &mut F) -> Result<(), SelfPlayRunError>
@@ -273,16 +270,12 @@ impl RunningPipeline {
                     // finish games signals are processed by workers, who send events to decrement active workers
                     change.map_err(|_| SelfPlayRunError::FinishSourceClosed)?;
                 }
+                result = async { self.writer_result.as_mut().unwrap().await }, if self.writer_result.is_some() => {
+                    self.writer_result.take();
+                    check_writer_result(result)?;
+                }
                 event = self.events_rx.recv() => {
                     record_worker_event(event, &mut self.active_workers)?;
-                }
-                result = async { self.assembler_task.as_mut().unwrap().await }, if self.assembler_task.is_some() => {
-                    self.assembler_task.take();
-                    check_assembler_result(result)?;
-                }
-                result = async { self.sink_task.as_mut().unwrap().await }, if self.sink_task.is_some() => {
-                    self.sink_task.take();
-                    check_sink_result(result)?;
                 }
             }
         }
@@ -317,16 +310,12 @@ impl RunningPipeline {
                 change = self.finish_games_rx.changed() => {
                     change.map_err(|_| SelfPlayRunError::FinishSourceClosed)?;
                 }
+                result = async { self.writer_result.as_mut().unwrap().await }, if self.writer_result.is_some() => {
+                    self.writer_result.take();
+                    check_writer_result(result)?;
+                }
                 event = self.events_rx.recv() => {
                     record_worker_event(event, &mut self.active_workers)?;
-                }
-                result = async { self.assembler_task.as_mut().unwrap().await }, if self.assembler_task.is_some() => {
-                    self.assembler_task.take();
-                    check_assembler_result(result)?;
-                }
-                result = async { self.sink_task.as_mut().unwrap().await }, if self.sink_task.is_some() => {
-                    self.sink_task.take();
-                    check_sink_result(result)?;
                 }
             }
         }
@@ -373,40 +362,24 @@ impl RunningPipeline {
         self.resume_txs.clear();
         drop(self.model.take());
 
-        // Wait for both stages on success, but return promptly on any failure.
-        // If both results are ready, prefer the sink's original error over a
-        // downstream assembler error caused by its channel closing.
-        while self.assembler_task.is_some() || self.sink_task.is_some() {
-            tokio::select! {
-                biased;
-                result = async { self.sink_task.as_mut().unwrap().await }, if self.sink_task.is_some() => {
-                    self.sink_task.take();
-                    check_sink_result(result)?;
-                }
-                result = async { self.assembler_task.as_mut().unwrap().await }, if self.assembler_task.is_some() => {
-                    self.assembler_task.take();
-                    check_assembler_result(result)?;
-                }
-            }
+        // The writer drains the queue and acknowledges publication before
+        // sending its result. After that, only thread teardown remains to join.
+        if let Some(result) = self.writer_result.take() {
+            check_writer_result(result.await)?;
         }
+        self.writer_thread
+            .join()
+            .expect("chunk-writer thread panicked");
         Ok(())
     }
 }
 
-fn check_assembler_result(
-    result: Result<Result<(), ChunkAssemblerError>, tokio::task::JoinError>,
+fn check_writer_result(
+    result: Result<Result<(), ChunkWriterError>, oneshot::error::RecvError>,
 ) -> Result<(), SelfPlayRunError> {
     result
-        .map_err(SelfPlayRunError::Task)?
-        .map_err(SelfPlayRunError::Assembler)
-}
-
-fn check_sink_result(
-    result: Result<Result<(), FileChunkSinkError>, tokio::task::JoinError>,
-) -> Result<(), SelfPlayRunError> {
-    result
-        .map_err(SelfPlayRunError::Task)?
-        .map_err(SelfPlayRunError::Sink)
+        .map_err(|_| SelfPlayRunError::WriterStopped)?
+        .map_err(SelfPlayRunError::Writer)
 }
 
 fn record_worker_event(
@@ -455,9 +428,10 @@ mod tests {
             Arc,
             atomic::{AtomicU64, Ordering},
         },
+        time::Duration,
     };
 
-    use super::super::chunk_assembler::ChunkMode;
+    use super::super::chunk_writer::ChunkMode;
     use super::super::params::{SearchBudgetPolicy, SelfPlayParams};
     use super::*;
     use crate::{
@@ -600,6 +574,22 @@ mod tests {
         worker_threads: usize,
         workers_per_thread: usize,
     ) -> SelfPlayOrchestrator {
+        orchestrator_with_events(
+            output_dir,
+            mode,
+            worker_threads,
+            workers_per_thread,
+            EventPublisher::discard(),
+        )
+    }
+
+    fn orchestrator_with_events(
+        output_dir: PathBuf,
+        mode: ChunkMode,
+        worker_threads: usize,
+        workers_per_thread: usize,
+        events: EventPublisher,
+    ) -> SelfPlayOrchestrator {
         let mut search_params = SearchParams::KATAGO_SELFPLAY8_MAIN_B18;
         search_params.root_noise_enabled = false;
         search_params.root_ending_bonus_points = 0.0;
@@ -619,7 +609,7 @@ mod tests {
                 chunk: mode,
                 output_dir,
             },
-            EventPublisher::discard(),
+            events,
         )
     }
 
@@ -681,15 +671,84 @@ mod tests {
         assert_eq!(written_record_counts(&dir), [2]);
     }
 
+    struct BlockingFlush {
+        reached: Option<oneshot::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl std::io::Write for BlockingFlush {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if let Some(reached) = self.reached.take() {
+                let _ = reached.send(());
+                let _ = self.release.recv();
+            }
+            Ok(())
+        }
+    }
+
     #[tokio::test]
-    async fn reports_sink_startup_failure() {
+    async fn drain_waits_for_publication_without_blocking_the_async_runtime() {
+        for mode in [ChunkMode::PerGame, ChunkMode::FixedRecords(10)] {
+            let dir = TestDir::new();
+            let (reached_tx, reached_rx) = oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let orchestrator = orchestrator_with_events(
+                dir.0.clone(),
+                mode,
+                1,
+                1,
+                EventPublisher::with_output(BlockingFlush {
+                    reached: Some(reached_tx),
+                    release: release_rx,
+                }),
+            );
+            let run = run_with_pass_model(orchestrator, 1);
+            tokio::pin!(run);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::select! {
+                    result = &mut run => panic!("returned before publication: {result:?}"),
+                    reached = reached_rx => reached.unwrap(),
+                }
+            })
+            .await
+            .unwrap();
+            // Poll the actual orchestrator's drain while the writer is stuck.
+            tokio::select! {
+                result = &mut run => panic!("returned before acknowledgment: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {},
+            }
+            assert_eq!(written_record_counts(&dir), [2]);
+            release_tx.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), &mut run)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn missing_writer_completion_is_an_error() {
+        let (tx, rx) = oneshot::channel::<Result<(), ChunkWriterError>>();
+        drop(tx);
+        assert!(matches!(
+            check_writer_result(rx.blocking_recv()),
+            Err(SelfPlayRunError::WriterStopped)
+        ));
+    }
+
+    #[tokio::test]
+    async fn reports_writer_startup_failure() {
         let dir = TestDir::new();
         let missing = dir.0.join("missing");
         let result = run_with_pass_model(orchestrator(missing, ChunkMode::PerGame, 1), 0).await;
         assert!(
             matches!(
                 result,
-                Err(SelfPlayRunError::Sink(FileChunkSinkError::Io(_)))
+                Err(SelfPlayRunError::Writer(ChunkWriterError::Io(_)))
             ),
             "unexpected result: {result:?}"
         );
@@ -717,7 +776,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn continuous_run_returns_on_sink_failure() {
+    async fn continuous_run_returns_on_writer_failure() {
         let dir = TestDir::new();
         let missing = dir.0.join("missing");
         let orchestrator = orchestrator(missing, ChunkMode::PerGame, 1);
@@ -732,7 +791,38 @@ mod tests {
                 )
             })
             .await;
-        assert!(matches!(result, Err(SelfPlayRunError::Sink(_))));
+        assert!(matches!(result, Err(SelfPlayRunError::Writer(_))));
+    }
+
+    #[tokio::test]
+    async fn continuous_run_returns_on_file_publication_failure() {
+        for mode in [ChunkMode::PerGame, ChunkMode::FixedRecords(1)] {
+            let dir = TestDir::new();
+            // Startup metadata succeeds; the first game's publication fails.
+            std::fs::create_dir(dir.0.join(".pending-chunk.tmp")).unwrap();
+            let orchestrator = orchestrator(dir.0.clone(), mode, 1);
+            let (_latest_tx, latest_rx) = watch::channel(Some(0));
+            let (_finish_tx, finish_rx) = watch::channel(false);
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                orchestrator.run_inner(None, latest_rx, finish_rx, |_, _| {
+                    Ok(
+                        start_test_runtime(0, vec![test_backend_factory(PassBackend, 8)], 64, 1)
+                            .unwrap(),
+                    )
+                }),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    result,
+                    Err(SelfPlayRunError::Writer(ChunkWriterError::Io(_)))
+                ),
+                "unexpected result: {result:?}"
+            );
+            assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 1);
+        }
     }
 
     #[tokio::test]
@@ -789,7 +879,8 @@ mod tests {
 
         // Zero games lets the group exit without a model, so cleanup does not
         // depend on the rejected checkpoint being loaded.
-        let mut pipeline = RunningPipeline::start(orchestrator, Some(0), latest_rx, finish_rx);
+        let mut pipeline =
+            RunningPipeline::start(orchestrator, Some(0), latest_rx, finish_rx).unwrap();
         let result = pipeline
             .drive(&mut |_, _| panic!("a cleared checkpoint must not be loaded"))
             .await;

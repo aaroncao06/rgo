@@ -70,6 +70,16 @@ impl EventPublisher {
         ack.await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "event writer stopped"))?
     }
+
+    /// The same acknowledged publication for callers on a dedicated OS thread.
+    pub(super) fn blocking_emit(&self, event: Event) -> io::Result<()> {
+        let (written, ack) = oneshot::channel();
+        self.0
+            .blocking_send(PendingEvent { event, written })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "event writer closed"))?;
+        ack.blocking_recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "event writer stopped"))?
+    }
 }
 
 fn write_events(mut output: impl Write, mut events: mpsc::Receiver<PendingEvent>) {
@@ -216,8 +226,12 @@ async fn supervise_self_play(
 #[cfg(test)]
 impl EventPublisher {
     pub(super) fn discard() -> Self {
+        Self::with_output(io::sink())
+    }
+
+    pub(super) fn with_output(output: impl Write + Send + 'static) -> Self {
         let (tx, rx) = mpsc::channel(1);
-        thread::spawn(move || write_events(io::sink(), rx));
+        thread::spawn(move || write_events(output, rx));
         Self(tx)
     }
 }
