@@ -1,111 +1,104 @@
 # rgo
 
-An experimental Go engine for low-cost 9x9 self-play and training research.
+An experimental Go engine for self-play and training research, with an initial
+focus on low-cost 9x9 experiments. Self-play and inference support 9x9, 13x13,
+and 19x19 boards.
 
-The `rgo-engine` Rust library implements board rules, positional superko,
-scoring, ONNX inference with a batched runtime/cache, and graph search using a
-selected KataGo self-play baseline. The separate `rgo-selfplay` application
-owns game generation, configuration, and training-record output. Its worker
-executable loads a TOML configuration and accepts model-ready and finish commands
-from a supervising client over stdin. It reports chunk publication and lifecycle
-events over stdout. The Python trainer
-remains to be implemented.
-
-The engine has no dependency on self-play. A future interactive player can
-reuse the same library. Client/server orchestration will supervise separate
-self-play and training components in separate applications.
-
-The dependency-free `rgo-artifacts` crate owns shared model/chunk identities and
-filename conventions. The engine, self-play, and future client/server components
-use those helpers with their own storage roots; artifact naming does not own
-file persistence or streaming.
+The Rust engine implements positional superko, area scoring, batched ONNX
+inference with a model-scoped cache, and PUCT graph search. The self-play worker
+generates games and writes training chunks under the control of a parent
+process. The trainer, supervising client/server, and interactive player are
+not implemented yet. No trained model is included; the ONNX files under the
+engine's test directory are synthetic fixtures.
 
 ## Build and test
 
-Run from the repository root with a Rust toolchain supporting edition 2024:
+Use a recent Rust toolchain supporting edition 2024. From the repository root:
 
 ```sh
-cd rust
-cargo build --workspace
-cargo test --workspace
-cargo test --workspace --release
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets
+cargo build --release --manifest-path rust/Cargo.toml --workspace
+cargo test --manifest-path rust/Cargo.toml --workspace
+cargo test --release --manifest-path rust/Cargo.toml --workspace
+cargo fmt --manifest-path rust/Cargo.toml --all -- --check
+cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets
 ```
 
-The crates currently produce warnings for unfinished or unused helpers. Miri
-tests that initialize the score-utility table are slow because they interpret its
-numerical initialization; there is no separate Miri table-generation path.
+CPU inference is enabled by default. The `ort` dependency downloads and copies
+ONNX Runtime binaries during the build; the first build needs network access
+unless the dependencies and runtime are already cached or supplied locally.
+CUDA inference requires the `cuda` feature and a compatible CUDA-enabled ONNX
+Runtime installation:
 
-## Self-play worker process
+```sh
+cargo build --release --manifest-path rust/Cargo.toml -p rgo-selfplay --features cuda
+```
 
-Self-play is a client-supervised worker, with no standalone filesystem-watcher
-mode. The client supplies model-ready notifications after publishing complete
-models atomically as `<model_dir>/<version>.onnx`. The worker checks the exact
-model path and loads announced versions at move boundaries. It creates the
-configured chunks directory and reports completed, durable chunks to the client.
+The project currently emits warnings for unfinished helpers and helpers used
+only in tests.
 
-A finish command or closed stdin stops new games and drains active games and
-chunks. SIGINT or SIGTERM on Unix also requests a graceful finish; a second
-shutdown signal forces immediate exit, including during blocked model startup.
-The client/server supervisor is still to be implemented. Integration tests
-launch the worker as a child and exercise its control protocol. See
-[configuration and the pipe protocol](configs/README.md).
+## Run the self-play worker
 
-## Source map
+The worker takes one TOML configuration path and communicates through
+newline-delimited JSON on stdin and stdout. See
+[configuration and the process protocol](configs/README.md).
 
-| Location | Responsibility |
-|---|---|
-| `rust/artifacts/src/lib.rs` | Shared model/chunk identities and canonical path helpers |
-| `rust/engine/src/lib.rs` | Reusable engine library; game, inference, and search modules |
-| `rust/selfplay/src/main.rs` | Configuration loading, directory provisioning, runtime startup, and shutdown signals |
-| `rust/selfplay/src/` | Self-play workers, orchestration, client pipe protocol, configuration, and training chunks |
-| `rust/engine/src/game/board.rs` | Coordinates, colors, chains, local legality, move application, and position hashing |
-| `rust/engine/src/game/board/scoring.rs` | Read-only area scoring and pass-alive analysis |
-| `rust/engine/src/game/game_state.rs` | Turns, rules, positional-superko history, scratch reset, and shared current-state hashing |
-| `rust/engine/src/game/hash.rs` | Deterministic hash primitives and Zobrist keys |
-| `rust/engine/src/inference/{inputs,outputs,policy}.rs` | Model encoding, output postprocessing, and policy indexing |
-| `rust/engine/src/inference/backend.rs` | Backend contract |
-| `rust/engine/src/inference/runtime.rs` | Model lifetime, client evaluation, and executor loop |
-| `rust/engine/src/inference/runtime/{cache,queue}.rs` | Model cache and request/batch synchronization |
-| `rust/engine/src/search/` | Worker, graph identity/storage, search statistics, utility, and selection formulas |
-| `rust/engine/src/search/worker.rs` | Graph lifecycle, playout execution, and reverse backup walk |
-| `rust/engine/src/search/worker/selection_policy.rs` | Complete descent policy: child scanning, PUCT, FPU, exploration scaling, and forced visits |
-| `rust/engine/src/search/worker/backup_policy.rs` | Complete parent-estimate policy: transposition contributions, value weighting, and moment aggregation |
-| `rust/engine/src/search/worker/root_policy.rs` | Root preprocessing and final selection: weights, reduced-weight/LCB adjustments, fallback, and temperature sampling |
-| `rust/engine/src/search/worker/root_endgame.rs` | Root ending-score bonus and useless-move pruning |
+```sh
+mkdir -p models
+cargo run --release --manifest-path rust/Cargo.toml -p rgo-selfplay -- configs/self_play.toml
+```
 
-The worker executes searches; private policy modules decide which child to
-explore, how to estimate a parent's value, and which move to play. Each policy
-keeps its implementation together, including its loops and bookkeeping. The
-reverse path walk stays in the worker and delegates parent recomputation to the
-backup policy. Modules use the existing worker and scratch storage, with no new
-runtime objects or dynamic dispatch. Shared numerical helpers stay in
-`search/{move_selection,root_policy,utility}.rs`. More fundamental algorithm
-changes may still require changes to the core mechanics.
+The example starts eight self-play tasks on two worker threads and uses one
+CPU inference executor. It waits for a `model_ready` command naming a completed
+ONNX model in `models/`. Model files are announced explicitly; the worker does
+not scan the directory. Paths in the configuration are relative to the process
+working directory.
 
-Large test suites live in child `tests.rs` modules; shorter suites remain inline.
-Python model/trainer directories are placeholders with no implementation yet.
-Client/server orchestration will supervise the self-play and training components
-through their local process interfaces.
+Each completed game is sent to a dedicated chunk-writer thread. The writer
+replays its moves, generates position features, and encodes policy targets and
+actual final-game outcomes. It uses synchronous file I/O, syncs and atomically
+publishes each chunk, then emits `chunk_ready`. A `finish` command or stdin EOF
+drains active games and pending chunks before exit.
 
-## Documentation
+## Model contract
 
-- [Architecture and boundaries](docs/01_PROJECT_OBJECTIVE_AND_ARCHITECTURE.md)
-- [Board geometry](docs/02_BOARD_GEOMETRY.md), [chains](docs/03_CHAINS.md),
-  [local legality](docs/04_KO_AND_LEGALITY.md), [moves and game end](docs/05_MOVE_AND_GAMEEND.md),
-  [superko and hashes](docs/06_SUPERKO_AND_HISTORY.md), and [scoring](docs/07_SCORING.md)
-- [Model I/O contract](docs/08_MODEL_IO.md)
-- [Search ownership and storage](docs/09_SEARCH_SYNCHRONIZATION.md)
-- [Runtime design rationale](docs/11_KATAGO_KZERO_RUNTIME_REVIEW.md)
-- [Search formulas](docs/13_KATAGO_SEARCH_UTILITY_AND_SELECTION.md) and
-  [implemented/deferred search features](docs/search_feature_review.md)
-- Future work: [deferred work and experiments](docs/12_DEFERRED_EXPERIMENTS.md),
-  [distributed orchestration](docs/distributed_selfplay_training.md),
-  [interactive application](docs/10_INTERACTIVE_APP.md), and
-  [bidirectional-search research](docs/99_BIDIRECTIONAL_SEARCH_RESEARCH.md)
-- Historical discussion: [original review worksheet](docs/REVIEW_FEEDBACK.md)
+Models must carry the ONNX metadata property `rgo.io_version = "0"`. All model
+inputs and outputs are float32 tensors with a dynamic batch dimension. Spatial
+dimensions must also be declared dynamic so the same model can serve all three
+board sizes. For a batch of `N` positions on an `S` by `S` board:
 
-Future plans and historical feedback do not imply that those interfaces are
-implemented. The numbered specifications describe the current baseline and
-identify deferred work; the source defines the actual internal API.
+- `spatial`: `[N, 3, S, S]`, containing player stones, opponent stones, and
+  current positional-superko bans as binary planes.
+- `global`: `[N, 2]`, containing player-relative komi and consecutive ending
+  passes.
+- `policy_logits`: `[N, S*S+1]`, with row-major board moves followed by pass.
+- `value`: `[N, 3]`, containing a win logit, raw score mean, and score-deviation
+  logit, all relative to the player to move. Score mean is scaled by 20;
+  deviation is `softplus(logit) * 20`.
+- `ownership_logits`: `[N, 1, S, S]`, with positive values favoring the player
+  to move. The engine applies `tanh`; ownership is requested when needed for
+  root endgame heuristics.
+
+The adapter validates tensor declarations when loading and output shapes when
+evaluating. Legal-move masking, symmetry restoration, and output processing
+belong to the engine. See the
+[ONNX adapter](rust/engine/src/inference/onnx.rs),
+[input encoder](rust/engine/src/inference/inputs.rs), and
+[output processing](rust/engine/src/inference/outputs.rs).
+
+## Project layout
+
+- [`rust/artifacts`](rust/artifacts/src/lib.rs): shared model/chunk identities
+  and filename conventions.
+- [`rust/engine`](rust/engine/src/lib.rs): reusable board, inference, and search
+  library, independent of self-play.
+- [`rust/selfplay`](rust/selfplay/src/main.rs): process configuration, game
+  workers, model handoff, pipe protocol, and chunk publication.
+- [`configs`](configs/README.md): example self-play configuration and usage.
+
+Search currently resets its graph for every move. The search defaults are
+defined in [SearchParams](rust/engine/src/search/params.rs); they follow a
+selected KataGo self-play baseline rather than implementing all KataGo
+features. Training chunks store compact inputs, FP16 policies, and
+player-relative final win/score/ownership labels. The initial chunk layout is
+still under development; its encoder is in
+[training_data.rs](rust/selfplay/src/training_data.rs).

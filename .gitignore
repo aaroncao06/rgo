@@ -1,3 +1,8 @@
 /target
 /rust/target
 .DS_Store
+
+# Private project notes and local agent instructions.
+/docs/
+/AGENTS.md
+/agents.md

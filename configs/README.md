@@ -1,26 +1,128 @@
 # Self-play worker configuration
 
-`self_play.toml` is an example consumed by `SelfPlayConfig::load` in the
-`rust/selfplay` worker process. It depends on the reusable `rust/engine` library.
-The client launches and supervises this worker; there is no standalone
-filesystem-watcher mode. The future client setup interface can construct this
-same configuration before launching it.
-
-## Client-to-worker pipe protocol
-
-The internal process launch interface takes one config path:
+[`self_play.toml`](self_play.toml) is a runnable CPU configuration for the
+`rgo-selfplay` worker. From the repository root:
 
 ```sh
-rgo-selfplay configs/self_play.toml
+mkdir -p models
+cargo run --release --manifest-path rust/Cargo.toml -p rgo-selfplay -- configs/self_play.toml
 ```
 
-The worker always uses local stdin/stdout pipes. The client
-owns server communication and stages remote artifacts in the configured paths;
-shared-storage clients use those paths directly. The model directory must exist,
-but self-play does not scan or watch it. The client/server supervisor is not yet
-implemented; integration tests currently exercise this boundary as the parent
-process. Launch arguments and `--help` are an internal worker interface, rather
-than an additional user-facing execution mode.
+The executable takes exactly one configuration path. Directory paths are
+relative to the worker's working directory, not the configuration file. The
+model directory must already exist; it can be empty while the worker waits for
+a model. The worker creates the output directory. Use one worker process per
+output directory because its writer uses a shared temporary filename.
+
+The executable is designed to be launched by a supervising process. It uses
+local stdin/stdout pipes; the parent publishes models, consumes chunks, and
+handles any remote communication. A production supervisor and trainer are not
+included yet.
+
+## Settings and defaults
+
+The top-level operational settings are required:
+
+- `worker_threads`: positive number of self-play worker threads.
+- `workers_per_thread`: positive number of game tasks per worker thread. The
+  example's `2 * 4` configuration runs eight tasks.
+- `output_dir`: directory for published `chunk-<32-hex-digit-id>.rgo` files.
+- `chunk`: publication mode, described below.
+- `inference`: model directory, executor configurations, and cache settings.
+
+The `[inference]` table contains:
+
+- `model_dir`: directory containing atomically published `<version>.onnx`
+  models, where the version is an unsigned 64-bit integer.
+- `cache_capacity` and `num_cache_shards`: evaluation-cache dimensions. The
+  example uses 65,536 entries and 16 shards; both must be powers of two, with
+  the shard count no larger than the capacity.
+- `executors`: one or more `[[inference.executors]]` entries. Each executor has
+  a `device` and positive `base_batch_size`.
+
+CPU devices use `device = { type = "cpu", intra_threads = 1 }`; the intra-op
+thread count must be positive. CUDA devices use
+`device = { type = "cuda", device_id = 0 }` and require a CUDA-enabled build
+and compatible ONNX Runtime. Device IDs must be nonnegative.
+
+`base_batch_size` is the maximum batch size for 19x19 positions. Smaller boards
+use `floor(base_batch_size * 361 / board_dim^2)`: a base of 8 permits 35 positions
+at 9x9, 17 at 13x13, or 8 at 19x19. Requests are batched by board size. Executors
+run with available requests without waiting for a full batch; all executors use
+the announced model.
+
+Optional algorithm settings inherit Rust defaults, including when only some
+fields are overridden:
+
+- `[self_play.rules]`: `board_dim = 9`, `komi = 7.5`, and
+  `multi_stone_suicide_legal = true`. Self-play supports board dimensions 9, 13,
+  and 19. Rules use area scoring and positional superko.
+- `[self_play]`: `randomize_inference_symmetry = true` and a fixed search budget
+  of 512 non-root nodes with a 1,024-playout safety limit per move.
+- `[search]`: defaults from
+  [`SearchParams::KATAGO_SELFPLAY8_MAIN_B18`](../rust/engine/src/search/params.rs).
+  Root symmetry averaging and subtree-value bias are deferred.
+
+Unknown fields and invalid values are rejected before workers start. Search
+validation checks numerical/distribution constraints, rather than imposing
+recommended tuning ranges. Extremely small Dirichlet concentrations can
+underflow during sampling; use the default unless deliberately experimenting
+with the sampler. Randomness is controlled by the code-defined `RNG_SEED` in
+[`main.rs`](../rust/selfplay/src/main.rs), with separate streams per worker.
+
+To vary the search budget, add probability/budget pairs to `[self_play]`:
+
+```toml
+[self_play]
+search_budget_policy = [
+  { probability = 0.9, budget = { max_nodes = 512, max_playouts = 1024 } },
+  { probability = 0.1, budget = { max_nodes = 2048, max_playouts = 4096 } },
+]
+```
+
+The policy is sampled once per move. Probabilities must be positive, finite,
+and sum to one. Each budget's `max_playouts` must be at least its `max_nodes`.
+
+## Chunk publication
+
+The example uses `chunk = { mode = "per_game" }`, publishing one chunk for
+each finished game. To combine or split games into fixed-size chunks, replace
+that top-level setting with:
+
+```toml
+chunk = { mode = "fixed_records", records = 25000 }
+```
+
+The record count must fit a positive `u32`; 25,000 is an example, not a tuned
+default. Graceful shutdown publishes a final partial chunk if needed.
+
+Workers retain move records until a game finishes. A dedicated OS thread
+replays and encodes those records, writes through `std::fs`, syncs the file,
+renames it into its final path, and syncs the directory on Unix. Only then does
+it report the chunk to the parent. The completed-game queue and event delivery
+are bounded, so a slow consumer applies backpressure.
+
+The initial chunk format has a 24-byte header, encoded records, and a 32-byte
+SHA-256 checksum over the header and records. The header contains the
+`RGOCHNK\0` magic followed by four little-endian `u32` fields: format version
+(currently 1), spatial-feature count (3), record count, and global-feature count
+(2). Each record contains, in order:
+
+1. Board dimension as `u8`.
+2. Three binary spatial planes, packed at one bit per active cell, each starting
+   on a byte boundary.
+3. Two player-relative global features as little-endian `f32`.
+4. Row-major policy probabilities, followed by pass, as little-endian `f16`.
+5. Final win target and final score as little-endian `f32`. Win targets are 0
+   for loss, 0.5 for draw, and 1 for win; scores are player-relative.
+6. Final ownership at two bits per active cell: 0 opponent, 1 neutral, 2 player.
+
+Packed cells occupy the least significant bits first; unused high bits are
+zero. Only active board cells are stored. Records occupy 235 bytes at 9x9,
+466 at 13x13, or 970 at 19x19. The layout is still under development; refer to
+the [encoder](../rust/selfplay/src/training_data.rs) for the current definition.
+
+## Commands and events
 
 Send one JSON command per line on stdin:
 
@@ -29,94 +131,40 @@ Send one JSON command per line on stdin:
 {"type":"finish"}
 ```
 
-`model_ready` means the client has completely published `<model_dir>/42.onnx`.
-Self-play checks that exact path before forwarding the version to its existing
-model-handoff logic. Missing or non-file paths and invalid ONNX models are
-errors. Versions must fit an unsigned 64-bit integer; duplicate and older
-announcements are ignored. Unannounced files do not trigger model changes.
-`finish` stops new games and drains active games and chunks. Closing stdin also
-requests a graceful finish, so a disconnected supervisor does not leave an
-uncontrolled producer running. Commands are limited to 4096 bytes per line,
-including the newline; malformed JSON, unknown commands, and unknown fields
-are errors.
+Send `model_ready` only after completely publishing `<model_dir>/42.onnx`.
+The worker checks that exact file and validates the ONNX contract when loading
+it. Duplicate or older version announcements are ignored. Unannounced files
+do not trigger model changes; adopted versions are switched at move boundaries
+through coordinated model handoff. The model must meet the
+[V0 tensor contract](../README.md#model-contract).
 
-Stdout contains only newline-delimited JSON events; diagnostics remain on stderr:
+`finish` stops new games, drains active games, and flushes pending chunks.
+Closing stdin requests the same graceful finish, including when no model has
+been announced. Commands are limited to 4,096 bytes including the newline;
+malformed JSON, unknown command types, and unknown fields are errors.
+
+Stdout contains newline-delimited JSON events. An illustrative sequence for a
+200-record 9x9 chunk is:
 
 ```json
 {"type":"ready","protocol_version":1}
-{"type":"chunk_ready","path":"self_play_chunks/chunk-<id>.rgo","bytes":2870,"records":2}
+{"type":"chunk_ready","path":"self_play_chunks/chunk-00000000000000000000000000000001.rgo","bytes":47056,"records":200}
 {"type":"stopped"}
 ```
 
 `ready` means the control interface is ready, not that a model has loaded.
-`chunk_ready` is emitted only after the complete chunk is atomically published
-and synced; its path follows the configured output path and is relative to the
-child's working directory when that configuration is relative. `records` is the
-actual number of training records, including for a final partial chunk. It comes
-directly from the encoder; the client/server can use it for replay inventory and
-should validate it against the file header when accepting the chunk. `stopped`
-follows all final chunk events after a successful drain. Runtime and command
-failures produce a best-effort `{"type":"error","message":"..."}` event and
-exit with status 1. Startup failures before the interface starts report on
-stderr with a nonzero exit status. The supervisor must monitor exit status and
-continuously drain stdout and stderr. Event delivery is bounded and applies
-backpressure rather than dropping chunk notifications. SIGINT or SIGTERM on
-Unix also requests a graceful finish; a second shutdown signal forces immediate
-exit. Signal handling runs independently of model startup: graceful finishing
-waits for an in-progress load to return, while forced exit remains available.
-The pipe protocol has no force-exit command. The parent requests graceful
-shutdown with `finish`, then kills the child directly if a timeout expires or
-the user requests forced shutdown. A `finish` command does not count as the
-first OS shutdown signal; the direct signal handler counts signals separately.
-An empty model directory is valid; the worker waits for its first model-ready
-command and can finish while waiting.
+`chunk_ready` reports a fully published chunk, its byte size, and actual record
+count. Relative event paths are relative to the worker's working directory.
+`stopped` follows all final chunk events after a successful drain.
 
-## Configuration fields
+The parent must continuously drain stdout and stderr and monitor exit status.
+Diagnostics go to stderr. Runtime and command failures emit a best-effort
+`{"type":"error","message":"..."}` event and exit with status 1; failures
+before the event interface starts are reported on stderr. Invalid launch
+arguments exit with status 2. `--help` prints usage and exits successfully.
 
-`SelfPlayConfig` combines operational settings with the existing `SelfPlayParams`,
-`SearchParams`, `ModelRuntimeConfig`, and `ChunkMode`; it does not duplicate their
-fields. Operational settings are required. Omitted algorithm tables or fields
-inherit the defaults defined in Rust (`SelfPlayParams::default()` and
-`SearchParams::KATAGO_SELFPLAY8_MAIN_B18`). Unknown fields and invalid values are
-rejected before workers are started.
-
-`self_play.rules.board_dim` defaults to 9 and must be 9, 13, or 19, within
-`MAX_BOARD_DIM` (currently 9, so only 9 is available). V0 models receive an exact-size tensor
-with three spatial channels. Requests are batched by board size; all sizes use
-the same loaded model. Checkpoints must export the dynamic-spatial
-`rgo.io_version = "0"` contract; incompatible declarations are rejected at loading.
-
-Search validation checks numeric and probability/distribution requirements, not
-KataGo's recommended tuning bounds. Finite negative bonuses or exploration
-coefficients are allowed for experiments. Positive scales/denominators and valid
-mixing weights remain required; enabled noise and LCB require positive
-concentration and confidence multipliers, respectively.
-
-Known numerical limitation: extremely small root Dirichlet total concentrations
-(for example, `0.001`) can underflow every gamma draw to zero. Normalization then
-triggers a debug assertion or produces NaN policy entries in release builds.
-Validation currently requires a positive concentration but does not rule out
-this case. The default `10.83` is not practically affected; robust/log-space
-sampling is deferred. Avoid extremely small concentrations in experiments until
-the sampler is made robust.
-
-Directory paths are relative to the process working directory, not the config
-file. The example assumes the repository root. The model directory must already
-exist; the executable creates the output directory before starting the file
-sink and syncs newly created directory entries on Unix. Use one sink per output
-directory, and publish complete models atomically as `<version>.onnx`.
-
-Each inference executor has its own device and batch limit. CPU thread counts
-are explicit. CUDA entries require a CUDA-enabled build and ONNX Runtime.
-The operating system/backend still validates whether the requested device and
-model can actually be loaded.
-
-`chunk = { mode = "per_game" }` publishes each finished game immediately.
-`chunk = { mode = "fixed_records", records = 25000 }` combines/splits games into
-fixed-size chunks, with a possible final partial chunk on graceful shutdown.
-That number is an example, not a tuned default.
-
-`self_play.search_budget_policy` is a list of probability/budget pairs sampled
-per move. Probabilities must be positive and sum to one. If omitted, the policy
-is the existing fixed 512-node / 1024-playout budget. Randomness still uses the
-existing code-defined seed; there is no second seed setting in the file.
+On Unix, SIGINT or SIGTERM requests a graceful finish; a second shutdown signal
+forces immediate exit. An in-progress model load can delay graceful shutdown.
+There is no force-exit pipe command: a supervisor can send `finish`, then kill
+the child if its shutdown deadline expires. Pipe commands and OS signal counts
+are independent.
