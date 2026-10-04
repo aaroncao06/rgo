@@ -3,26 +3,16 @@ use tokio::sync::{mpsc, watch};
 
 use super::{
     RNG_SEED,
-    chunk_writer::CompletedGame,
     params::SelfPlayParams,
-    training_data::{TrainingSample, ValueTarget},
+    training_data::{CompletedGame, SelfPlayRecord},
 };
 use crate::{
-    game::{
-        board::{Color, Loc, MAX_BOARD_AREA, Player},
-        game_state::GameState,
-    },
-    inference::{
-        inputs::NNInput,
-        policy::loc_to_spatial,
-        runtime::{InferenceClient, ModelHandle},
-    },
+    game::game_state::GameState,
+    inference::runtime::{InferenceClient, ModelHandle},
     search::{
         node_store::FixedArenaNodeStore,
         params::SearchParams,
-        worker::{
-            PolicyTarget, SearchBudget, SearchError, SearchResult, SearchValueTarget, SearchWorker,
-        },
+        worker::{SearchBudget, SearchError, SearchResult, SearchWorker},
     },
 };
 
@@ -36,13 +26,6 @@ fn derive_rng_seed(global_seed: u64, worker_index: u64, stream: u64) -> u64 {
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
-}
-
-struct SelfPlayRecord {
-    player: Player,
-    selected_move: Loc, // to reconstruct nn input when we replay the game to finalize
-    policy_target: PolicyTarget,
-    search_value_target: SearchValueTarget,
 }
 
 #[derive(Debug)]
@@ -68,7 +51,6 @@ pub(super) struct WorkerModelControl {
 
 pub(super) struct SelfPlayWorker {
     game_state: GameState,
-    records: Vec<SelfPlayRecord>,
     completed_games_tx: mpsc::Sender<CompletedGame>,
     search_worker: SearchWorker<FixedArenaNodeStore>,
     inference_client: InferenceClient,
@@ -101,7 +83,6 @@ impl SelfPlayWorker {
         let game_state = GameState::new(self_play_params.rules);
         Self {
             game_state,
-            records: Vec::new(),
             completed_games_tx,
             search_worker: SearchWorker::new(node_store, search_params),
             inference_client,
@@ -111,7 +92,11 @@ impl SelfPlayWorker {
         }
     }
 
-    async fn play_move(&mut self, search_budget: SearchBudget) -> Result<(), SelfPlayError> {
+    async fn play_move(
+        &mut self,
+        search_budget: SearchBudget,
+        records: &mut Vec<SelfPlayRecord>,
+    ) -> Result<(), SelfPlayError> {
         let search_result = self
             .search_worker
             .search(
@@ -125,13 +110,11 @@ impl SelfPlayWorker {
         let SearchResult {
             selected_move,
             policy_target,
-            value_target: search_value_target,
         } = search_result;
-        self.records.push(SelfPlayRecord {
+        records.push(SelfPlayRecord {
             player: self.game_state.next_player(),
             selected_move,
             policy_target,
-            search_value_target,
         });
 
         let played = self.game_state.play(selected_move);
@@ -165,100 +148,24 @@ impl SelfPlayWorker {
 
     pub(super) async fn play_game(&mut self) -> Result<(), SelfPlayError> {
         self.game_state.reset(self.params.rules);
-        self.records.clear();
+        // Provisional reservation; calibrate from observed game lengths later.
+        let board_dim = self.game_state.board().dim();
+        let mut records = Vec::with_capacity(board_dim * board_dim);
         while !self.game_state.is_finished() {
             self.sync_model().await?;
             let search_budget = self.params.search_budget_policy.sample(&mut self.rng);
-            self.play_move(search_budget).await?;
+            self.play_move(search_budget, &mut records).await?;
         }
-        self.submit_finished_game().await
-    }
-
-    async fn submit_finished_game(&mut self) -> Result<(), SelfPlayError> {
-        let samples = build_training_samples(&mut self.records, &mut self.game_state);
         self.completed_games_tx
-            .send(CompletedGame { samples })
+            .send(CompletedGame::new(&self.game_state, records))
             .await
             .map_err(|_| SelfPlayError::ChunkWriterClosed)
     }
 }
 
-fn build_training_samples(
-    records: &mut Vec<SelfPlayRecord>,
-    game_state: &mut GameState,
-) -> Vec<TrainingSample> {
-    debug_assert!(
-        game_state.is_finished(),
-        "cannot finalize an unfinished game"
-    );
-    let final_ownership = game_state.final_ownership();
-    let final_state_hash = game_state.current_state_hash();
-    let final_turn_number = game_state.turn_number();
-    let rules = *game_state.rules();
-    let black_ownership = ownership_for_player(game_state.board(), &final_ownership, Player::Black);
-    let white_ownership = ownership_for_player(game_state.board(), &final_ownership, Player::White);
-
-    game_state.reset(rules);
-    let mut samples = Vec::with_capacity(records.len());
-    for record in records.drain(..) {
-        debug_assert_eq!(record.player, game_state.next_player());
-        let ownership = match record.player {
-            Player::Black => black_ownership,
-            Player::White => white_ownership,
-        };
-        let SearchValueTarget {
-            win_probability,
-            score_mean,
-            score_stdev,
-        } = record.search_value_target;
-        samples.push(TrainingSample {
-            input: NNInput::encode(game_state),
-            policy_target: record.policy_target,
-            value_target: ValueTarget {
-                win_probability,
-                score_mean,
-                score_stdev,
-                ownership,
-            },
-        });
-        let played = game_state.play(record.selected_move);
-        debug_assert!(played, "recorded self-play move failed during replay");
-    }
-    debug_assert_eq!(
-        game_state.current_state_hash(),
-        final_state_hash,
-        "replayed game differs from the completed game"
-    );
-    debug_assert_eq!(
-        game_state.turn_number(),
-        final_turn_number,
-        "replayed game has the wrong length"
-    );
-    samples
-}
-
-fn ownership_for_player(
-    board: &crate::game::board::Board,
-    final_ownership: &[Color; crate::game::board::BOARD_STORAGE_LEN],
-    player: Player,
-) -> [u8; MAX_BOARD_AREA] {
-    let mut ownership = [1; MAX_BOARD_AREA];
-    for loc in board.locs() {
-        ownership[loc_to_spatial(board, loc)] = match (final_ownership[loc.index()], player) {
-            (Color::Empty, _) => 1,
-            (Color::Black, Player::Black) | (Color::White, Player::White) => 2,
-            (Color::Black, Player::White) | (Color::White, Player::Black) => 0,
-            (Color::Wall, _) => unreachable!("board iterator yielded a wall"),
-        };
-    }
-    ownership
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::game::rules::Rules;
-    use crate::inference::policy::loc_to_policy;
 
     #[test]
     fn global_seed_derives_stable_distinct_worker_streams() {
@@ -277,76 +184,5 @@ mod tests {
             gameplay,
             derive_rng_seed(global_seed, 1, GAMEPLAY_RNG_STREAM)
         );
-    }
-
-    #[test]
-    fn finished_game_replay_builds_player_relative_training_samples() {
-        for board_dim in [5, 9] {
-            let rules = Rules {
-                board_dim,
-                ..Rules::TROMP_TAYLORISH_9
-            };
-            let mut game_state = GameState::new(rules);
-            let center = game_state
-                .board()
-                .loc(board_dim / 2, board_dim / 2)
-                .unwrap();
-            let moves = [center, Loc::PASS, Loc::PASS];
-            let mut records = Vec::new();
-
-            for (turn, move_loc) in moves.into_iter().enumerate() {
-                let mut policy_target =
-                    [half::f16::ZERO; crate::inference::policy::MAX_POLICY_SIZE];
-                policy_target[loc_to_policy(game_state.board(), move_loc)] = half::f16::ONE;
-                records.push(SelfPlayRecord {
-                    player: game_state.next_player(),
-                    selected_move: move_loc,
-                    policy_target,
-                    search_value_target: SearchValueTarget {
-                        win_probability: 0.1 + turn as f32 * 0.1,
-                        score_mean: turn as f32 + 0.5,
-                        score_stdev: turn as f32 + 1.5,
-                    },
-                });
-                assert!(game_state.play(move_loc));
-            }
-            assert!(game_state.is_finished());
-
-            let samples = build_training_samples(&mut records, &mut game_state);
-
-            assert!(records.is_empty());
-            assert_eq!(samples.len(), 3);
-            assert_eq!(samples[0].input.global, [-7.5, 0.0]);
-            assert_eq!(samples[1].input.global, [7.5, 0.0]);
-            assert_eq!(samples[2].input.global, [-7.5, 1.0]);
-
-            let center_policy = loc_to_policy(game_state.board(), center);
-            let center_spatial = loc_to_spatial(game_state.board(), center);
-            assert_eq!(samples[0].input.spatial[center_spatial], 0);
-            assert_eq!(samples[1].input.spatial[MAX_BOARD_AREA + center_spatial], 1);
-            assert_eq!(samples[2].input.spatial[center_spatial], 1);
-            assert_eq!(samples[0].policy_target[center_policy], half::f16::ONE);
-
-            assert_eq!(samples[0].value_target.win_probability, 0.1);
-            assert_eq!(samples[0].value_target.score_mean, 0.5);
-            assert_eq!(samples[0].value_target.score_stdev, 1.5);
-            assert_eq!(samples[0].value_target.ownership[center_spatial], 2);
-            assert_eq!(samples[1].value_target.ownership[center_spatial], 0);
-            for sample in &samples {
-                assert_eq!(sample.input.board_dim, board_dim);
-                assert!(
-                    sample.policy_target[board_dim * board_dim + 1..]
-                        .iter()
-                        .all(|&p| p == half::f16::ZERO)
-                );
-                for i in 0..MAX_BOARD_AREA {
-                    let x = i % crate::game::board::MAX_BOARD_DIM;
-                    let y = i / crate::game::board::MAX_BOARD_DIM;
-                    if x >= board_dim || y >= board_dim {
-                        assert_eq!(sample.value_target.ownership[i], 1);
-                    }
-                }
-            }
-        }
     }
 }

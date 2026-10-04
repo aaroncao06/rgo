@@ -22,7 +22,7 @@ use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt},
 };
-use training_data::{ChunkEncoder, TrainingSample, ValueTarget};
+use training_data::ChunkEncoder;
 
 struct Scratch(std::path::PathBuf);
 impl Drop for Scratch {
@@ -36,21 +36,19 @@ fn mock_chunk(records: usize) -> Vec<u8> {
     let policy_len = state.board().dim().pow(2) + 1;
     let mut policy_target = [half::f16::ZERO; MAX_POLICY_SIZE];
     policy_target[..policy_len].fill(half::f16::from_f64(1.0 / policy_len as f64));
-    let mut sample = TrainingSample {
-        input: NNInput::encode(&state),
-        policy_target,
-        value_target: ValueTarget {
-            win_probability: 0.5,
-            score_mean: 0.0,
-            score_stdev: 1.0,
-            ownership: [1; game::board::MAX_BOARD_AREA],
-        },
-    };
+    let input = NNInput::encode(&state);
+    let ownership = [1; game::board::MAX_BOARD_AREA];
     let mut encoder = ChunkEncoder::new(records);
     for i in 0..records {
-        sample.value_target.score_mean = (i % 81) as f32 - 40.0;
-        sample.value_target.win_probability = (i % 101) as f32 / 100.0;
-        encoder.push(&sample);
+        let final_score = (i % 81) as f32 - 40.0;
+        let win_target = if final_score > 0.0 {
+            1.0
+        } else if final_score < 0.0 {
+            0.0
+        } else {
+            0.5
+        };
+        encoder.push(&input, &policy_target, win_target, final_score, &ownership);
     }
     assert_eq!(encoder.record_count(), records);
     let bytes = encoder.finish();

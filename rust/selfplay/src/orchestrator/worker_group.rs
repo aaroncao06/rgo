@@ -9,8 +9,8 @@ use tokio::{
 
 use crate::search::params::SearchParams;
 use crate::{
-    chunk_writer::CompletedGame,
     params::SelfPlayParams,
+    training_data::CompletedGame,
     worker::{SelfPlayError, SelfPlayWorker, WorkerModelControl},
 };
 

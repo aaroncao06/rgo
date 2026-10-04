@@ -338,51 +338,6 @@ async fn search_stops_at_playout_guard_when_terminal_revisits_cannot_fill_the_st
 }
 
 #[tokio::test]
-async fn search_value_target_uses_current_player_and_converts_moments_to_stdev() {
-    for player in [Player::Black, Player::White] {
-        let mut state = GameState::new(Rules::TROMP_TAYLORISH_9);
-        if player == Player::White {
-            assert!(state.play(Loc::PASS));
-        }
-        let mut worker = worker();
-        let mut client = inference_client(false);
-        worker.start_game(&state, &mut client).await.unwrap();
-        worker
-            .search_graph
-            .root
-            .as_mut()
-            .unwrap()
-            .node
-            .replace_stats(SearchStats {
-                visits: 4,
-                white_win_sum: 3.0,
-                white_score_sum: 12.0,
-                white_score_mean_sq_sum: 52.0,
-                white_utility_sum: 0.0,
-                white_utility_sq_sum: 0.0,
-                weight_sum: 4.0,
-                weight_sq_sum: 4.0,
-            });
-
-        let mut rng = SmallRng::seed_from_u64(0);
-        let target = worker.build_search_result(&mut rng).unwrap().value_target;
-        let expected = match player {
-            Player::White => SearchValueTarget {
-                win_probability: 0.75,
-                score_mean: 3.0,
-                score_stdev: 2.0,
-            },
-            Player::Black => SearchValueTarget {
-                win_probability: 0.25,
-                score_mean: -3.0,
-                score_stdev: 2.0,
-            },
-        };
-        assert_eq!(target, expected);
-    }
-}
-
-#[tokio::test]
 async fn search_propagates_inference_failure_without_sampling() {
     let mut worker = worker();
     // Root Dirichlet noise is intentionally sampled before search in the

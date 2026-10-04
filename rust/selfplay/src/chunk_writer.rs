@@ -10,14 +10,18 @@ use tokio::sync::mpsc;
 
 use super::{
     control::{Event, EventPublisher},
-    training_data::{ChunkEncoder, TrainingSample},
+    training_data::{ChunkEncoder, CompletedGame},
+};
+use crate::{
+    game::{
+        board::{BOARD_STORAGE_LEN, Board, Color, MAX_BOARD_AREA, Player},
+        game_state::GameState,
+        rules::Rules,
+    },
+    inference::{inputs::NNInput, policy::loc_to_spatial},
 };
 
 const PENDING_CHUNK_FILE: &str = ".pending-chunk.tmp";
-
-pub(super) struct CompletedGame {
-    pub(super) samples: Vec<TrainingSample>,
-}
 
 #[derive(Clone, Copy, serde::Deserialize)]
 #[serde(
@@ -47,9 +51,10 @@ impl From<io::Error> for ChunkWriterError {
 
 /// Encodes and durably publishes chunks on one dedicated OS thread.
 ///
-/// Workers transfer completed games through a bounded queue. Sample vectors
-/// are freed after encoding. One reusable encoder owns the encoded
-/// byte allocation through publication, without overlapping writes.
+/// Workers transfer completed move records through a bounded queue. Replay
+/// generates inputs directly into reusable scratch storage; records are freed
+/// after encoding. One reusable encoder owns the encoded byte allocation
+/// through publication, without overlapping writes.
 /// Closing the queue drains games and flushes the final partial fixed chunk.
 ///
 /// The caller must durably provision the output directory before starting.
@@ -62,6 +67,8 @@ pub(super) struct ChunkWriter {
     completed_games_rx: mpsc::Receiver<CompletedGame>,
     events: EventPublisher,
     active_chunk: ChunkEncoder,
+    replay_state: GameState,
+    input: NNInput,
 }
 
 impl ChunkWriter {
@@ -76,12 +83,16 @@ impl ChunkWriter {
             ChunkMode::PerGame => ChunkEncoder::new(1),
             ChunkMode::FixedRecords(records) => ChunkEncoder::new(records),
         };
+        let replay_state = GameState::new(Rules::default());
+        let input = NNInput::encode(&replay_state);
         Self {
             mode,
             output_dir,
             completed_games_rx,
             events,
             active_chunk,
+            replay_state,
+            input,
         }
     }
 
@@ -97,10 +108,7 @@ impl ChunkWriter {
         }
 
         while let Some(game) = self.completed_games_rx.blocking_recv() {
-            match self.mode {
-                ChunkMode::PerGame => self.append_game_per_game(game)?,
-                ChunkMode::FixedRecords(records) => self.append_game_fixed(game, records)?,
-            }
+            self.append_game(game)?;
         }
         if self.active_chunk.record_count() > 0 {
             debug_assert!(matches!(self.mode, ChunkMode::FixedRecords(_)));
@@ -109,51 +117,81 @@ impl ChunkWriter {
         Ok(())
     }
 
-    fn append_game_per_game(&mut self, game: CompletedGame) -> Result<(), ChunkWriterError> {
+    fn append_game(&mut self, game: CompletedGame) -> Result<(), ChunkWriterError> {
         debug_assert!(
-            !game.samples.is_empty(),
-            "completed games must have samples"
+            !game.records.is_empty(),
+            "completed games must have records"
         );
-        self.active_chunk.reset(game.samples.len());
-        for sample in &game.samples {
-            self.active_chunk.push(sample);
+        if let ChunkMode::PerGame = self.mode {
+            self.active_chunk.reset(game.records.len());
         }
-        drop(game);
-        self.publish()
-    }
-
-    fn append_game_fixed(
-        &mut self,
-        mut game: CompletedGame,
-        records: usize,
-    ) -> Result<(), ChunkWriterError> {
-        loop {
-            // Preserve tail-first consumption: independently sampled records
-            // need no game order, and truncation does not shift remaining data.
-            let count = self
-                .active_chunk
-                .remaining_capacity()
-                .min(game.samples.len());
-            let remaining = game.samples.len() - count;
-            for sample in &game.samples[remaining..] {
-                self.active_chunk.push(sample);
-            }
-            game.samples.truncate(remaining);
-
-            if game.samples.is_empty() {
-                // Release samples before publishing the game's final chunk.
-                drop(game);
-                if self.active_chunk.record_count() == records {
-                    self.publish()?;
-                }
-                return Ok(());
-            }
-            debug_assert!(
-                self.active_chunk.record_count() == records,
-                "unfinished game must have filled a chunk"
+        self.replay_state.reset(game.rules);
+        let black_ownership = ownership_for_player(
+            self.replay_state.board(),
+            &game.final_ownership,
+            Player::Black,
+        );
+        let white_ownership = ownership_for_player(
+            self.replay_state.board(),
+            &game.final_ownership,
+            Player::White,
+        );
+        let white_score = self
+            .replay_state
+            .board()
+            .locs()
+            .map(|loc| match game.final_ownership[loc.index()] {
+                Color::White => 1_i16,
+                Color::Black => -1,
+                Color::Empty => 0,
+                Color::Wall => unreachable!("board iterator yielded a wall"),
+            })
+            .sum::<i16>() as f32
+            + game.rules.komi;
+        let white_win_target = if white_score > 0.0 {
+            1.0
+        } else if white_score < 0.0 {
+            0.0
+        } else {
+            0.5
+        };
+        for (index, record) in game.records.iter().enumerate() {
+            debug_assert_eq!(record.player, self.replay_state.next_player());
+            self.input.encode_in_place(&self.replay_state);
+            let (win_target, final_score, ownership) = match record.player {
+                Player::Black => (1.0 - white_win_target, -white_score, &black_ownership),
+                Player::White => (white_win_target, white_score, &white_ownership),
+            };
+            self.active_chunk.push(
+                &self.input,
+                &record.policy_target,
+                win_target,
+                final_score,
+                ownership,
             );
+            let played = self.replay_state.play(record.selected_move);
+            debug_assert!(played, "recorded self-play move failed during replay");
+
+            // Publish intermediate fixed chunks while retaining the remaining
+            // move records. The final chunk is published after releasing them.
+            if matches!(self.mode, ChunkMode::FixedRecords(_))
+                && self.active_chunk.remaining_capacity() == 0
+                && index + 1 < game.records.len()
+            {
+                self.publish()?;
+            }
+        }
+        debug_assert!(self.replay_state.is_finished());
+        debug_assert_eq!(
+            self.replay_state.turn_number(),
+            game.records.len(),
+            "replayed game has the wrong length"
+        );
+        drop(game);
+        if matches!(self.mode, ChunkMode::PerGame) || self.active_chunk.remaining_capacity() == 0 {
             self.publish()?;
         }
+        Ok(())
     }
 
     fn publish(&mut self) -> Result<(), ChunkWriterError> {
@@ -180,6 +218,23 @@ impl ChunkWriter {
         }
         Ok(())
     }
+}
+
+fn ownership_for_player(
+    board: &Board,
+    final_ownership: &[Color; BOARD_STORAGE_LEN],
+    player: Player,
+) -> [u8; MAX_BOARD_AREA] {
+    let mut ownership = [1; MAX_BOARD_AREA];
+    for loc in board.locs() {
+        ownership[loc_to_spatial(board, loc)] = match (final_ownership[loc.index()], player) {
+            (Color::Empty, _) => 1,
+            (Color::Black, Player::Black) | (Color::White, Player::White) => 2,
+            (Color::Black, Player::White) | (Color::White, Player::Black) => 0,
+            (Color::Wall, _) => unreachable!("board iterator yielded a wall"),
+        };
+    }
+    ownership
 }
 
 #[cfg(unix)]

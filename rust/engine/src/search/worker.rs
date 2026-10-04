@@ -105,17 +105,6 @@ pub type PolicyTarget = [half::f16; crate::inference::policy::MAX_POLICY_SIZE];
 pub struct SearchResult {
     pub selected_move: Loc,
     pub policy_target: PolicyTarget,
-    pub value_target: SearchValueTarget,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SearchValueTarget {
-    /// Probability that the player to move wins.
-    pub win_probability: f32,
-    /// Expected final score from the player-to-move perspective, in points.
-    pub score_mean: f32,
-    /// Standard deviation of the final score; unchanged by perspective.
-    pub score_stdev: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]

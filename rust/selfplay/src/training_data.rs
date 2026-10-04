@@ -1,4 +1,8 @@
-use crate::game::board::MAX_BOARD_AREA;
+use crate::game::{
+    board::{BOARD_STORAGE_LEN, Color, Loc, MAX_BOARD_AREA, Player},
+    game_state::GameState,
+    rules::Rules,
+};
 use crate::inference::{
     inputs::{NNInput, NUM_GLOBAL_FEATURES, NUM_SPATIAL_FEATURES},
     policy::active_rows,
@@ -12,8 +16,10 @@ pub(super) const CHUNK_FORMAT_VERSION: u32 = 1;
 pub(super) const CHUNK_HEADER_SIZE: usize = 8 + 4 * size_of::<u32>();
 pub(super) const CHUNK_CHECKSUM_SIZE: usize = 32;
 /// Each record stores: board dimension (u8), binary spatial planes, global
-/// features (f32), policy including pass (f16), three value targets (f32), and
-/// ownership labels. Only active cells are stored, in row-major order.
+/// features (f32), policy including pass (f16), final win/score targets (f32), and
+/// ownership labels. Win targets are 0 (loss), 0.5 (draw), or 1 (win); final
+/// scores and ownership are player-relative. Only active cells are stored, in
+/// row-major order.
 ///
 /// Each spatial plane uses one bit per cell and starts on a byte boundary;
 /// ownership uses two bits per cell (0 = opponent, 1 = neutral, 2 = player).
@@ -23,26 +29,35 @@ pub(super) fn training_record_size(board_dim: usize) -> usize {
     let board_area = board_dim * board_dim;
     size_of::<u8>()
         + NUM_SPATIAL_FEATURES * board_area.div_ceil(8)
-        + (NUM_GLOBAL_FEATURES + 3) * size_of::<f32>()
+        + (NUM_GLOBAL_FEATURES + 2) * size_of::<f32>()
         + (board_area + 1) * size_of::<f16>()
         + (2 * board_area).div_ceil(8)
 }
 
-#[derive(Debug, PartialEq)]
-pub(super) struct ValueTarget {
-    pub(super) win_probability: f32,
-    pub(super) score_mean: f32,
-    pub(super) score_stdev: f32,
-    /// 0 = opponent, 1 = neutral, 2 = current player.
-    pub(super) ownership: [u8; MAX_BOARD_AREA],
+pub(super) struct SelfPlayRecord {
+    pub(super) player: Player,
+    pub(super) selected_move: Loc,
+    pub(super) policy_target: PolicyTarget,
 }
 
-// In-memory arrays retain capacity. Policy uses an active prefix including pass;
-// spatial inputs and ownership retain the maximum row stride.
-pub(super) struct TrainingSample {
-    pub(super) input: NNInput,
-    pub(super) policy_target: PolicyTarget,
-    pub(super) value_target: ValueTarget,
+/// Games currently start empty; rules and moves suffice to reconstruct inputs.
+/// Final ownership is calculated once; the writer prepares player-relative labels.
+pub(super) struct CompletedGame {
+    pub(super) rules: Rules,
+    pub(super) records: Vec<SelfPlayRecord>,
+    pub(super) final_ownership: [Color; BOARD_STORAGE_LEN],
+}
+
+impl CompletedGame {
+    pub(super) fn new(game_state: &GameState, records: Vec<SelfPlayRecord>) -> Self {
+        debug_assert!(game_state.is_finished(), "cannot submit an unfinished game");
+        debug_assert_eq!(records.len(), game_state.turn_number());
+        Self {
+            rules: *game_state.rules(),
+            records,
+            final_ownership: game_state.final_ownership(),
+        }
+    }
 }
 
 /// Builds one versioned chunk directly in its final byte representation.
@@ -95,7 +110,14 @@ impl ChunkEncoder {
         self.record_capacity - self.record_count
     }
 
-    pub(super) fn push(&mut self, sample: &TrainingSample) {
+    pub(super) fn push(
+        &mut self,
+        input: &NNInput,
+        policy_target: &PolicyTarget,
+        win_target: f32,
+        final_score: f32,
+        ownership: &[u8; MAX_BOARD_AREA],
+    ) {
         debug_assert!(
             !self.finished,
             "reset the encoder before pushing more records"
@@ -105,40 +127,28 @@ impl ChunkEncoder {
             "training chunk capacity exceeded"
         );
         let record_start = self.bytes.len();
-        let board_dim = sample.input.board_dim;
+        let board_dim = input.board_dim;
         self.bytes
             .reserve(training_record_size(board_dim) + CHUNK_CHECKSUM_SIZE);
         debug_assert!(
-            !sample.input.include_ownership,
+            !input.include_ownership,
             "ownership requests are inference metadata, not training input"
         );
         self.bytes.push(board_dim as u8);
-        for plane in sample.input.spatial.as_chunks::<MAX_BOARD_AREA>().0 {
+        for plane in input.spatial.as_chunks::<MAX_BOARD_AREA>().0 {
             let cells = active_rows(plane, board_dim).flatten().map(|&value| {
                 debug_assert!(value <= 1, "spatial features must be binary");
                 value
             });
             extend_packed::<1>(&mut self.bytes, cells);
         }
-        extend_f32s(&mut self.bytes, &sample.input.global);
-        extend_f16s(
-            &mut self.bytes,
-            &sample.policy_target[..board_dim * board_dim + 1],
-        );
-        extend_f32s(
-            &mut self.bytes,
-            &[
-                sample.value_target.win_probability,
-                sample.value_target.score_mean,
-                sample.value_target.score_stdev,
-            ],
-        );
-        let ownership = active_rows(&sample.value_target.ownership, board_dim)
-            .flatten()
-            .map(|&value| {
-                debug_assert!(value <= 2, "invalid ownership label");
-                value
-            });
+        extend_f32s(&mut self.bytes, &input.global);
+        extend_f16s(&mut self.bytes, &policy_target[..board_dim * board_dim + 1]);
+        extend_f32s(&mut self.bytes, &[win_target, final_score]);
+        let ownership = active_rows(ownership, board_dim).flatten().map(|&value| {
+            debug_assert!(value <= 2, "invalid ownership label");
+            value
+        });
         extend_packed::<2>(&mut self.bytes, ownership);
         debug_assert_eq!(
             self.bytes.len() - record_start,
@@ -220,24 +230,79 @@ fn chunk_header(record_count: usize) -> [u8; CHUNK_HEADER_SIZE] {
 }
 
 #[cfg(test)]
-/// Test helper for encoding a complete sample slice. Production chunk assembly
-/// encodes records incrementally.
-pub(super) fn encode_chunk(samples: &[TrainingSample]) -> Vec<u8> {
-    let mut encoder = ChunkEncoder::new(samples.len());
-    for sample in samples {
-        encoder.push(sample);
+pub(super) mod test_support {
+    use super::*;
+
+    pub struct ValueTarget {
+        pub win_target: f32,
+        pub final_score: f32,
+        pub ownership: [u8; MAX_BOARD_AREA],
     }
-    encoder.finish().to_vec()
+
+    // Owned snapshots exist only in tests to compare replayed records.
+    pub struct TestSample {
+        pub input: NNInput,
+        pub policy_target: PolicyTarget,
+        pub value_target: ValueTarget,
+    }
+
+    impl TestSample {
+        pub fn push_into(&self, encoder: &mut ChunkEncoder) {
+            encoder.push(
+                &self.input,
+                &self.policy_target,
+                self.value_target.win_target,
+                self.value_target.final_score,
+                &self.value_target.ownership,
+            );
+        }
+    }
+
+    /// Test helper for encoding a complete sample slice. Production chunk assembly
+    /// encodes records incrementally.
+    pub fn encode_chunk(samples: &[TestSample]) -> Vec<u8> {
+        let mut encoder = ChunkEncoder::new(samples.len());
+        for sample in samples {
+            sample.push_into(&mut encoder);
+        }
+        encoder.finish().to_vec()
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::*;
     use super::*;
     use crate::game::board::MAX_BOARD_DIM;
     use crate::game::{game_state::GameState, rules::Rules};
     use crate::inference::policy::MAX_POLICY_SIZE;
 
-    fn sample(board_dim: usize) -> TrainingSample {
+    #[test]
+    fn completed_game_preserves_final_ownership_and_moves_record_storage() {
+        for board_dim in [9, 13, 19] {
+            let mut state = GameState::new(Rules {
+                board_dim,
+                ..Rules::TROMP_TAYLORISH_9
+            });
+            let center = state.board().loc(board_dim / 2, board_dim / 2).unwrap();
+            let mut records = Vec::new();
+            for selected_move in [center, Loc::PASS, Loc::PASS] {
+                records.push(SelfPlayRecord {
+                    player: state.next_player(),
+                    selected_move,
+                    policy_target: [f16::ZERO; MAX_POLICY_SIZE],
+                });
+                assert!(state.play(selected_move));
+            }
+            let allocation = records.as_ptr();
+            let game = CompletedGame::new(&state, records);
+            assert_eq!(game.records.as_ptr(), allocation);
+            assert_eq!(game.final_ownership, state.final_ownership());
+            assert_eq!(game.final_ownership[center.index()], Color::Black);
+        }
+    }
+
+    fn sample(board_dim: usize) -> TestSample {
         let mut input = NNInput::encode(&GameState::new(Rules {
             board_dim,
             ..Rules::TROMP_TAYLORISH_9
@@ -253,15 +318,14 @@ mod tests {
             }
         });
         input.global[1] = -0.0;
-        TrainingSample {
+        TestSample {
             input,
             policy_target: std::array::from_fn(|i| {
                 f16::from_f64(i as f64 / MAX_POLICY_SIZE as f64)
             }),
             value_target: ValueTarget {
-                win_probability: 0.75,
-                score_mean: 3.5,
-                score_stdev: 1.25,
+                win_target: 1.0,
+                final_score: 3.5,
                 ownership: std::array::from_fn(|i| {
                     if i / MAX_BOARD_DIM < board_dim && i % MAX_BOARD_DIM < board_dim {
                         (i % 3) as u8
@@ -313,9 +377,8 @@ mod tests {
                 offset += 2;
             }
             for value in [
-                sample.value_target.win_probability,
-                sample.value_target.score_mean,
-                sample.value_target.score_stdev,
+                sample.value_target.win_target,
+                sample.value_target.final_score,
             ] {
                 assert_eq!(read_f32(&bytes, offset).to_bits(), value.to_bits());
                 offset += 4;
@@ -394,9 +457,9 @@ mod tests {
             );
             assert_eq!(offset, bytes.len());
         }
-        assert_eq!(training_record_size(9), 239);
-        assert_eq!(training_record_size(13), 470);
-        assert_eq!(training_record_size(19), 974);
+        assert_eq!(training_record_size(9), 235);
+        assert_eq!(training_record_size(13), 466);
+        assert_eq!(training_record_size(19), 970);
     }
 
     #[test]
@@ -404,7 +467,7 @@ mod tests {
         for capacity in [3, 5] {
             let mut encoder = ChunkEncoder::new(capacity);
             for board_dim in [9, 3, 5] {
-                encoder.push(&sample(board_dim));
+                sample(board_dim).push_into(&mut encoder);
             }
             assert_eq!(encoder.record_count(), 3);
             let bytes = encoder.finish();
@@ -434,12 +497,12 @@ mod tests {
             let samples: Vec<_> = (0..count)
                 .map(|tag| {
                     let mut sample = sample(board_dim);
-                    sample.value_target.score_mean = tag as f32 + capacity as f32;
+                    sample.value_target.final_score = tag as f32 + capacity as f32;
                     sample
                 })
                 .collect();
             for sample in &samples {
-                encoder.push(sample);
+                sample.push_into(&mut encoder);
             }
             assert_eq!(encoder.record_count(), count);
             assert_eq!(encoder.remaining_capacity(), capacity - count);
@@ -462,13 +525,12 @@ mod tests {
 
     #[test]
     fn chunk_checksum_rejects_corrupted_payload() {
-        let sample = TrainingSample {
+        let sample = TestSample {
             input: NNInput::encode(&GameState::new(Rules::TROMP_TAYLORISH_9)),
             policy_target: [f16::from_f32(0.25); MAX_POLICY_SIZE],
             value_target: ValueTarget {
-                win_probability: 0.75,
-                score_mean: 3.5,
-                score_stdev: 1.25,
+                win_target: 1.0,
+                final_score: 3.5,
                 ownership: [2; MAX_BOARD_AREA],
             },
         };

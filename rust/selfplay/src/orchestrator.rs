@@ -6,9 +6,10 @@ use std::thread;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use super::{
-    chunk_writer::{ChunkWriter, ChunkWriterError, CompletedGame},
+    chunk_writer::{ChunkWriter, ChunkWriterError},
     config::SelfPlayConfig,
     control::EventPublisher,
+    training_data::CompletedGame,
     worker::{SelfPlayError, WorkerModelControl},
 };
 use crate::inference::runtime::{

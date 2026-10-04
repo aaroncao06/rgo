@@ -13,9 +13,14 @@ use tokio::sync::oneshot;
 
 use super::*;
 use crate::{
+    game::board::Loc,
     game::{game_state::GameState, rules::Rules},
     inference::{inputs::NNInput, policy::MAX_POLICY_SIZE},
-    training_data::{ValueTarget, encode_chunk, verify_chunk_checksum},
+    training_data::{
+        SelfPlayRecord,
+        test_support::{TestSample, ValueTarget, encode_chunk},
+        verify_chunk_checksum,
+    },
 };
 
 static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
@@ -51,23 +56,88 @@ impl Drop for TestDir {
     }
 }
 
-fn sample(dim: usize, tag: usize) -> TrainingSample {
-    let mut rules = Rules::TROMP_TAYLORISH_9;
-    rules.board_dim = dim;
-    TrainingSample {
-        input: NNInput::encode(&GameState::new(rules)),
-        policy_target: [half::f16::from_f32(tag as f32); MAX_POLICY_SIZE],
-        value_target: ValueTarget {
-            win_probability: 0.5,
-            score_mean: tag as f32,
-            score_stdev: 1.0,
-            ownership: [1; crate::game::board::MAX_BOARD_AREA],
-        },
-    }
+// Build real completed games and independent snapshots of each pre-move input.
+fn game(dim: usize, tags: &[usize]) -> (CompletedGame, Vec<TestSample>) {
+    assert!(tags.len() >= 2);
+    let rules = Rules {
+        board_dim: dim,
+        ..Rules::TROMP_TAYLORISH_9
+    };
+    let state = GameState::new(rules);
+    let moves: Vec<_> = (0..tags.len())
+        .map(|index| {
+            if index + 2 >= tags.len() {
+                Loc::PASS
+            } else {
+                state.board().loc(index, 0).unwrap()
+            }
+        })
+        .collect();
+    game_with_moves(rules, &moves, tags)
 }
 
-fn game(samples: Vec<TrainingSample>) -> CompletedGame {
-    CompletedGame { samples }
+fn game_with_moves(
+    rules: Rules,
+    moves: &[Loc],
+    tags: &[usize],
+) -> (CompletedGame, Vec<TestSample>) {
+    assert_eq!(moves.len(), tags.len());
+    let mut state = GameState::new(rules);
+    let mut records = Vec::new();
+    let mut samples = Vec::new();
+    for (&selected_move, &tag) in moves.iter().zip(tags) {
+        let policy_target = [half::f16::from_f32(tag as f32); MAX_POLICY_SIZE];
+        samples.push(TestSample {
+            input: NNInput::encode(&state),
+            policy_target,
+            value_target: ValueTarget {
+                win_target: 0.5,
+                final_score: 0.0,
+                ownership: [1; crate::game::board::MAX_BOARD_AREA],
+            },
+        });
+        records.push(SelfPlayRecord {
+            player: state.next_player(),
+            selected_move,
+            policy_target,
+        });
+        assert!(state.play(selected_move));
+    }
+    let white_score = state.final_score_white_minus_black();
+    let game = CompletedGame::new(&state, records);
+    for (sample, record) in samples.iter_mut().zip(&game.records) {
+        let score = if record.player == Player::White {
+            white_score
+        } else {
+            -white_score
+        };
+        sample.value_target.final_score = score;
+        sample.value_target.win_target = if score > 0.0 {
+            1.0
+        } else if score < 0.0 {
+            0.0
+        } else {
+            0.5
+        };
+        // Derive expected labels from the finished board independently of the
+        // writer's perspective-conversion helper.
+        for loc in state.board().locs() {
+            let color = game.final_ownership[loc.index()];
+            let own_color = match record.player {
+                Player::Black => Color::Black,
+                Player::White => Color::White,
+            };
+            sample.value_target.ownership[loc_to_spatial(state.board(), loc)] =
+                if color == Color::Empty {
+                    1
+                } else if color == own_color {
+                    2
+                } else {
+                    0
+                };
+        }
+    }
+    (game, samples)
 }
 
 // Checks that each announcement names a complete file before acknowledging it.
@@ -210,10 +280,9 @@ async fn per_game_publishes_without_waiting_for_queue_closure_or_splitting() {
         rx,
         EventPublisher::with_output(output),
     ));
-    for (dim, length) in [(9, 1), (13, 3), (19, 2)] {
-        let samples: Vec<_> = (0..length).map(|tag| sample(dim, tag)).collect();
+    for (dim, tags) in [(9, vec![0, 1]), (13, vec![0, 1, 2]), (19, vec![0, 1, 2, 3])] {
+        let (game, samples) = game(dim, &tags);
         let expected = encode_chunk(&samples);
-        let game = game(samples);
         tx.send(game).await.unwrap();
         assert_chunk(&next_event(&mut events).await, &expected);
     }
@@ -229,39 +298,39 @@ async fn fixed_chunks_combine_games_and_flush_a_partial_chunk() {
     let (tx, rx) = mpsc::channel(1);
     let (output, mut events) = event_output();
     let writer = RunningWriter::start(ChunkWriter::new(
-        ChunkMode::FixedRecords(3),
+        ChunkMode::FixedRecords(5),
         dir.0.clone(),
         rx,
         EventPublisher::with_output(output),
     ));
     let mut expected_samples = Vec::new();
-    for (dim, tag) in [(9, 1), (13, 2)] {
-        let game = game(vec![sample(dim, tag)]);
+    for (dim, tags) in [(9, [0, 1]), (13, [2, 3])] {
+        let (game, samples) = game(dim, &tags);
         tx.send(game).await.unwrap();
-        expected_samples.push(sample(dim, tag));
+        expected_samples.extend(samples);
     }
     assert!(events.try_recv().is_err());
-    // The next game fills the old chunk from its tail, leaving one sample for
-    // the final partial chunk. Neither dimension nor game boundaries split it.
-    let game = game(vec![sample(19, 3), sample(19, 4)]);
+    // The next game's first move fills the old chunk; its remaining moves
+    // become the final partial chunk, preserving chronological replay order.
+    let (game, samples) = game(19, &[4, 5, 6]);
     tx.send(game).await.unwrap();
-    expected_samples.push(sample(19, 4));
+    expected_samples.extend(samples);
     assert_chunk(
         &next_event(&mut events).await,
-        &encode_chunk(&expected_samples),
+        &encode_chunk(&expected_samples[..5]),
     );
     assert!(events.try_recv().is_err());
     drop(tx);
     writer.finish().await.unwrap();
     assert_chunk(
         &next_event(&mut events).await,
-        &encode_chunk(&[sample(19, 3)]),
+        &encode_chunk(&expected_samples[5..]),
     );
     assert_eq!(dir.files().len(), 2);
 }
 
 #[tokio::test]
-async fn fixed_chunks_split_a_game_preserving_existing_tail_order() {
+async fn fixed_chunks_split_a_game_in_chronological_order() {
     let dir = TestDir::new();
     let (tx, rx) = mpsc::channel(1);
     let (output, mut events) = event_output();
@@ -271,20 +340,69 @@ async fn fixed_chunks_split_a_game_preserving_existing_tail_order() {
         rx,
         EventPublisher::with_output(output),
     ));
-    let samples: Vec<_> = (0..5).map(|tag| sample(9, tag)).collect();
-    let game = game(samples);
+    let (game, samples) = game(9, &[0, 1, 2, 3, 4]);
     tx.send(game).await.unwrap();
-    for tags in [[3, 4], [1, 2]] {
-        let expected: Vec<_> = tags.map(|tag| sample(9, tag)).into();
-        assert_chunk(&next_event(&mut events).await, &encode_chunk(&expected));
+    for chunk in samples[..4].chunks(2) {
+        assert_chunk(&next_event(&mut events).await, &encode_chunk(chunk));
     }
     drop(tx);
     writer.finish().await.unwrap();
-    assert_chunk(
-        &next_event(&mut events).await,
-        &encode_chunk(&[sample(9, 0)]),
-    );
+    assert_chunk(&next_event(&mut events).await, &encode_chunk(&samples[4..]));
     assert_eq!(dir.files().len(), 3);
+}
+
+#[test]
+fn replay_encodes_ko_history_passes_and_rule_features_for_all_board_dims() {
+    for board_dim in [9, 13, 19] {
+        let rules = Rules {
+            board_dim,
+            komi: board_dim as f32 + 0.5,
+            multi_stone_suicide_legal: board_dim != 13,
+        };
+        let state = GameState::new(rules);
+        let moves: Vec<_> = [
+            (4, 3),
+            (4, 4),
+            (3, 4),
+            (4, 6),
+            (5, 4),
+            (3, 5),
+            (0, 0),
+            (5, 5),
+            (4, 5),
+        ]
+        .into_iter()
+        .map(|(x, y)| state.board().loc(x, y).unwrap())
+        .chain([Loc::PASS, Loc::PASS])
+        .collect();
+        let tags: Vec<_> = (0..moves.len()).collect();
+        let (game, samples) = game_with_moves(rules, &moves, &tags);
+        let recapture = crate::inference::policy::loc_to_spatial(
+            state.board(),
+            state.board().loc(4, 4).unwrap(),
+        );
+        assert_eq!(
+            samples[9].input.spatial[2 * crate::game::board::MAX_BOARD_AREA + recapture],
+            1
+        );
+        assert_eq!(samples[10].input.global[1], 1.0);
+        assert_eq!(samples[0].input.global[0], -rules.komi);
+        assert_eq!(samples[1].input.global[0], rules.komi);
+        let dir = TestDir::new();
+        let (tx, rx) = mpsc::channel(1);
+        let (output, mut events) = event_output();
+        tx.try_send(game).unwrap();
+        drop(tx);
+        ChunkWriter::new(
+            ChunkMode::PerGame,
+            dir.0.clone(),
+            rx,
+            EventPublisher::with_output(output),
+        )
+        .run()
+        .unwrap();
+        assert_chunk(&events.try_recv().unwrap(), &encode_chunk(&samples));
+    }
 }
 
 #[test]
@@ -295,16 +413,10 @@ fn repeated_games_reuse_the_encoder() {
         let (output, mut events) = event_output();
         let mut writer =
             ChunkWriter::new(mode, dir.0.clone(), rx, EventPublisher::with_output(output));
-        for _ in 0..4 {
-            let game = game((0..3).map(|tag| sample(19, tag)).collect());
-            match mode {
-                ChunkMode::PerGame => writer.append_game_per_game(game).unwrap(),
-                ChunkMode::FixedRecords(records) => {
-                    writer.append_game_fixed(game, records).unwrap()
-                }
-            }
-            let expected: Vec<_> = (0..3).map(|tag| sample(19, tag)).collect();
-            assert_chunk(&events.try_recv().unwrap(), &encode_chunk(&expected));
+        for dim in [19, 9, 13, 19] {
+            let (game, samples) = game(dim, &[0, 1, 2]);
+            writer.append_game(game).unwrap();
+            assert_chunk(&events.try_recv().unwrap(), &encode_chunk(&samples));
         }
         assert_eq!(dir.files().len(), 4);
     }
@@ -323,12 +435,12 @@ async fn restarting_after_deletion_does_not_reuse_chunk_ids() {
             rx,
             EventPublisher::with_output(output),
         ));
-        let game = game(vec![sample(9, 0)]);
+        let (game, samples) = game(9, &[0, 1]);
         tx.send(game).await.unwrap();
         drop(tx);
         writer.finish().await.unwrap();
         let event = next_event(&mut events).await;
-        assert_chunk(&event, &encode_chunk(&[sample(9, 0)]));
+        assert_chunk(&event, &encode_chunk(&samples));
         let path = PathBuf::from(event["path"].as_str().unwrap());
         fs::remove_file(&path).unwrap();
         paths.push(path);
@@ -338,13 +450,13 @@ async fn restarting_after_deletion_does_not_reuse_chunk_ids() {
 
 #[test]
 fn file_failure_closes_the_queue_and_cancels_queued_games() {
-    for mode in [ChunkMode::PerGame, ChunkMode::FixedRecords(1)] {
+    for mode in [ChunkMode::PerGame, ChunkMode::FixedRecords(2)] {
         let dir = TestDir::new();
         fs::create_dir(dir.0.join(PENDING_CHUNK_FILE)).unwrap();
         let (tx, rx) = mpsc::channel(2);
         let (output, mut events) = event_output();
-        let first = game(vec![sample(9, 0)]);
-        let second = game(vec![sample(9, 1)]);
+        let (first, _) = game(9, &[0, 1]);
+        let (second, _) = game(9, &[2, 3]);
         tx.try_send(first).unwrap();
         tx.try_send(second).unwrap();
         let result =
@@ -385,8 +497,8 @@ fn notification_failure_is_reported_after_file_publication() {
     for fail_on_flush in [false, true] {
         let dir = TestDir::new();
         let (tx, rx) = mpsc::channel(2);
-        let first = game(vec![sample(9, 0)]);
-        let second = game(vec![sample(9, 1)]);
+        let (first, first_samples) = game(9, &[0, 1]);
+        let (second, _) = game(9, &[2, 3]);
         tx.try_send(first).unwrap();
         tx.try_send(second).unwrap();
         let result = ChunkWriter::new(
@@ -412,13 +524,13 @@ fn notification_failure_is_reported_after_file_publication() {
         assert!(tx.is_closed());
         let files = dir.files();
         assert_eq!(files.len(), 1);
-        assert_eq!(fs::read(&files[0]).unwrap(), encode_chunk(&[sample(9, 0)]));
+        assert_eq!(fs::read(&files[0]).unwrap(), encode_chunk(&first_samples));
     }
 }
 
 #[tokio::test]
 async fn blocked_publication_backpressures_producers_when_the_queue_is_full() {
-    for mode in [ChunkMode::PerGame, ChunkMode::FixedRecords(1)] {
+    for mode in [ChunkMode::PerGame, ChunkMode::FixedRecords(2)] {
         let dir = TestDir::new();
         let (tx, rx) = mpsc::channel(1);
         let (mut output, mut events) = event_output();
@@ -431,16 +543,16 @@ async fn blocked_publication_backpressures_producers_when_the_queue_is_full() {
             rx,
             EventPublisher::with_output(output),
         ));
-        let first = game(vec![sample(9, 0)]);
+        let (first, first_samples) = game(9, &[0, 1]);
         tx.send(first).await.unwrap();
         tokio::time::timeout(TIMEOUT, reached_rx)
             .await
             .unwrap()
             .unwrap();
-        let second = game(vec![sample(9, 1)]);
+        let (second, second_samples) = game(9, &[2, 3]);
         tx.send(second).await.unwrap();
         assert!(matches!(
-            tx.try_send(game(vec![sample(9, 2)])),
+            tx.try_send(game(9, &[4, 5]).0),
             Err(mpsc::error::TrySendError::Full(_))
         ));
         drop(tx);
@@ -451,12 +563,12 @@ async fn blocked_publication_backpressures_producers_when_the_queue_is_full() {
         release_tx.send(()).unwrap();
         assert_chunk(
             &next_event(&mut events).await,
-            &encode_chunk(&[sample(9, 0)]),
+            &encode_chunk(&first_samples),
         );
         writer.finish().await.unwrap();
         assert_chunk(
             &next_event(&mut events).await,
-            &encode_chunk(&[sample(9, 1)]),
+            &encode_chunk(&second_samples),
         );
     }
 }
@@ -475,7 +587,7 @@ async fn a_split_game_resumes_encoding_after_blocked_publication() {
         rx,
         EventPublisher::with_output(output),
     ));
-    let game = game((0..5).map(|tag| sample(9, tag)).collect());
+    let (game, samples) = game(9, &[0, 1, 2, 3, 4]);
     tx.send(game).await.unwrap();
     drop(tx);
     tokio::time::timeout(TIMEOUT, reached_rx)
@@ -486,9 +598,8 @@ async fn a_split_game_resumes_encoding_after_blocked_publication() {
     assert_eq!(dir.files().len(), 1);
     release_tx.send(()).unwrap();
     writer.finish().await.unwrap();
-    for tags in [vec![3, 4], vec![1, 2], vec![0]] {
-        let samples: Vec<_> = tags.into_iter().map(|tag| sample(9, tag)).collect();
-        assert_chunk(&next_event(&mut events).await, &encode_chunk(&samples));
+    for chunk in samples.chunks(2) {
+        assert_chunk(&next_event(&mut events).await, &encode_chunk(chunk));
     }
 }
 
@@ -497,7 +608,7 @@ fn final_partial_chunk_publication_errors_are_propagated() {
     let dir = TestDir::new();
     fs::create_dir(dir.0.join(PENDING_CHUNK_FILE)).unwrap();
     let (tx, rx) = mpsc::channel(1);
-    let game = game(vec![sample(9, 0)]);
+    let (game, _) = game(9, &[0, 1]);
     tx.try_send(game).unwrap();
     drop(tx);
     let result = ChunkWriter::new(
@@ -509,4 +620,96 @@ fn final_partial_chunk_publication_errors_are_propagated() {
     .run();
     assert!(matches!(result, Err(ChunkWriterError::Io(_))));
     assert_eq!(dir.files(), [dir.0.join(PENDING_CHUNK_FILE)]);
+}
+
+#[test]
+fn ownership_labels_use_each_players_perspective_and_neutral_padding() {
+    for dim in [9, 13, 19] {
+        let board = Board::new(dim);
+        let mut final_ownership = [Color::Wall; BOARD_STORAGE_LEN];
+        for loc in board.locs() {
+            final_ownership[loc.index()] = Color::Empty;
+        }
+        let black = board.loc(0, 0).unwrap();
+        let white = board.loc(dim - 1, dim - 1).unwrap();
+        final_ownership[black.index()] = Color::Black;
+        final_ownership[white.index()] = Color::White;
+        for player in [Player::Black, Player::White] {
+            let mut expected = [1; MAX_BOARD_AREA];
+            expected[loc_to_spatial(&board, black)] = if player == Player::Black { 2 } else { 0 };
+            expected[loc_to_spatial(&board, white)] = if player == Player::White { 2 } else { 0 };
+            assert_eq!(
+                ownership_for_player(&board, &final_ownership, player),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn chunk_values_use_final_area_and_komi_in_each_players_perspective() {
+    use crate::inference::inputs::{NUM_GLOBAL_FEATURES, NUM_SPATIAL_FEATURES};
+    use crate::training_data::{CHUNK_HEADER_SIZE, training_record_size};
+
+    for board_dim in [9, 13, 19] {
+        let board = Board::new(board_dim);
+        let center = board.loc(board_dim / 2, board_dim / 2).unwrap();
+        let area = (board_dim * board_dim) as f32;
+        for (moves, komi, white_score) in [
+            (vec![Loc::PASS, Loc::PASS], -7.5, -7.5),
+            (vec![Loc::PASS, Loc::PASS], 0.0, 0.0),
+            (vec![Loc::PASS, Loc::PASS], 7.5, 7.5),
+            (vec![center, Loc::PASS, Loc::PASS], 7.5, 7.5 - area),
+            (
+                vec![Loc::PASS, center, Loc::PASS, Loc::PASS],
+                7.5,
+                7.5 + area,
+            ),
+        ] {
+            let rules = Rules {
+                board_dim,
+                komi,
+                ..Rules::TROMP_TAYLORISH_9
+            };
+            let tags: Vec<_> = (0..moves.len()).collect();
+            let (game, samples) = game_with_moves(rules, &moves, &tags);
+            let dir = TestDir::new();
+            let (_tx, rx) = mpsc::channel(1);
+            let (output, mut events) = event_output();
+            let mut writer = ChunkWriter::new(
+                ChunkMode::PerGame,
+                dir.0.clone(),
+                rx,
+                EventPublisher::with_output(output),
+            );
+            writer.append_game(game).unwrap();
+            let event = events.try_recv().unwrap();
+            assert_chunk(&event, &encode_chunk(&samples));
+            let bytes = fs::read(event["path"].as_str().unwrap()).unwrap();
+            let values_offset = 1
+                + NUM_SPATIAL_FEATURES * (board_dim * board_dim).div_ceil(8)
+                + NUM_GLOBAL_FEATURES * size_of::<f32>()
+                + (board_dim * board_dim + 1) * size_of::<half::f16>();
+            for index in 0..moves.len() {
+                let offset =
+                    CHUNK_HEADER_SIZE + index * training_record_size(board_dim) + values_offset;
+                let win = f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+                let score = f32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+                let expected_score = if index % 2 == 0 {
+                    -white_score
+                } else {
+                    white_score
+                };
+                let expected_win = if expected_score > 0.0 {
+                    1.0
+                } else if expected_score < 0.0 {
+                    0.0
+                } else {
+                    0.5
+                };
+                assert_eq!(score, expected_score);
+                assert_eq!(win, expected_win);
+            }
+        }
+    }
 }

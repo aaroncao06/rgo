@@ -2,7 +2,7 @@
 //! reduced-weight/LCB adjustments, and temperature sampling.
 
 use super::{
-    PolicyTarget, SearchError, SearchResult, SearchValueTarget, SearchWorker,
+    PolicyTarget, SearchError, SearchResult, SearchWorker,
     selection_policy::{exploration_scaling, selection_value},
 };
 use crate::{
@@ -11,7 +11,7 @@ use crate::{
         game_state::GameState,
     },
     inference::policy::loc_to_policy,
-    search::{move_selection, node::SearchNode, node_store::NodeStore, root_policy},
+    search::{move_selection, node_store::NodeStore, root_policy},
 };
 use rand::Rng;
 
@@ -55,16 +55,9 @@ impl<N: NodeStore> SearchWorker<N> {
             rng,
         )];
         let policy_target = normalized_policy_target(game_state.board(), &moves, &policy_weights);
-        let root = self
-            .search_graph
-            .root
-            .as_ref()
-            .expect("search result requires an active game");
-        let value_target = search_value_target(&root.node, root.game_state.next_player());
         Ok(SearchResult {
             selected_move,
             policy_target,
-            value_target,
         })
     }
 
@@ -295,22 +288,6 @@ fn normalized_policy_target(board: &Board, moves: &[Loc], weights: &[f64]) -> Po
         target[loc_to_policy(board, move_loc)] = half::f16::from_f64(weight / weight_sum);
     }
     target
-}
-
-fn search_value_target(node: &SearchNode, player: Player) -> SearchValueTarget {
-    let white_win_probability = node.white_win_rate();
-    let white_score_mean = node.white_score_mean();
-    let score_variance =
-        (node.white_score_mean_sq() - white_score_mean * white_score_mean).max(0.0);
-    let (win_probability, score_mean) = match player {
-        Player::White => (white_win_probability, white_score_mean),
-        Player::Black => (1.0 - white_win_probability, -white_score_mean),
-    };
-    SearchValueTarget {
-        win_probability: win_probability as f32,
-        score_mean: score_mean as f32,
-        score_stdev: score_variance.sqrt() as f32,
-    }
 }
 
 #[cfg(test)]

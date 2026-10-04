@@ -235,7 +235,7 @@ mod unix {
                 assert_eq!(bytes[offset], 9);
                 offset += 1
                     + 3 * 81_usize.div_ceil(8)
-                    + (2 + 3) * 4
+                    + (2 + 2) * 4
                     + 82 * 2
                     + (2 * 81_usize).div_ceil(8);
             }
