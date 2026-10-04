@@ -1,11 +1,15 @@
 use crate::inference::{SUPPORTED_BOARD_DIMS, onnx::InferenceDevice};
 use std::path::PathBuf;
 
-/// Device and batch limit for one backend/executor thread.
+/// Device and session settings for one backend/executor thread.
 #[derive(Debug, Clone, Copy, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutorConfig {
     pub device: InferenceDevice,
+    /// ONNX Runtime CPU threads per operator, including CPU fallback work.
+    /// Defaults to one to avoid multiplying thread pools across executors.
+    #[serde(default = "default_intra_threads")]
+    pub intra_threads: usize,
     /// Maximum positions per 19×19 batch. Smaller boards scale by active area:
     /// floor(base_batch_size * 361 / board_dim²). This bounds input volume,
     /// not model compute, which can scale differently with board dimensions.
@@ -25,9 +29,19 @@ pub struct ModelRuntimeConfig {
 
 impl ExecutorConfig {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self.intra_threads == 0 {
+            return Err("executor intra_threads must be positive");
+        }
+        if self.intra_threads > i32::MAX as usize {
+            return Err("executor intra_threads exceeds ONNX Runtime's i32 limit");
+        }
         batch_sizes(self.base_batch_size)?;
         self.device.validate()
     }
+}
+
+fn default_intra_threads() -> usize {
+    1
 }
 
 /// Limits in SUPPORTED_BOARD_DIMS order, computed before batch dispatch.

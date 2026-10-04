@@ -450,7 +450,8 @@ mod tests {
         ModelRuntimeConfig {
             model_dir: PathBuf::from("unused-models"),
             executors: vec![crate::inference::runtime::ExecutorConfig {
-                device: crate::inference::onnx::InferenceDevice::Cpu { intra_threads: 1 },
+                device: crate::inference::onnx::InferenceDevice::Cpu {},
+                intra_threads: 1,
                 base_batch_size: 4,
             }],
             cache_capacity: 64,

@@ -3,10 +3,18 @@ use crate::game::board::{MAX_BOARD_AREA, Player};
 use crate::inference::inputs::NNInput;
 use crate::inference::policy::MAX_POLICY_SIZE;
 
+fn cpu_config() -> ExecutorConfig {
+    ExecutorConfig {
+        device: InferenceDevice::Cpu {},
+        intra_threads: 1,
+        base_batch_size: 8,
+    }
+}
+
 fn backend() -> OnnxBackend {
     OnnxBackend::load(
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/v0.onnx"),
-        InferenceDevice::Cpu { intra_threads: 1 },
+        cpu_config(),
     )
     .unwrap()
 }
@@ -129,14 +137,14 @@ fn rejects_incompatible_contract_metadata() {
 #[test]
 fn rejects_incompatible_input_shape() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/wrong_shape.onnx");
-    assert!(OnnxBackend::load(&path, InferenceDevice::Cpu { intra_threads: 1 }).is_err());
+    assert!(OnnxBackend::load(&path, cpu_config()).is_err());
 }
 
 #[test]
 fn rejects_runtime_output_shapes_that_omit_pass() {
     use crate::game::{game_state::GameState, rules::Rules};
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/wrong_output.onnx");
-    let mut backend = OnnxBackend::load(&path, InferenceDevice::Cpu { intra_threads: 1 }).unwrap();
+    let mut backend = OnnxBackend::load(&path, cpu_config()).unwrap();
     let input = NNInput::encode(&GameState::new(Rules {
         board_dim: 5,
         ..Rules::default()
@@ -154,23 +162,53 @@ fn rejects_runtime_output_shapes_that_omit_pass() {
 #[test]
 fn unavailable_cuda_returns_an_error_instead_of_falling_back_to_cpu() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/v0.onnx");
-    assert!(OnnxBackend::load(&path, InferenceDevice::Cuda { device_id: 0 }).is_err());
+    assert!(
+        OnnxBackend::load(
+            &path,
+            ExecutorConfig {
+                device: InferenceDevice::Cuda { device_id: 0 },
+                ..cpu_config()
+            }
+        )
+        .is_err()
+    );
 }
 
 #[test]
-fn invalid_device_settings_return_errors_before_loading() {
+fn invalid_executor_settings_return_errors_before_loading() {
     let path = std::path::Path::new("unused.onnx");
-    for (device, message) in [
+    for (config, message) in [
         (
-            InferenceDevice::Cpu { intra_threads: 0 },
-            "CPU intra_threads must be positive",
+            ExecutorConfig {
+                intra_threads: 0,
+                ..cpu_config()
+            },
+            "executor intra_threads must be positive",
         ),
         (
-            InferenceDevice::Cuda { device_id: -1 },
+            ExecutorConfig {
+                intra_threads: i32::MAX as usize + 1,
+                ..cpu_config()
+            },
+            "executor intra_threads exceeds ONNX Runtime's i32 limit",
+        ),
+        (
+            ExecutorConfig {
+                device: InferenceDevice::Cuda { device_id: 0 },
+                intra_threads: 0,
+                ..cpu_config()
+            },
+            "executor intra_threads must be positive",
+        ),
+        (
+            ExecutorConfig {
+                device: InferenceDevice::Cuda { device_id: -1 },
+                ..cpu_config()
+            },
             "CUDA device_id must be nonnegative",
         ),
     ] {
-        let error = OnnxBackend::load(path, device)
+        let error = OnnxBackend::load(path, config)
             .err()
             .expect("invalid device must be rejected");
         assert!(error.to_string().contains(message));

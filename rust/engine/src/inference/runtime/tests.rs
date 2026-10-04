@@ -14,7 +14,8 @@ fn onnx_runtime_config() -> ModelRuntimeConfig {
         model_dir: PathBuf::from("unused-models"),
         executors: [1, 4]
             .map(|base_batch_size| ExecutorConfig {
-                device: crate::inference::onnx::InferenceDevice::Cpu { intra_threads: 1 },
+                device: crate::inference::onnx::InferenceDevice::Cpu {},
+                intra_threads: 1,
                 base_batch_size,
             })
             .into(),
@@ -111,6 +112,7 @@ fn load_rejects_unsupported_cuda_before_starting_executors() {
     let mut config = models.config();
     config.executors.push(ExecutorConfig {
         device: crate::inference::onnx::InferenceDevice::Cuda { device_id: 0 },
+        intra_threads: 1,
         base_batch_size: 8,
     });
     assert!(matches!(
@@ -311,7 +313,11 @@ async fn an_executor_drains_requests_through_the_dynamic_onnx_model() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/v0.onnx");
         let backend = OnnxBackend::load(
             &path,
-            crate::inference::onnx::InferenceDevice::Cpu { intra_threads: 1 },
+            ExecutorConfig {
+                device: crate::inference::onnx::InferenceDevice::Cpu {},
+                intra_threads: 1,
+                base_batch_size: 4,
+            },
         )
         .unwrap();
         InferenceExecutor::new(queue, backend, 4).run();

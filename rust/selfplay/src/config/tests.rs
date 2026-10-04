@@ -13,8 +13,9 @@ fn example_reuses_algorithm_defaults() {
     assert!(matches!(config.chunk, ChunkMode::PerGame));
     assert!(matches!(
         config.inference.executors[0].device,
-        InferenceDevice::Cpu { intra_threads: 1 }
+        InferenceDevice::Cpu {}
     ));
+    assert_eq!(config.inference.executors[0].intra_threads, 1);
     let mut rng = SmallRng::seed_from_u64(0);
     assert_eq!(
         config.self_play.search_budget_policy.sample(&mut rng),
@@ -80,7 +81,8 @@ fn unknown_fields_are_errors_at_every_level() {
     for source in [
         format!("misspelled = 1\n{EXAMPLE}"),
         EXAMPLE.replace("cache_capacity = 65536", "cache_capcity = 65536"),
-        EXAMPLE.replace("intra_threads = 1", "intra_threads = 1, typo = 2"),
+        EXAMPLE.replace("intra_threads = 1", "intra_threads = 1\ntypo = 2"),
+        EXAMPLE.replace("type = \"cpu\"", "type = \"cpu\", typo = 2"),
         EXAMPLE.replace("mode = \"per_game\"", "mode = \"per_game\", typo = 2"),
         format!("{EXAMPLE}\n[self_play]\ntypo = true\n"),
         format!("{EXAMPLE}\n[self_play.rules]\ntypo = true\n"),
@@ -106,6 +108,7 @@ fn invalid_operational_settings_return_errors_without_panicking() {
             &format!("base_batch_size = {}", usize::MAX),
         ),
         EXAMPLE.replace("intra_threads = 1", "intra_threads = 0"),
+        EXAMPLE.replace("intra_threads = 1", "intra_threads = 2147483648"),
         EXAMPLE.replace(
             "mode = \"per_game\"",
             "mode = \"fixed_records\", records = 0",
@@ -188,10 +191,7 @@ fn self_play_rejects_budgets_beyond_the_fixed_arena_index_range() {
 
 #[test]
 fn cuda_device_configuration_is_feature_gated() {
-    let source = EXAMPLE.replace(
-        "type = \"cpu\", intra_threads = 1",
-        "type = \"cuda\", device_id = 0",
-    );
+    let source = EXAMPLE.replace("type = \"cpu\"", "type = \"cuda\", device_id = 0");
     if cfg!(feature = "cuda") {
         assert!(SelfPlayConfig::from_toml(&source).is_ok());
     } else {
@@ -203,6 +203,34 @@ fn cuda_device_configuration_is_feature_gated() {
     assert!(matches!(
         SelfPlayConfig::from_toml(&source.replace("device_id = 0", "device_id = -1")),
         Err(ConfigError::Invalid(_))
+    ));
+}
+
+#[test]
+fn executor_threads_default_to_one_and_allow_an_override() {
+    let omitted = EXAMPLE.replace("intra_threads = 1\n", "");
+    assert_eq!(
+        SelfPlayConfig::from_toml(&omitted)
+            .unwrap()
+            .inference
+            .executors[0]
+            .intra_threads,
+        1
+    );
+    assert_eq!(
+        SelfPlayConfig::from_toml(&EXAMPLE.replace("intra_threads = 1", "intra_threads = 3"))
+            .unwrap()
+            .inference
+            .executors[0]
+            .intra_threads,
+        3
+    );
+    // Session settings belong on the executor, including for CPU devices.
+    assert!(matches!(
+        SelfPlayConfig::from_toml(
+            &omitted.replace("type = \"cpu\"", "type = \"cpu\", intra_threads = 3")
+        ),
+        Err(ConfigError::Parse(_))
     ));
 }
 

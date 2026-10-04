@@ -38,10 +38,13 @@ The `[inference]` table contains:
   example uses 65,536 entries and 16 shards; both must be powers of two, with
   the shard count no larger than the capacity.
 - `executors`: one or more `[[inference.executors]]` entries. Each executor has
-  a `device` and positive `base_batch_size`.
+  a `device`, positive `base_batch_size`, and optional `intra_threads`.
 
-CPU devices use `device = { type = "cpu", intra_threads = 1 }`; the intra-op
-thread count must be positive. CUDA devices use
+`intra_threads` is a session setting on each executor, defaults to 1, and must
+be between 1 and 2,147,483,647. It controls ONNX Runtime CPU work, including CPU
+fallback operations for GPU providers; it does not control GPU kernel threads.
+
+CPU devices use `device = { type = "cpu" }`. CUDA devices use
 `device = { type = "cuda", device_id = 0 }` and require a CUDA-enabled build
 and compatible ONNX Runtime. Device IDs must be nonnegative.
 

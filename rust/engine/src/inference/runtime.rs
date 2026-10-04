@@ -293,7 +293,7 @@ impl ModelRuntime {
             let queue = queue.clone();
             let startup_tx = startup_tx.clone();
             executor_threads.push(std::thread::spawn(move || {
-                match OnnxBackend::load(&path, executor.device) {
+                match OnnxBackend::load(&path, executor) {
                     Ok(backend) => {
                         let _ = startup_tx.send(Ok(()));
                         drop(startup_tx);
