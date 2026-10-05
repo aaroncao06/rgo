@@ -441,8 +441,8 @@ mod tests {
             runtime::{start_test_runtime, test_backend_factory},
         },
         search::{params::SearchParams, worker::SearchBudget},
-        training_data::verify_chunk_checksum,
     };
+    use rgo_artifacts::chunk::verify_chunk_checksum;
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
 

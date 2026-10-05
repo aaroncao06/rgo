@@ -146,7 +146,8 @@ belong to the engine. See the
 ## Project layout
 
 - [`rust/artifacts`](rust/artifacts/src/lib.rs): shared model/chunk identities
-  and filename conventions.
+  and filename conventions, plus the binary chunk schema, record sizes, header
+  encoding, and checksum verification.
 - [`rust/engine`](rust/engine/src/lib.rs): reusable board, inference, and search
   library, independent of self-play.
 - [`rust/selfplay`](rust/selfplay/src/main.rs): process configuration, game
@@ -158,7 +159,8 @@ defined in [SearchParams](rust/engine/src/search/params.rs); they follow a
 selected KataGo self-play baseline rather than implementing all KataGo
 features. Training chunks store compact inputs, FP16 policies, and
 player-relative final win/score/ownership labels. The initial chunk layout is
-still under development; its encoder is in
+still under development; the shared schema is in
+[rgo-artifacts::chunk](rust/artifacts/src/chunk.rs), and its self-play encoder is in
 [training_data.rs](rust/selfplay/src/training_data.rs).
 
 ## License and acknowledgments

@@ -153,7 +153,8 @@ SHA-256 checksum over the header and records. The header contains the
 Packed cells occupy the least significant bits first; unused high bits are
 zero. Only active board cells are stored. Records occupy 235 bytes at 9x9,
 466 at 13x13, or 970 at 19x19. The layout is still under development; refer to
-the [encoder](../rust/selfplay/src/training_data.rs) for the current definition.
+the [shared schema](../rust/artifacts/src/chunk.rs) and the
+[encoder](../rust/selfplay/src/training_data.rs) for the current definition.
 
 ## Commands and events
 

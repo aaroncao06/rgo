@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use rgo_artifacts::chunk::verify_chunk_checksum;
 use rgo_artifacts::{CHUNK_FILE_PREFIX, CHUNK_FILE_SUFFIX};
 use serde_json::Value;
 use tokio::sync::oneshot;
@@ -19,7 +20,6 @@ use crate::{
     training_data::{
         SelfPlayRecord,
         test_support::{TestSample, ValueTarget, encode_chunk},
-        verify_chunk_checksum,
     },
 };
 
@@ -649,7 +649,7 @@ fn ownership_labels_use_each_players_perspective_and_neutral_padding() {
 #[test]
 fn chunk_values_use_final_area_and_komi_in_each_players_perspective() {
     use crate::inference::inputs::{NUM_GLOBAL_FEATURES, NUM_SPATIAL_FEATURES};
-    use crate::training_data::{CHUNK_HEADER_SIZE, training_record_size};
+    use rgo_artifacts::chunk::{CHUNK_HEADER_SIZE, training_record_size};
 
     for board_dim in [9, 13, 19] {
         let board = Board::new(board_dim);

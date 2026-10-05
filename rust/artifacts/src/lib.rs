@@ -1,7 +1,9 @@
-//! Shared artifact identities and naming conventions.
+//! Shared artifact identities, naming conventions, and binary schemas.
 //! Callers own storage roots and file/stream delivery; this crate performs no I/O.
 
 use std::path::{Path, PathBuf};
+
+pub mod chunk;
 
 /// Identity of an immutable published model.
 pub type ModelVersion = u64;
