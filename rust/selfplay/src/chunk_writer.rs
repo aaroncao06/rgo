@@ -22,6 +22,7 @@ use crate::{
 };
 
 const PENDING_CHUNK_FILE: &str = ".pending-chunk.tmp";
+const MAX_CHUNK_RECORDS: usize = 1024; // only applies to per game
 
 #[derive(Clone, Copy, serde::Deserialize)]
 #[serde(
@@ -31,7 +32,7 @@ const PENDING_CHUNK_FILE: &str = ".pending-chunk.tmp";
     deny_unknown_fields
 )]
 pub(super) enum ChunkMode {
-    /// Publish every completed game immediately as one chunk.
+    /// Publish on each completed game, splitting at MAX_CHUNK_RECORDS and carrying tails.
     PerGame,
     /// Combine or split games to publish chunks of exactly this many records.
     FixedRecords(usize),
@@ -55,7 +56,7 @@ impl From<io::Error> for ChunkWriterError {
 /// generates inputs directly into reusable scratch storage; records are freed
 /// after encoding. One reusable encoder owns the encoded byte allocation
 /// through publication, without overlapping writes.
-/// Closing the queue drains games and flushes the final partial fixed chunk.
+/// Closing the queue drains games and flushes the final partial chunk.
 ///
 /// The caller must durably provision the output directory before starting.
 /// Exactly one writer may use a directory at a time. Random 128-bit IDs avoid
@@ -111,7 +112,6 @@ impl ChunkWriter {
             self.append_game(game)?;
         }
         if self.active_chunk.record_count() > 0 {
-            debug_assert!(matches!(self.mode, ChunkMode::FixedRecords(_)));
             self.publish()?;
         }
         Ok(())
@@ -123,7 +123,9 @@ impl ChunkWriter {
             "completed games must have records"
         );
         if let ChunkMode::PerGame = self.mode {
-            self.active_chunk.reset(game.records.len());
+            self.active_chunk.set_capacity(
+                (self.active_chunk.record_count() + game.records.len()).min(MAX_CHUNK_RECORDS),
+            );
         }
         self.replay_state.reset(game.rules);
         let black_ownership = ownership_for_player(
@@ -172,13 +174,12 @@ impl ChunkWriter {
             let played = self.replay_state.play(record.selected_move);
             debug_assert!(played, "recorded self-play move failed during replay");
 
-            // Publish intermediate fixed chunks while retaining the remaining
-            // move records. The final chunk is published after releasing them.
-            if matches!(self.mode, ChunkMode::FixedRecords(_))
-                && self.active_chunk.remaining_capacity() == 0
-                && index + 1 < game.records.len()
-            {
+            // Publish intermediate full chunks while retaining the remaining
+            // move records. A full final chunk is published after releasing them.
+            if self.active_chunk.remaining_capacity() == 0 && index + 1 < game.records.len() {
+                let num_records = self.active_chunk.record_count();
                 self.publish()?;
+                self.active_chunk.reset(num_records);
             }
         }
         debug_assert!(self.replay_state.is_finished());
@@ -188,8 +189,11 @@ impl ChunkWriter {
             "replayed game has the wrong length"
         );
         drop(game);
-        if matches!(self.mode, ChunkMode::PerGame) || self.active_chunk.remaining_capacity() == 0 {
+        if self.active_chunk.remaining_capacity() == 0 {
             self.publish()?;
+            if let ChunkMode::FixedRecords(records) = self.mode {
+                self.active_chunk.reset(records);
+            }
         }
         Ok(())
     }
@@ -212,10 +216,6 @@ impl ChunkWriter {
             bytes: bytes.len(),
             records,
         })?;
-        // Per-game mode resets when the next game supplies its capacity.
-        if let ChunkMode::FixedRecords(records) = self.mode {
-            self.active_chunk.reset(records);
-        }
         Ok(())
     }
 }

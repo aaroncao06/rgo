@@ -5,7 +5,8 @@ worker_threads = 2
 workers_per_thread = 4
 output_dir = "self_play_chunks"
 
-# Use { mode = "fixed_records", records = 25000 } to batch across games.
+# Per-game mode publishes for each game, caps chunks at 1024, and carries tails.
+# Use { mode = "fixed_records", records = 1024 } to batch across games.
 chunk = { mode = "per_game" }
 
 [inference]

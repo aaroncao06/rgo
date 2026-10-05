@@ -118,16 +118,21 @@ and sum to one. Each budget's `max_playouts` must be at least its `max_nodes`.
 
 ## Chunk publication
 
-The example uses `chunk = { mode = "per_game" }`, publishing one chunk for
-each finished game. To combine or split games into fixed-size chunks, replace
-that top-level setting with:
+The example uses `chunk = { mode = "per_game" }`, publishing at least one
+chunk for each finished game, with at most 1,024 records per chunk. Longer
+games are split; their partial tails carry into the next game's chunks.
+Each new game sets the chunk target to its record count plus any carried
+records, capped at 1,024. Shutdown publishes any remaining tail.
+To combine or split games into fixed-size chunks, replace that top-level
+setting with:
 
 ```toml
-chunk = { mode = "fixed_records", records = 25000 }
+chunk = { mode = "fixed_records", records = 1024 }
 ```
 
-The record count must fit a positive `u32`; 25,000 is an example, not a tuned
-default. Graceful shutdown publishes a final partial chunk if needed.
+The record count must fit a positive `u32`; 1,024 is an example, not a tuned
+default. It keeps chunks under 1 MiB even for 19x19 records. Graceful shutdown
+publishes a final partial chunk if needed.
 
 Workers retain move records until a game finishes. A dedicated OS thread
 replays and encodes those records, writes through `std::fs`, syncs the file,

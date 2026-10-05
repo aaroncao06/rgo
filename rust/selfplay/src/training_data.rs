@@ -47,9 +47,9 @@ impl CompletedGame {
 
 /// Builds one versioned chunk directly in its final byte representation.
 ///
-/// Full chunks hash each record as it is encoded. Only the final partial chunk
-/// needs a second hashing pass because its record count is not known when its
-/// header is initialized.
+/// Records are hashed as they are encoded. Finishing needs a second hashing
+/// pass only when the final record count differs from the initialized header,
+/// such as after changing capacity or flushing a partial chunk.
 /// Finished bytes stay in the encoder; reset it after publication to reuse the
 /// allocation for the next chunk.
 pub(super) struct ChunkEncoder {
@@ -74,7 +74,7 @@ impl ChunkEncoder {
     }
 
     pub(super) fn reset(&mut self, record_capacity: usize) {
-        assert!(record_capacity > 0, "training chunks must be nonempty");
+        debug_assert!(record_capacity > 0, "training chunks must be nonempty");
         let header = chunk_header(record_capacity);
         self.bytes.clear();
         self.bytes.reserve(CHUNK_HEADER_SIZE + CHUNK_CHECKSUM_SIZE);
@@ -84,6 +84,19 @@ impl ChunkEncoder {
         self.record_capacity = record_capacity;
         self.record_count = 0;
         self.finished = false;
+    }
+
+    /// Reset an empty chunk's target, preserving records in a nonempty chunk.
+    pub(super) fn set_capacity(&mut self, record_capacity: usize) {
+        debug_assert!(record_capacity > 0 && record_capacity >= self.record_count);
+        if self.record_count == 0 {
+            self.reset(record_capacity);
+        } else {
+            debug_assert!(!self.finished, "reset the encoder after finishing");
+            // Leave the header unchanged so the incremental checksum stays valid.
+            // finish() writes the actual record count and rehashes if needed.
+            self.record_capacity = record_capacity;
+        }
     }
 
     /// Records awaiting finalization; finishing clears this count.
@@ -147,10 +160,11 @@ impl ChunkEncoder {
         debug_assert!(!self.finished, "chunk already finished");
         debug_assert!(self.record_count > 0, "cannot finish an empty chunk");
 
-        let checksum = if self.record_count == self.record_capacity {
+        let header = chunk_header(self.record_count);
+        let checksum = if self.bytes[..CHUNK_HEADER_SIZE] == header {
             std::mem::take(&mut self.checksum).finalize()
         } else {
-            self.bytes[..CHUNK_HEADER_SIZE].copy_from_slice(&chunk_header(self.record_count));
+            self.bytes[..CHUNK_HEADER_SIZE].copy_from_slice(&header);
             Sha256::digest(&self.bytes)
         };
         self.bytes.extend_from_slice(&checksum);

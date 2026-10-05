@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use rand::{RngExt, SeedableRng, rngs::SmallRng};
 use rgo_artifacts::chunk::verify_chunk_checksum;
 use rgo_artifacts::{CHUNK_FILE_PREFIX, CHUNK_FILE_SUFFIX};
 use serde_json::Value;
@@ -270,7 +271,7 @@ fn an_empty_queue_does_not_publish_chunks() {
 }
 
 #[tokio::test]
-async fn per_game_publishes_without_waiting_for_queue_closure_or_splitting() {
+async fn per_game_publishes_small_games_without_waiting_for_queue_closure() {
     let dir = TestDir::new();
     let (tx, rx) = mpsc::channel(1);
     let (output, mut events) = event_output();
@@ -289,6 +290,89 @@ async fn per_game_publishes_without_waiting_for_queue_closure_or_splitting() {
     drop(tx);
     writer.finish().await.unwrap();
     assert_eq!(dir.files().len(), 3);
+    assert!(!dir.0.join(PENDING_CHUNK_FILE).exists());
+}
+
+#[tokio::test]
+async fn per_game_splits_at_the_limit_and_carries_tails_until_next_game_or_shutdown() {
+    let rules = Rules {
+        board_dim: 19,
+        ..Rules::TROMP_TAYLORISH_9
+    };
+    let mut state = GameState::new(rules);
+    let mut rng = SmallRng::seed_from_u64(7);
+    let mut moves = Vec::new();
+    // Generate legal captures and passes so the fixture exceeds the board area.
+    // Each tested prefix is completed with two passes below.
+    for _ in 0..2 * MAX_CHUNK_RECORDS + 1 {
+        let legal: Vec<_> = state
+            .board()
+            .locs()
+            .filter(|&loc| state.is_legal(loc))
+            .collect();
+        let selected_move = if legal.is_empty() {
+            Loc::PASS
+        } else {
+            legal[rng.random_range(0..legal.len())]
+        };
+        assert!(state.play(selected_move));
+        assert!(!state.is_finished(), "long-game fixture ended early");
+        moves.push(selected_move);
+    }
+
+    let dir = TestDir::new();
+    let (tx, rx) = mpsc::channel(1);
+    let (output, mut events) = event_output();
+    let writer = RunningWriter::start(ChunkWriter::new(
+        ChunkMode::PerGame,
+        dir.0.clone(),
+        rx,
+        EventPublisher::with_output(output),
+    ));
+    let mut expected_files = 0;
+    let mut pending_samples = Vec::new();
+    for (dim, records) in [
+        (19, MAX_CHUNK_RECORDS - 1),
+        (19, MAX_CHUNK_RECORDS),
+        (19, MAX_CHUNK_RECORDS + 2),
+        (19, 2 * MAX_CHUNK_RECORDS),
+        (13, 3),
+        (19, MAX_CHUNK_RECORDS + 2),
+    ] {
+        let tags: Vec<_> = (0..records).collect();
+        let (game, samples) = if dim == 19 {
+            let mut game_moves = moves[..records - 2].to_vec();
+            game_moves.extend([Loc::PASS, Loc::PASS]);
+            game_with_moves(rules, &game_moves, &tags)
+        } else {
+            game(dim, &tags)
+        };
+        let capacity = (pending_samples.len() + records).min(MAX_CHUNK_RECORDS);
+        pending_samples.extend(samples);
+        tx.send(game).await.unwrap();
+        let mut published = 0;
+        while pending_samples.len() >= capacity {
+            assert_chunk(
+                &next_event(&mut events).await,
+                &encode_chunk(&pending_samples[..capacity]),
+            );
+            pending_samples.drain(..capacity);
+            expected_files += 1;
+            published += 1;
+        }
+        assert!(published > 0, "every completed game must publish a chunk");
+        assert!(events.try_recv().is_err());
+    }
+    assert_eq!(pending_samples.len(), 2);
+    drop(tx);
+    writer.finish().await.unwrap();
+    assert_chunk(
+        &next_event(&mut events).await,
+        &encode_chunk(&pending_samples),
+    );
+    expected_files += 1;
+    assert!(events.try_recv().is_err());
+    assert_eq!(dir.files().len(), expected_files);
     assert!(!dir.0.join(PENDING_CHUNK_FILE).exists());
 }
 
