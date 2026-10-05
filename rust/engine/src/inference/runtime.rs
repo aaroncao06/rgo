@@ -288,12 +288,12 @@ impl ModelRuntime {
         let cache = EvaluationCache::new(config.cache_capacity, config.num_cache_shards);
         let mut executor_threads = Vec::with_capacity(config.executors.len());
         let (startup_tx, startup_rx) = mpsc::channel();
-        for executor in config.executors.iter().copied() {
+        for executor in config.executors.iter().cloned() {
             let path = checkpoint_path.clone();
             let queue = queue.clone();
             let startup_tx = startup_tx.clone();
             executor_threads.push(std::thread::spawn(move || {
-                match OnnxBackend::load(&path, executor) {
+                match OnnxBackend::load(&path, &executor) {
                     Ok(backend) => {
                         let _ = startup_tx.send(Ok(()));
                         drop(startup_tx);

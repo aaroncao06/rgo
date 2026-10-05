@@ -5,6 +5,8 @@ edition = "2024"
 
 [features]
 cuda = ["ort/cuda"]
+coreml = ["ort/coreml"]
+webgpu = ["ort/webgpu"]
 # Synthetic inference fixtures for dependent crates' tests, never enabled by default.
 test-support = []
 

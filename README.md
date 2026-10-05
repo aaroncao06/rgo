@@ -33,6 +33,24 @@ Runtime installation:
 cargo build --release --manifest-path rust/Cargo.toml -p rgo-selfplay --features cuda
 ```
 
+CoreML (`--features coreml`) accelerates inference on Apple platforms using
+MLProgram format, requiring macOS 12+. WebGPU (`--features webgpu`) uses Dawn
+to target Metal, Vulkan, or Direct3D 12. To build both on Apple Silicon:
+
+```sh
+cargo build --release --manifest-path rust/Cargo.toml -p rgo-selfplay --features coreml,webgpu
+```
+
+Choose the provider per executor in the
+[worker configuration](configs/README.md). Hardware smoke tests are opt-in:
+
+```sh
+cargo test --manifest-path rust/Cargo.toml -p rgo-engine --features coreml,webgpu matches_cpu_across_dynamic_shapes -- --ignored
+```
+
+These use a synthetic model to check the tensor boundary; a trained model's
+operator coverage and throughput must be measured separately.
+
 The project currently emits warnings for unfinished helpers and helpers used
 only in tests.
 

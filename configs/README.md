@@ -48,6 +48,36 @@ CPU devices use `device = { type = "cpu" }`. CUDA devices use
 `device = { type = "cuda", device_id = 0 }` and require a CUDA-enabled build
 and compatible ONNX Runtime. Device IDs must be nonnegative.
 
+CoreML devices use `device = { type = "coreml" }` and require `--features coreml`
+and macOS 12+ (or iOS 15+ for an embedding application). The backend uses
+MLProgram format and allows dynamic input shapes. Optional device settings:
+
+- `compute_units`: `"all"` (default), `"cpu_and_gpu"`,
+  `"cpu_and_neural_engine"`, or `"cpu_only"`. These select hardware CoreML is
+  allowed to use; they do not force every operation onto a particular processor.
+- `model_cache_dir`: nonempty directory path to cache converted/compiled models
+  across session loads. Omitted by default. This is separate from the runtime's
+  evaluation-result cache. Keep published model versions immutable so a cached
+  compilation cannot be reused for different weights at the same model path.
+  ONNX Runtime does not remove old compiled-model cache entries.
+
+WebGPU devices use `device = { type = "webgpu" }` and require `--features webgpu`
+and a compatible GPU/driver. Dawn selects Metal on macOS, Vulkan on Linux, and
+Direct3D 12 or Vulkan on Windows. Optional device settings:
+
+- `power_preference`: `"high_performance"` (default) or `"low_power"`, an adapter
+  selection hint.
+- `preferred_layout`: `"nhwc"` (default) or `"nchw"`, the provider's preferred
+  layout for operations such as convolution. Model inputs remain NCHW.
+
+WebGPU graph capture is disabled because batches and board dimensions change.
+Use `--features coreml,webgpu` to include both providers in an Apple Silicon
+build. The pinned dependency has prebuilt CoreML binaries for Apple Silicon
+and WebGPU binaries for Apple Silicon, x86-64 Windows, and x86-64 Linux; other
+targets or feature combinations may require a custom ONNX Runtime build.
+Provider registration failures are errors. Unsupported model operations can
+still run through ONNX Runtime's CPU fallback.
+
 `base_batch_size` is the maximum batch size for 19x19 positions. Smaller boards
 use `floor(base_batch_size * 361 / board_dim^2)`: a base of 8 permits 35 positions
 at 9x9, 17 at 13x13, or 8 at 19x19. Requests are batched by board size. Executors

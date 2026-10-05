@@ -1,7 +1,10 @@
 //! The V0 ONNX tensor boundary. No model architecture or search processing lives here.
 
 use crate::game::board::MAX_BOARD_DIM;
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use ort::{
     ep,
@@ -17,22 +20,83 @@ use super::{
 };
 
 /// Select an execution provider, not exclusive ownership of a device.
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InferenceDevice {
     Cpu {},
     /// Requires a CUDA-enabled ONNX Runtime and the crate's `cuda` feature.
+    // TensorRT is deferred; benchmark it against CUDA when NVIDIA hardware is available.
     Cuda {
         device_id: i32,
     },
+    /// Requires the `coreml` feature and macOS 12+ (MLProgram format).
+    #[serde(rename = "coreml")]
+    CoreMl {
+        #[serde(default)]
+        compute_units: CoreMlComputeUnits,
+        /// Cache of converted/compiled models, separate from evaluation results.
+        #[serde(default)]
+        model_cache_dir: Option<PathBuf>,
+    },
+    /// Requires the `webgpu` feature and a compatible GPU/driver.
+    #[serde(rename = "webgpu")]
+    WebGpu {
+        #[serde(default)]
+        power_preference: WebGpuPowerPreference,
+        #[serde(default)]
+        preferred_layout: WebGpuLayout,
+    },
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoreMlComputeUnits {
+    #[default]
+    All,
+    CpuAndGpu,
+    CpuAndNeuralEngine,
+    CpuOnly,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebGpuPowerPreference {
+    #[default]
+    HighPerformance,
+    LowPower,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WebGpuLayout {
+    Nchw,
+    #[default]
+    Nhwc,
 }
 
 impl InferenceDevice {
-    pub fn validate(self) -> Result<(), &'static str> {
+    pub fn validate(&self) -> Result<(), &'static str> {
         match self {
-            Self::Cuda { device_id } if device_id < 0 => Err("CUDA device_id must be nonnegative"),
+            Self::Cuda { device_id } if *device_id < 0 => Err("CUDA device_id must be nonnegative"),
             Self::Cuda { .. } if !cfg!(feature = "cuda") => {
                 Err("CUDA inference requires the cuda feature")
+            }
+            Self::CoreMl {
+                model_cache_dir: Some(path),
+                ..
+            } if path.as_os_str().is_empty() => Err("CoreML model_cache_dir must not be empty"),
+            Self::CoreMl {
+                model_cache_dir: Some(path),
+                ..
+            } if path.to_str().is_none() => Err("CoreML model_cache_dir must be valid UTF-8"),
+            Self::CoreMl { .. } if !cfg!(feature = "coreml") => {
+                Err("CoreML inference requires the coreml feature")
+            }
+            Self::CoreMl { .. } if !cfg!(any(target_os = "macos", target_os = "ios")) => {
+                Err("CoreML inference requires an Apple platform")
+            }
+            Self::WebGpu { .. } if !cfg!(feature = "webgpu") => {
+                Err("WebGPU inference requires the webgpu feature")
             }
             _ => Ok(()),
         }
@@ -51,21 +115,68 @@ pub(crate) struct OnnxBackend {
 impl OnnxBackend {
     /// Construct on the owning executor thread.
     /// CPU intra-op parallelism is explicit to avoid multiplying thread pools.
-    pub(crate) fn load(path: &Path, config: ExecutorConfig) -> ort::Result<Self> {
+    pub(crate) fn load(path: &Path, config: &ExecutorConfig) -> ort::Result<Self> {
         config.validate().map_err(ort::Error::new)?;
-        let provider = match config.device {
+        let provider = match &config.device {
             InferenceDevice::Cpu {} => ep::CPU::default().with_arena_allocator(true).build(),
             #[cfg(feature = "cuda")]
             InferenceDevice::Cuda { device_id } => {
-                ep::CUDA::default().with_device_id(device_id).build()
+                ep::CUDA::default().with_device_id(*device_id).build()
             }
             #[cfg(not(feature = "cuda"))]
             InferenceDevice::Cuda { .. } => unreachable!("CUDA support was validated"),
+            #[cfg(feature = "coreml")]
+            InferenceDevice::CoreMl {
+                compute_units,
+                model_cache_dir,
+            } => {
+                let units = match compute_units {
+                    CoreMlComputeUnits::All => ep::coreml::ComputeUnits::All,
+                    CoreMlComputeUnits::CpuAndGpu => ep::coreml::ComputeUnits::CPUAndGPU,
+                    CoreMlComputeUnits::CpuAndNeuralEngine => {
+                        ep::coreml::ComputeUnits::CPUAndNeuralEngine
+                    }
+                    CoreMlComputeUnits::CpuOnly => ep::coreml::ComputeUnits::CPUOnly,
+                };
+                let mut provider = ep::CoreML::default()
+                    .with_model_format(ep::coreml::ModelFormat::MLProgram)
+                    .with_compute_units(units)
+                    .with_static_input_shapes(false);
+                if let Some(dir) = model_cache_dir {
+                    provider = provider
+                        .with_model_cache_dir(dir.to_str().expect("cache path was validated"));
+                }
+                provider.build()
+            }
+            #[cfg(not(feature = "coreml"))]
+            InferenceDevice::CoreMl { .. } => unreachable!("CoreML support was validated"),
+            #[cfg(feature = "webgpu")]
+            InferenceDevice::WebGpu {
+                power_preference,
+                preferred_layout,
+            } => {
+                use ep::ArbitrarilyConfigurableExecutionProvider;
+                let power = match power_preference {
+                    WebGpuPowerPreference::HighPerformance => "high-performance",
+                    WebGpuPowerPreference::LowPower => "low-power",
+                };
+                let layout = match preferred_layout {
+                    WebGpuLayout::Nchw => ep::webgpu::PreferredLayout::NCHW,
+                    WebGpuLayout::Nhwc => ep::webgpu::PreferredLayout::NHWC,
+                };
+                ep::WebGPU::default()
+                    .with_arbitrary_config("ep.webgpuexecutionprovider.powerPreference", power)
+                    .with_preferred_layout(layout)
+                    .with_enable_graph_capture(false)
+                    .build()
+            }
+            #[cfg(not(feature = "webgpu"))]
+            InferenceDevice::WebGpu { .. } => unreachable!("WebGPU support was validated"),
         };
         let session = Session::builder()?
             .with_intra_threads(config.intra_threads)?
             // A requested provider must register successfully; don't silently
-            // turn an unavailable CUDA configuration into a CPU-only session.
+            // turn an unavailable provider into a CPU-only session.
             .with_execution_providers([provider.error_on_failure()])?
             .commit_from_file(path)?;
         validate_contract(&session)?;

@@ -51,3 +51,26 @@ model.graph.input[0].type.tensor_type.shape.dim[1].dim_value = 3
 model.graph.node[-1].CopyFrom(helper.make_node("Identity", ["board_policy"], ["policy_logits"]))
 onnx.checker.check_model(model)
 onnx.save(model, directory / "wrong_output.onnx")
+
+# An accelerator smoke fixture with a constant-weight 1x1 convolution. The
+# original adapter fixture has no convolution and is not a throughput benchmark.
+conv_nodes = list(nodes)
+conv_nodes[2] = helper.make_node(
+    "Conv", ["spatial", "conv_weights"], ["ownership_logits"], kernel_shape=[1, 1],
+    pads=[0, 0, 0, 0], strides=[1, 1], dilations=[1, 1],
+)
+conv_graph = helper.make_graph(
+    conv_nodes, "rgo_v0_conv_fixture",
+    [tensor("spatial", ["N", 3, "H", "W"]), tensor("global", ["N", 2])],
+    [tensor("policy_logits", ["N", "P"]), tensor("value", ["N", 3]),
+     tensor("ownership_logits", ["N", 1, "H", "W"])],
+    initializer=[initializers[-1], helper.make_tensor(
+        "conv_weights", TensorProto.FLOAT, [1, 3, 1, 1], [0.125, 0.25, 0.5]
+    )],
+)
+conv_model = helper.make_model(
+    conv_graph, opset_imports=[helper.make_opsetid("", 13)], ir_version=10
+)
+helper.set_model_props(conv_model, {"rgo.io_version": "0"})
+onnx.checker.check_model(conv_model)
+onnx.save(conv_model, directory / "v0_conv.onnx")

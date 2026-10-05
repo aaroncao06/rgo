@@ -2,7 +2,7 @@ use crate::inference::{SUPPORTED_BOARD_DIMS, onnx::InferenceDevice};
 use std::path::PathBuf;
 
 /// Device and session settings for one backend/executor thread.
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutorConfig {
     pub device: InferenceDevice,

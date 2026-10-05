@@ -1,7 +1,10 @@
 use rand::{SeedableRng, rngs::SmallRng};
 
 use super::*;
-use crate::{inference::onnx::InferenceDevice, search::worker::SearchBudget};
+use crate::{
+    inference::onnx::{CoreMlComputeUnits, InferenceDevice, WebGpuLayout, WebGpuPowerPreference},
+    search::worker::SearchBudget,
+};
 
 const EXAMPLE: &str = include_str!("../../../../configs/self_play.toml");
 
@@ -204,6 +207,106 @@ fn cuda_device_configuration_is_feature_gated() {
         SelfPlayConfig::from_toml(&source.replace("device_id = 0", "device_id = -1")),
         Err(ConfigError::Invalid(_))
     ));
+}
+
+#[test]
+fn accelerator_options_parse_defaults_and_overrides() {
+    // Parse independently of feature availability; validation rejects missing EPs.
+    let parse = |device: &str| -> SelfPlayConfig {
+        toml::from_str(&EXAMPLE.replace("type = \"cpu\"", device)).unwrap()
+    };
+    let config = parse("type = \"coreml\"");
+    assert!(matches!(
+        config.inference.executors[0].device,
+        InferenceDevice::CoreMl {
+            compute_units: CoreMlComputeUnits::All,
+            model_cache_dir: None
+        }
+    ));
+    for (name, expected) in [
+        ("all", CoreMlComputeUnits::All),
+        ("cpu_and_gpu", CoreMlComputeUnits::CpuAndGpu),
+        (
+            "cpu_and_neural_engine",
+            CoreMlComputeUnits::CpuAndNeuralEngine,
+        ),
+        ("cpu_only", CoreMlComputeUnits::CpuOnly),
+    ] {
+        let config = parse(&format!(
+            "type = \"coreml\", compute_units = \"{name}\", model_cache_dir = \"coreml_cache\""
+        ));
+        let InferenceDevice::CoreMl {
+            compute_units,
+            ref model_cache_dir,
+        } = config.inference.executors[0].device
+        else {
+            unreachable!()
+        };
+        assert_eq!(compute_units, expected);
+        assert_eq!(model_cache_dir.as_deref(), Some(Path::new("coreml_cache")));
+    }
+    let config = parse("type = \"webgpu\"");
+    assert!(matches!(
+        config.inference.executors[0].device,
+        InferenceDevice::WebGpu {
+            power_preference: WebGpuPowerPreference::HighPerformance,
+            preferred_layout: WebGpuLayout::Nhwc
+        }
+    ));
+    let config =
+        parse("type = \"webgpu\", power_preference = \"low_power\", preferred_layout = \"nchw\"");
+    assert!(matches!(
+        config.inference.executors[0].device,
+        InferenceDevice::WebGpu {
+            power_preference: WebGpuPowerPreference::LowPower,
+            preferred_layout: WebGpuLayout::Nchw
+        }
+    ));
+}
+
+#[test]
+fn accelerator_settings_reject_unknown_or_invalid_fields() {
+    for device in [
+        "type = \"coreml\", compute_units = \"gpu_only\"",
+        "type = \"coreml\", typo = 1",
+        "type = \"coreml\", intra_threads = 1",
+        "type = \"webgpu\", power_preference = \"fast\"",
+        "type = \"webgpu\", preferred_layout = \"chw\"",
+        "type = \"webgpu\", typo = 1",
+        "type = \"webgpu\", intra_threads = 1",
+    ] {
+        assert!(matches!(
+            SelfPlayConfig::from_toml(&EXAMPLE.replace("type = \"cpu\"", device)),
+            Err(ConfigError::Parse(_))
+        ));
+    }
+    let source = EXAMPLE.replace(
+        "type = \"cpu\"",
+        "type = \"coreml\", model_cache_dir = \"\"",
+    );
+    assert!(matches!(
+        SelfPlayConfig::from_toml(&source),
+        Err(ConfigError::Invalid(
+            "CoreML model_cache_dir must not be empty"
+        ))
+    ));
+}
+
+#[test]
+fn accelerator_configuration_is_feature_and_platform_gated() {
+    for (device, supported) in [
+        (
+            "coreml",
+            cfg!(all(
+                feature = "coreml",
+                any(target_os = "macos", target_os = "ios")
+            )),
+        ),
+        ("webgpu", cfg!(feature = "webgpu")),
+    ] {
+        let source = EXAMPLE.replace("type = \"cpu\"", &format!("type = \"{device}\""));
+        assert_eq!(SelfPlayConfig::from_toml(&source).is_ok(), supported);
+    }
 }
 
 #[test]

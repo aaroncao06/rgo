@@ -11,10 +11,36 @@ fn cpu_config() -> ExecutorConfig {
     }
 }
 
+#[cfg(all(feature = "coreml", target_os = "macos"))]
+struct CacheDir(PathBuf);
+
+#[cfg(all(feature = "coreml", target_os = "macos"))]
+impl CacheDir {
+    fn new(provider: &str) -> Self {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = Self(std::env::temp_dir().join(format!(
+            "rgo-{provider}-cache-{}-{unique}",
+            std::process::id()
+        )));
+        std::fs::create_dir(&dir.0).unwrap();
+        dir
+    }
+}
+
+#[cfg(all(feature = "coreml", target_os = "macos"))]
+impl Drop for CacheDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn backend() -> OnnxBackend {
     OnnxBackend::load(
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/v0.onnx"),
-        cpu_config(),
+        &cpu_config(),
     )
     .unwrap()
 }
@@ -137,14 +163,14 @@ fn rejects_incompatible_contract_metadata() {
 #[test]
 fn rejects_incompatible_input_shape() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/wrong_shape.onnx");
-    assert!(OnnxBackend::load(&path, cpu_config()).is_err());
+    assert!(OnnxBackend::load(&path, &cpu_config()).is_err());
 }
 
 #[test]
 fn rejects_runtime_output_shapes_that_omit_pass() {
     use crate::game::{game_state::GameState, rules::Rules};
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/wrong_output.onnx");
-    let mut backend = OnnxBackend::load(&path, cpu_config()).unwrap();
+    let mut backend = OnnxBackend::load(&path, &cpu_config()).unwrap();
     let input = NNInput::encode(&GameState::new(Rules {
         board_dim: 5,
         ..Rules::default()
@@ -165,7 +191,7 @@ fn unavailable_cuda_returns_an_error_instead_of_falling_back_to_cpu() {
     assert!(
         OnnxBackend::load(
             &path,
-            ExecutorConfig {
+            &ExecutorConfig {
                 device: InferenceDevice::Cuda { device_id: 0 },
                 ..cpu_config()
             }
@@ -208,10 +234,153 @@ fn invalid_executor_settings_return_errors_before_loading() {
             "CUDA device_id must be nonnegative",
         ),
     ] {
-        let error = OnnxBackend::load(path, config)
+        let error = OnnxBackend::load(path, &config)
             .err()
             .expect("invalid device must be rejected");
         assert!(error.to_string().contains(message));
+    }
+}
+
+#[test]
+fn unavailable_accelerators_are_rejected_before_loading() {
+    let path = Path::new("unused.onnx");
+    for (device, supported, message) in [
+        (
+            InferenceDevice::CoreMl {
+                compute_units: CoreMlComputeUnits::All,
+                model_cache_dir: None,
+            },
+            cfg!(all(
+                feature = "coreml",
+                any(target_os = "macos", target_os = "ios")
+            )),
+            "CoreML inference requires",
+        ),
+        (
+            InferenceDevice::WebGpu {
+                power_preference: WebGpuPowerPreference::HighPerformance,
+                preferred_layout: WebGpuLayout::Nhwc,
+            },
+            cfg!(feature = "webgpu"),
+            "WebGPU inference requires",
+        ),
+    ] {
+        if supported {
+            continue;
+        }
+        let error = OnnxBackend::load(
+            path,
+            &ExecutorConfig {
+                device,
+                ..cpu_config()
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains(message), "{error}");
+    }
+}
+
+#[cfg(any(all(feature = "coreml", target_os = "macos"), feature = "webgpu"))]
+fn compare_accelerator_with_cpu(device: InferenceDevice) {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/v0_conv.onnx");
+    let mut accelerator = OnnxBackend::load(
+        &path,
+        &ExecutorConfig {
+            device,
+            ..cpu_config()
+        },
+    )
+    .unwrap();
+    let mut cpu = OnnxBackend::load(&path, &cpu_config()).unwrap();
+    for (board_dim, batch_size, ownership) in
+        [(9, 1, true), (13, 3, false), (19, 2, true), (9, 3, true)]
+    {
+        let inputs: Vec<_> = (0..batch_size)
+            .map(|i| NNInput {
+                board_dim,
+                spatial: std::array::from_fn(|j| ((i + j / 7) % 2) as u8),
+                global: [i as f32 * 0.25 - 0.75, 0.5],
+                include_ownership: ownership && i % 2 == 0,
+            })
+            .collect();
+        let mut expected = Vec::new();
+        let mut actual = Vec::new();
+        cpu.evaluate_batch(&inputs, &mut expected).unwrap();
+        accelerator.evaluate_batch(&inputs, &mut actual).unwrap();
+        assert_eq!(actual.len(), expected.len());
+        let legal = vec![true; board_dim * board_dim + 1];
+        for (expected, actual) in expected.iter_mut().zip(&mut actual) {
+            let expected = Arc::get_mut(expected).unwrap();
+            let actual = Arc::get_mut(actual).unwrap();
+            expected.process_in_place(Player::White, &legal, board_dim);
+            actual.process_in_place(Player::White, &legal, board_dim);
+            let close = |a: f32, b: f32| {
+                assert!(
+                    (a - b).abs() <= 1e-4 * (1.0 + a.abs()),
+                    "expected {a}, got {b}"
+                )
+            };
+            for (&a, &b) in expected.policy_probs().iter().zip(actual.policy_probs()) {
+                close(a, b);
+            }
+            close(expected.white_win_prob(), actual.white_win_prob());
+            close(expected.white_score_mean(), actual.white_score_mean());
+            close(expected.white_score_mean_sq(), actual.white_score_mean_sq());
+            assert_eq!(expected.has_ownership(), actual.has_ownership());
+            if let (Some(expected), Some(actual)) =
+                (expected.white_ownership(), actual.white_ownership())
+            {
+                for (&a, &b) in expected.iter().zip(actual) {
+                    close(a, b);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "coreml", target_os = "macos"))]
+#[test]
+#[ignore = "requires macOS 12+ with CoreML; run explicitly on supported hardware"]
+fn coreml_matches_cpu_across_dynamic_shapes() {
+    let cache = CacheDir::new("coreml");
+    let device = InferenceDevice::CoreMl {
+        compute_units: CoreMlComputeUnits::All,
+        model_cache_dir: Some(cache.0.clone()),
+    };
+    compare_accelerator_with_cpu(device.clone());
+    assert!(
+        std::fs::read_dir(&cache.0).unwrap().next().is_some(),
+        "CoreML should cache at least one compiled partition"
+    );
+    // A new session must give the same outputs when loading cached partitions.
+    compare_accelerator_with_cpu(device);
+    for compute_units in [
+        CoreMlComputeUnits::CpuAndGpu,
+        CoreMlComputeUnits::CpuAndNeuralEngine,
+        CoreMlComputeUnits::CpuOnly,
+    ] {
+        compare_accelerator_with_cpu(InferenceDevice::CoreMl {
+            compute_units,
+            model_cache_dir: None,
+        });
+    }
+}
+
+#[cfg(feature = "webgpu")]
+#[test]
+#[ignore = "requires a WebGPU-compatible GPU/driver; run explicitly on supported hardware"]
+fn webgpu_matches_cpu_across_dynamic_shapes() {
+    for power_preference in [
+        WebGpuPowerPreference::HighPerformance,
+        WebGpuPowerPreference::LowPower,
+    ] {
+        for preferred_layout in [WebGpuLayout::Nhwc, WebGpuLayout::Nchw] {
+            compare_accelerator_with_cpu(InferenceDevice::WebGpu {
+                power_preference,
+                preferred_layout,
+            });
+        }
     }
 }
 

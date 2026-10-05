@@ -5,6 +5,8 @@ edition = "2024"
 
 [features]
 cuda = ["rgo-engine/cuda"]
+coreml = ["rgo-engine/coreml"]
+webgpu = ["rgo-engine/webgpu"]
 
 [dependencies]
 half = "2.7"

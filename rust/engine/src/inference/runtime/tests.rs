@@ -313,7 +313,7 @@ async fn an_executor_drains_requests_through_the_dynamic_onnx_model() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/v0.onnx");
         let backend = OnnxBackend::load(
             &path,
-            ExecutorConfig {
+            &ExecutorConfig {
                 device: crate::inference::onnx::InferenceDevice::Cpu {},
                 intra_threads: 1,
                 base_batch_size: 4,

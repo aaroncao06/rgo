@@ -24,6 +24,10 @@ intra_threads = 1
 device = { type = "cpu" }
 # CUDA alternative (build with --features cuda):
 # device = { type = "cuda", device_id = 0 }
+# CoreML alternative (macOS 12+, build with --features coreml):
+# device = { type = "coreml", compute_units = "all", model_cache_dir = "coreml_cache" }
+# WebGPU alternative (build with --features webgpu):
+# device = { type = "webgpu", power_preference = "high_performance", preferred_layout = "nhwc" }
 
 # Omit these tables to use the same defaults defined in Rust.
 # Individual fields may be overridden without restating the other defaults.
