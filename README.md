@@ -11,6 +11,46 @@ process. The trainer, supervising client/server, and interactive player are
 not implemented yet. No trained model is included; the ONNX files under the
 engine's test directory are synthetic fixtures.
 
+## Planned training architecture
+
+The long-term goal is low-cost Go training using heterogeneous compute
+contributed by friends or volunteers. The proposed coordination layer would
+support a single machine, a fixed allocation across multiple GPUs, and remote
+clients through the same component interfaces.
+
+The planned responsibilities are:
+
+- **Server:** own the bounded replay store, sample training shards, publish
+  models and recovery checkpoints, track training demand, and assign workloads.
+  Neural inference and gradient computation run on clients.
+- **Client:** manage a compute cluster that may contain several GPUs and CPU
+  workers. It handles hardware allocation, process supervision, and artifact
+  transfers. The server assigns work to the client; the client manages execution
+  on its hardware.
+- **Compute workers:** self-play consumes ONNX models and produces training
+  chunks; a Python trainer consumes sampled shards and produces resumable
+  checkpoints and exported models. Both use local files and lifecycle controls.
+  Clients provide shared paths locally or stage downloaded artifacts remotely.
+
+Initially, one client would train a model at a time while other clients generate
+self-play data. Manual assignments would support stable hardware allocations;
+an automatic scheduler would balance new data against training samples consumed,
+using measured throughput and the self-play cost of assigning a client to
+training. Training could migrate at recovery checkpoints, carrying optimizer
+state with it. Recovery checkpoints and models published to self-play would
+have separate cadences.
+
+The research direction is making these component boundaries work efficiently
+across local and distributed deployments. Scheduling, transfer costs, and
+learning efficiency still need experimental validation.
+
+The current repository implements the engine and self-play worker. Next steps:
+
+1. Add local client/server coordination, replay retention, and shard sampling.
+2. Add the trainer and validate a complete 9x9 training loop.
+3. Add remote artifact transfers behind the same worker interfaces.
+4. Add workload scheduling and checkpoint-based trainer migration.
+
 ## Build and test
 
 Use a recent Rust toolchain supporting edition 2024. From the repository root:
@@ -120,3 +160,13 @@ features. Training chunks store compact inputs, FP16 policies, and
 player-relative final win/score/ownership labels. The initial chunk layout is
 still under development; its encoder is in
 [training_data.rs](rust/selfplay/src/training_data.rs).
+
+## License and acknowledgments
+
+rgo is licensed under the [MIT License](LICENSE).
+
+Thanks to David J Wu (lightvector) and the
+[KataGo contributors](https://github.com/lightvector/KataGo) for their work on
+Go search and self-play training. KataGo informs our search policies, root
+heuristics, and regression tests. Its notice for adapted portions is preserved
+in [third-party notices](THIRD_PARTY_NOTICES.md).
