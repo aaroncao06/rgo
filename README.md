@@ -147,7 +147,7 @@ belong to the engine. See the
 
 - [`rust/artifacts`](rust/artifacts/src/lib.rs): shared model/chunk identities
   and filename conventions, plus the binary chunk schema, record sizes, header
-  encoding, and checksum verification.
+  encoding, checksum verification, and validated borrowed record views.
 - [`rust/engine`](rust/engine/src/lib.rs): reusable board, inference, and search
   library, independent of self-play.
 - [`rust/selfplay`](rust/selfplay/src/main.rs): process configuration, game

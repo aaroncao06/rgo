@@ -156,6 +156,12 @@ zero. Only active board cells are stored. Records occupy 235 bytes at 9x9,
 the [shared schema](../rust/artifacts/src/chunk.rs) and the
 [encoder](../rust/selfplay/src/training_data.rs) for the current definition.
 
+Rust consumers can use `rgo_artifacts::chunk::Chunk::parse` to validate a
+nonempty chunk's header, checksum, record count, dimensions (1 through 19), and
+record boundaries. Its `records()` iterator exposes each record's board
+dimension, offset within the file, and borrowed packed bytes. This validates
+structure and integrity; tensor values and packed labels remain undecoded.
+
 ## Commands and events
 
 Send one JSON command per line on stdin:
