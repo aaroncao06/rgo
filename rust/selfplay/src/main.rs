@@ -180,4 +180,5 @@ impl ShutdownSignals {
 }
 
 #[cfg(all(test, unix))]
+#[path = "../tests/unit/shutdown.rs"]
 mod shutdown_tests;
