@@ -15,13 +15,11 @@ use tokio::sync::oneshot;
 
 use super::*;
 use crate::{
+    chunk_encoder::test_support::{TestSample, ValueTarget, encode_chunk},
     game::board::Loc,
     game::{game_state::GameState, rules::Rules},
+    game_records::SelfPlayRecord,
     inference::{inputs::NNInput, policy::MAX_POLICY_SIZE},
-    training_data::{
-        SelfPlayRecord,
-        test_support::{TestSample, ValueTarget, encode_chunk},
-    },
 };
 
 static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);

@@ -3,8 +3,8 @@ use tokio::sync::{mpsc, watch};
 
 use super::{
     RNG_SEED,
+    game_records::{CompletedGame, SelfPlayRecord},
     params::SelfPlayParams,
-    training_data::{CompletedGame, SelfPlayRecord},
 };
 use crate::{
     game::game_state::GameState,

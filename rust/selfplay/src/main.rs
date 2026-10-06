@@ -9,12 +9,13 @@ use config::SelfPlayConfig;
 /// Change this one value to reproduce or vary all self-play randomness.
 const RNG_SEED: u64 = 0;
 
+mod chunk_encoder;
 mod chunk_writer;
 mod config;
 mod control;
+mod game_records;
 mod orchestrator;
 mod params;
-mod training_data;
 mod worker;
 
 const USAGE: &str = "Usage: rgo-selfplay <config.toml> (client-supervised worker)";

@@ -161,7 +161,7 @@ features. Training chunks store compact inputs, FP16 policies, and
 player-relative final win/score/ownership labels. The initial chunk layout is
 still under development; the shared schema is in
 [rgo-artifacts::chunk](rust/artifacts/src/chunk.rs), and its self-play encoder is in
-[training_data.rs](rust/selfplay/src/training_data.rs).
+[chunk_encoder.rs](rust/selfplay/src/chunk_encoder.rs).
 
 ## License and acknowledgments
 

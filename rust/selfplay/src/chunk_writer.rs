@@ -9,8 +9,9 @@ use rgo_artifacts::{ChunkId, chunk_path};
 use tokio::sync::mpsc;
 
 use super::{
+    chunk_encoder::ChunkEncoder,
     control::{Event, EventPublisher},
-    training_data::{ChunkEncoder, CompletedGame},
+    game_records::CompletedGame,
 };
 use crate::{
     game::{

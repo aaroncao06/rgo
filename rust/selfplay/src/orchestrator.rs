@@ -9,7 +9,7 @@ use super::{
     chunk_writer::{ChunkWriter, ChunkWriterError},
     config::SelfPlayConfig,
     control::EventPublisher,
-    training_data::CompletedGame,
+    game_records::CompletedGame,
     worker::{SelfPlayError, WorkerModelControl},
 };
 use crate::inference::runtime::{
