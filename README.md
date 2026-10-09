@@ -7,7 +7,9 @@ and 19x19 boards.
 The Rust engine implements positional superko, area scoring, batched ONNX
 inference with a model-scoped cache, and PUCT graph search. The self-play worker
 generates games and writes training chunks under the control of a parent
-process. The trainer, supervising client/server, and interactive player are
+process. The server binary has a replay core that retains packed chunks and
+exports sampled NPZ shards with arrays grouped by board size.
+The trainer, client supervision, server transport, and interactive player are
 not implemented yet. No trained model is included; the ONNX files under the
 engine's test directory are synthetic fixtures.
 
@@ -44,9 +46,10 @@ The research direction is making these component boundaries work efficiently
 across local and distributed deployments. Scheduling, transfer costs, and
 learning efficiency still need experimental validation.
 
-The current repository implements the engine and self-play worker. Next steps:
+The current repository implements the engine, self-play worker, and server
+replay core. Next steps:
 
-1. Add local client/server coordination, replay retention, and shard sampling.
+1. Wire local client/server coordination to replay ingestion and shard sampling.
 2. Add the trainer and validate a complete 9x9 training loop.
 3. Add remote artifact transfers behind the same worker interfaces.
 4. Add workload scheduling and checkpoint-based trainer migration.
@@ -147,11 +150,14 @@ belong to the engine. See the
 
 - [`rust/artifacts`](rust/artifacts/src/lib.rs): shared model/chunk identities
   and filename conventions, plus the binary chunk schema, record sizes, header
-  encoding, checksum verification, and validated borrowed record views.
+  encoding, and checksum verification.
 - [`rust/engine`](rust/engine/src/lib.rs): reusable board, inference, and search
   library, independent of self-play.
 - [`rust/selfplay`](rust/selfplay/src/main.rs): process configuration, game
   workers, model handoff, pipe protocol, and chunk publication.
+- [`rust/server`](rust/server/README.md): chunk reading/validation, persistent
+  replay storage, FIFO retention, and sampling into NPZ training shards inside
+  the server binary.
 - [`configs`](configs/README.md): example self-play configuration and usage.
 
 Search currently resets its graph for every move. The search defaults are

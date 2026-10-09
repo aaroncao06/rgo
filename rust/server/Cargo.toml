@@ -1,0 +1,16 @@
+[package]
+name = "rgo-server"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+npyz = { version = "0.9", features = ["half"] }
+rand = { version = "0.10", default-features = false }
+rgo-artifacts = { path = "../artifacts" }
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
+tempfile = "3.27"
+zip = { version = "0.6", default-features = false }
+
+[dev-dependencies]
+sha2 = "0.10"

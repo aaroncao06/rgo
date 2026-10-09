@@ -3,7 +3,7 @@ use super::*;
 use crate::game::board::MAX_BOARD_DIM;
 use crate::game::{game_state::GameState, rules::Rules};
 use crate::inference::policy::MAX_POLICY_SIZE;
-use rgo_artifacts::chunk::{CHUNK_FORMAT_VERSION, CHUNK_MAGIC, Chunk, verify_chunk_checksum};
+use rgo_artifacts::chunk::{CHUNK_FORMAT_VERSION, CHUNK_MAGIC, verify_chunk_checksum};
 
 fn sample(board_dim: usize) -> TestSample {
     let mut input = NNInput::encode(&GameState::new(Rules {
@@ -53,16 +53,6 @@ fn chunk_encoding_stores_only_active_cells_and_pass_for_all_board_dims() {
             CHUNK_HEADER_SIZE + training_record_size(board_dim) + CHUNK_CHECKSUM_SIZE
         );
         assert!(verify_chunk_checksum(&bytes));
-
-        let chunk = Chunk::parse(&bytes).unwrap();
-        let record = chunk.records().next().unwrap();
-        assert_eq!(chunk.record_count(), 1);
-        assert_eq!(record.board_dim(), board_dim);
-        assert_eq!(record.offset(), CHUNK_HEADER_SIZE);
-        assert_eq!(
-            record.bytes(),
-            &bytes[CHUNK_HEADER_SIZE..bytes.len() - CHUNK_CHECKSUM_SIZE]
-        );
 
         let mut offset = CHUNK_HEADER_SIZE;
         assert_eq!(usize::from(bytes[offset]), board_dim);
@@ -179,14 +169,9 @@ fn mixed_dim_records_are_self_describing_in_full_and_partial_chunks() {
         assert_eq!(encoder.record_count(), 5);
         let bytes = encoder.finish();
         assert_eq!(read_u32(bytes, 16), 5);
-        let chunk = Chunk::parse(bytes).unwrap();
-        assert_eq!(chunk.record_count(), 5);
         let mut offset = CHUNK_HEADER_SIZE;
-        for (board_dim, record) in [9, 13, 19, 3, 5].into_iter().zip(chunk.records()) {
+        for board_dim in [9, 13, 19, 3, 5] {
             assert_eq!(usize::from(bytes[offset]), board_dim);
-            assert_eq!(record.board_dim(), board_dim);
-            assert_eq!(record.offset(), offset);
-            assert_eq!(record.bytes().as_ptr(), bytes[offset..].as_ptr());
             offset += training_record_size(board_dim);
         }
         assert_eq!(offset + CHUNK_CHECKSUM_SIZE, bytes.len());

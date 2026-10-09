@@ -1,5 +1,5 @@
 [workspace]
-members = ["artifacts", "engine", "selfplay"]
+members = ["artifacts", "engine", "selfplay", "server"]
 resolver = "2"
 
 [workspace.package]

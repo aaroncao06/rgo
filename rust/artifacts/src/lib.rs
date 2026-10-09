@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 
 pub mod chunk;
 
+/// Board sizes supported by inference, self-play, and replay ingestion.
+pub const SUPPORTED_BOARD_DIMS: [usize; 3] = [9, 13, 19];
+
 /// Identity of an immutable published model.
 pub type ModelVersion = u64;
 /// Identity of an immutable self-play chunk.

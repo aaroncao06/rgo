@@ -1,5 +1,4 @@
-/// Board sizes supported by self-play and inference batching.
-pub const SUPPORTED_BOARD_DIMS: [usize; 3] = [9, 13, 19];
+pub use rgo_artifacts::SUPPORTED_BOARD_DIMS;
 
 pub mod backend;
 pub mod inputs;
