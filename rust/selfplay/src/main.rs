@@ -72,7 +72,7 @@ async fn run(config: SelfPlayConfig) -> Result<(), String> {
             config.inference.model_dir.display()
         ));
     }
-    prepare_output_dir(&config.output_dir).map_err(|error| {
+    rgo_fs::prepare_directory(&config.output_dir).map_err(|error| {
         format!(
             "could not prepare output directory {}: {error}",
             config.output_dir.display()
@@ -116,30 +116,6 @@ async fn with_shutdown<F: Future<Output = Result<(), String>>>(
     // JoinSet aborts the signal task on success or error, keeping the sender
     // alive throughout orchestration without leaving a detached task behind.
     run(finish_tx, finish_rx).await
-}
-
-/// Provision directory entries durably before the chunk writer publishes chunks.
-fn prepare_output_dir(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    let parents = {
-        let absolute = env::current_dir()?.join(path);
-        let mut missing = absolute.as_path();
-        let mut parents = Vec::new();
-        while !missing.try_exists()? {
-            let parent = missing
-                .parent()
-                .ok_or_else(|| io::Error::other("output directory has no parent"))?;
-            parents.push(parent.to_path_buf());
-            missing = parent;
-        }
-        parents
-    };
-    fs::create_dir_all(path)?;
-    #[cfg(unix)]
-    for parent in parents {
-        fs::File::open(parent)?.sync_all()?;
-    }
-    Ok(())
 }
 
 struct ShutdownSignals {

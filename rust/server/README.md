@@ -61,17 +61,11 @@ it does not create or open ancestor directories.
   records already evicted.
 
 The file and replay directory are synced before the acceptance/retention
-transaction commits. SQLite uses DELETE journaling with `cache_spill = OFF`, so
-modified catalog pages remain in memory until commit. The store explicitly syncs
-the catalog directory after SQL updates and before commit on Unix, ensuring the
-rollback journal's filename is durable before database pages are overwritten.
-Schema creation uses the same transaction path. SQLite uses `synchronous = EXTRA`
-to sync rollback-journal deletion before commit returns. Catalog changes are
-durable before intake or evicted chunk files are removed. The store syncs the
-catalog directory after each write commit on Unix because SQLite can silently
-skip its directory sync if opening the directory fails. On macOS, SQLite also
-uses `fullfsync = ON` for journal/database writes, and the explicit directory
-sync flushes journal deletion through the drive's cache before file cleanup.
+transaction commits. SQLite manages catalog durability and recovery using
+DELETE journaling, `synchronous = EXTRA`, and `fullfsync = ON` for macOS.
+The store uses normal SQLite commits before removing intake or evicted chunk
+files. SQLite manages its journal synchronization; there are no additional
+application barriers around database commits.
 `fullfsync` is enabled before `synchronous`: preparing the latter can trigger
 hot-journal recovery, which must fully sync the restored database on macOS.
 The intake filename remains available until registration and eviction cleanup

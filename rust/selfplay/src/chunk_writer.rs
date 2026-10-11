@@ -1,11 +1,12 @@
 use std::{
     fs::{self, File},
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 
 use rand::{TryRng, rngs::SysError, rngs::SysRng};
 use rgo_artifacts::{ChunkId, chunk_path};
+use rgo_fs::sync_directory;
 use tokio::sync::mpsc;
 
 use super::{
@@ -236,16 +237,6 @@ fn ownership_for_player(
         };
     }
     ownership
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> io::Result<()> {
-    Ok(())
 }
 
 fn random_chunk_id() -> Result<ChunkId, SysError> {

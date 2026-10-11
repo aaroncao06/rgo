@@ -657,6 +657,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rgo-fs"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "rgo-selfplay"
 version = "0.1.0"
 dependencies = [
@@ -665,6 +672,7 @@ dependencies = [
  "rand",
  "rgo-artifacts",
  "rgo-engine",
+ "rgo-fs",
  "serde",
  "serde_json",
  "sha2",
@@ -679,6 +687,7 @@ dependencies = [
  "npyz",
  "rand",
  "rgo-artifacts",
+ "rgo-fs",
  "rusqlite",
  "sha2",
  "tempfile",

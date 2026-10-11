@@ -12,6 +12,7 @@ webgpu = ["rgo-engine/webgpu"]
 [dependencies]
 half = "2.7"
 rgo-artifacts = { path = "../artifacts" }
+rgo-fs = { path = "../fs" }
 rgo-engine = { path = "../engine" }
 rand = { version = "0.10", default-features = false, features = ["sys_rng"] }
 serde = { version = "1", features = ["derive"] }

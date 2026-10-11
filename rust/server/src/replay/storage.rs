@@ -32,18 +32,19 @@ impl ReplayStore {
         fs::create_dir_all(&chunk_dir)?;
         sync_directory(root)?;
         let mut db = Connection::open(root.join("replay.sqlite"))?;
-        // EXTRA syncs journal deletion; fullfsync orders journal/database writes
-        // through the drive's cache on macOS. commit_catalog also enforces the
-        // directory barrier because SQLite can silently skip it on Unix.
+        // SQLite owns catalog durability and recovery. EXTRA syncs journal
+        // deletion; fullfsync flushes journal/database writes on macOS.
+        // We accept residual catalog-corruption risk if power loss follows a
+        // directory-sync failure SQLite ignores. Future startup repair could
+        // validate surviving chunks and rebuild the catalog, accepting loss of
+        // arrival order and receipts for evicted chunks. No rebuild exists yet.
         // Set fullfsync first: preparing synchronous loads the schema and can
         // recover a hot journal, which must fully sync the restored database.
         db.execute_batch(
             "PRAGMA fullfsync = ON;
-             PRAGMA cache_spill = OFF;
              PRAGMA synchronous = EXTRA;
              PRAGMA journal_mode = DELETE;",
         )?;
-        // Schema writes need the same journal-creation barrier as later updates.
         let transaction = db.transaction()?;
         transaction.execute_batch(
             "CREATE TABLE IF NOT EXISTS chunks (
@@ -51,16 +52,12 @@ impl ReplayStore {
                  id BLOB NOT NULL UNIQUE CHECK(length(id) = 16),
                  record_count INTEGER NOT NULL CHECK(record_count > 0),
                  byte_len INTEGER NOT NULL CHECK(byte_len > 0),
-                 active INTEGER NOT NULL CHECK(active IN (0, 1)),
-                 has_file INTEGER NOT NULL CHECK(has_file IN (0, 1)),
-                 CHECK(active = 0 OR has_file = 1)
+                 active INTEGER NOT NULL CHECK(active IN (0, 1))
              );
              CREATE INDEX IF NOT EXISTS active_chunks ON chunks(seq)
-                 WHERE active = 1;
-             CREATE INDEX IF NOT EXISTS pending_deletions ON chunks(seq)
-                 WHERE active = 0 AND has_file = 1;",
+                 WHERE active = 1;",
         )?;
-        commit_catalog(transaction, root)?;
+        transaction.commit()?;
         let mut store = Self {
             config,
             chunk_dir,
@@ -139,8 +136,8 @@ impl ReplayStore {
             let evicted = {
                 let transaction = self.db.transaction()?;
                 transaction.execute(
-                    "INSERT INTO chunks (id, record_count, byte_len, active, has_file)
-                     VALUES (?1, ?2, ?3, 1, 1)",
+                    "INSERT INTO chunks (id, record_count, byte_len, active)
+                     VALUES (?1, ?2, ?3, 1)",
                     params![
                         id.to_be_bytes().as_slice(),
                         records as i64,
@@ -153,12 +150,11 @@ impl ReplayStore {
                     total,
                     self.config.window_records,
                 )?;
-                commit_catalog(transaction, self.chunk_dir.parent().unwrap())?;
+                transaction.commit()?;
                 evicted
             };
             self.chunks.push_back(indexed);
-            self.trim_index(total, evicted);
-            self.cleanup_evicted()?;
+            self.finish_eviction(total, evicted)?;
             IngestOutcome::Added { records }
         };
         // Also finish intake cleanup on retries of a committed acceptance.
@@ -188,24 +184,26 @@ impl ReplayStore {
             self.retained_records as u64,
             records,
         )?;
-        if evicted == 0 {
-            // No SQL writes or journal to persist; still finish pending cleanup below.
-            transaction.commit()?;
-        } else {
-            commit_catalog(transaction, self.chunk_dir.parent().unwrap())?;
-        }
+        transaction.commit()?;
         self.config.window_records = records;
-        self.trim_index(self.retained_records as u64, evicted);
-        self.cleanup_evicted()?;
+        self.finish_eviction(self.retained_records as u64, evicted)?;
         self.needs_reopen = false;
         Ok(())
     }
 
-    fn trim_index(&mut self, mut total: u64, evicted: usize) {
+    // The catalog has already committed. If deletion is interrupted, reopening
+    // loads the active inventory and removes the remaining inactive files.
+    fn finish_eviction(&mut self, mut total: u64, evicted: usize) -> Result<()> {
         for _ in 0..evicted {
-            total -= self.chunks.pop_front().unwrap().records as u64;
+            let chunk = self.chunks.pop_front().unwrap();
+            remove_if_exists(&chunk_path(&self.chunk_dir, chunk.id))?;
+            total -= chunk.records as u64;
+        }
+        if evicted > 0 {
+            sync_directory(&self.chunk_dir)?;
         }
         self.retained_records = total as usize;
+        Ok(())
     }
 
     fn load_index(&mut self) -> Result<()> {
@@ -238,31 +236,6 @@ impl ReplayStore {
         Ok(())
     }
 
-    fn cleanup_evicted(&mut self) -> Result<()> {
-        let pending = {
-            let mut statement = self
-                .db
-                .prepare("SELECT id FROM chunks WHERE active = 0 AND has_file = 1")?;
-            statement
-                .query_map([], |row| row.get::<_, Vec<u8>>(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        if pending.is_empty() {
-            return Ok(());
-        }
-        for id in &pending {
-            remove_if_exists(&chunk_path(&self.chunk_dir, decode_id(id)?))?;
-        }
-        sync_directory(&self.chunk_dir)?;
-        let transaction = self.db.transaction()?;
-        transaction.execute(
-            "UPDATE chunks SET has_file = 0 WHERE active = 0 AND has_file = 1",
-            [],
-        )?;
-        commit_catalog(transaction, self.chunk_dir.parent().unwrap())?;
-        Ok(())
-    }
-
     fn remove_orphans(&self) -> Result<()> {
         let active: HashSet<_> = self.chunks.iter().map(|chunk| chunk.id).collect();
         for entry in fs::read_dir(&self.chunk_dir)? {
@@ -287,20 +260,6 @@ impl ReplayStore {
         sync_directory(&self.chunk_dir)?;
         Ok(())
     }
-}
-
-pub(super) fn commit_catalog(transaction: Transaction<'_>, directory: &Path) -> Result<()> {
-    // The bundled build opens its disk journal on the first SQL write. With
-    // cache_spill disabled, changed database pages stay in RAM until COMMIT.
-    // Persist journal creation first: SQLite ignores directory-sync failures
-    // inside unixSync, so a post-commit barrier alone cannot protect rollback.
-    sync_directory(directory)?;
-    transaction.commit()?;
-    // SQLite's EXTRA sync silently skips the directory if opening it fails.
-    // Enforce the barrier before deleting files, propagating failures on Unix.
-    // On macOS this also uses F_FULLFSYNC instead of SQLite's ordinary fsync.
-    sync_directory(directory)?;
-    Ok(())
 }
 
 fn evict_chunks(
@@ -345,13 +304,8 @@ fn remove_if_exists(path: &Path) -> io::Result<()> {
     }
 }
 
-#[cfg(unix)]
 pub(super) fn sync_directory(path: &Path) -> io::Result<()> {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     super::tests::before_directory_sync(path)?;
-    File::open(path)?.sync_all()
-}
-#[cfg(not(unix))]
-pub(super) fn sync_directory(_: &Path) -> io::Result<()> {
-    Ok(())
+    rgo_fs::sync_directory(path)
 }

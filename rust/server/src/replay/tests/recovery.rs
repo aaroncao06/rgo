@@ -1,4 +1,3 @@
-use super::super::storage::commit_catalog;
 use super::*;
 
 #[test]
@@ -17,140 +16,12 @@ fn catalog_uses_durable_sync_settings_on_initial_open_and_reopen() {
             .query_row("PRAGMA fullfsync", [], |row| row.get(0))
             .unwrap();
         assert!(fullfsync, "macOS catalog writes require F_FULLFSYNC");
-        let cache_spill: bool = store
-            .db
-            .query_row("PRAGMA cache_spill", [], |row| row.get(0))
-            .unwrap();
-        assert!(
-            !cache_spill,
-            "database writes must wait for the journal barrier"
-        );
         let journal_mode: String = store
             .db
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
         assert_eq!(journal_mode, "delete");
-        // Atomic-write builds may defer creating the disk journal until COMMIT,
-        // which would invalidate the pre-commit directory barrier.
-        let deferred_journal: bool = store
-            .db
-            .query_row(
-                "SELECT sqlite_compileoption_used('ENABLE_ATOMIC_WRITE') OR
-                        sqlite_compileoption_used('ENABLE_BATCH_ATOMIC_WRITE')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(
-            !deferred_journal,
-            "catalog requires an immediately created journal"
-        );
     }
-}
-
-#[cfg(unix)]
-#[test]
-fn failed_schema_journal_barrier_rolls_back_initialization() {
-    let root = TempDir::new().unwrap();
-    {
-        // The first root sync provisions chunks/; the next precedes schema COMMIT.
-        let _fault = faults::inject_after(faults::Operation::Sync, root.path().to_owned(), 1);
-        assert!(matches!(
-            ReplayStore::open(root.path(), config(100)),
-            Err(ReplayError::Io(_))
-        ));
-    }
-    let db = Connection::open(root.path().join("replay.sqlite")).unwrap();
-    let tables: u32 = db
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'chunks'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(tables, 0);
-    drop(db);
-    // A failed open releases the lock and can safely repeat initialization.
-    let store = ReplayStore::open(root.path(), config(100)).unwrap();
-    assert_eq!(store.stats().unwrap().retained_records, 0);
-}
-
-#[cfg(unix)]
-#[test]
-fn dirty_catalog_pages_wait_for_the_journal_barrier_even_with_a_small_cache() {
-    let root = TempDir::new().unwrap();
-    let mut store = ReplayStore::open(root.path(), config(100)).unwrap();
-    let transaction = store.db.transaction().unwrap();
-    transaction
-        .execute_batch(
-            "CREATE TABLE barrier_fixture (id INTEGER PRIMARY KEY, payload BLOB);
-             WITH RECURSIVE rows(n) AS (
-                 VALUES(1) UNION ALL SELECT n + 1 FROM rows WHERE n < 200
-             ) INSERT INTO barrier_fixture SELECT n, randomblob(4096) FROM rows;",
-        )
-        .unwrap();
-    commit_catalog(transaction, root.path()).unwrap();
-    store.db.execute_batch("PRAGMA cache_size = 2").unwrap();
-    let original = fs::read(root.path().join("replay.sqlite")).unwrap();
-    let transaction = store.db.transaction().unwrap();
-    transaction
-        .execute("UPDATE barrier_fixture SET payload = zeroblob(4096)", [])
-        .unwrap();
-    assert!(root.path().join("replay.sqlite-journal").is_file());
-    // This UPDATE dirties far more pages than the cache target. They must stay
-    // in RAM, rather than spill before we can persist journal creation.
-    assert!(
-        fs::read(root.path().join("replay.sqlite")).unwrap() == original,
-        "database pages changed before the journal-creation barrier"
-    );
-    let _fault = faults::inject([(faults::Operation::Sync, root.path().to_owned())]);
-    assert!(matches!(
-        commit_catalog(transaction, root.path()),
-        Err(ReplayError::Io(_))
-    ));
-    assert!(
-        fs::read(root.path().join("replay.sqlite")).unwrap() == original,
-        "aborting before the journal-creation barrier changed database pages"
-    );
-    assert!(store.db.is_autocommit());
-}
-
-#[cfg(unix)]
-#[test]
-fn failed_ingestion_journal_barrier_preserves_prior_catalog_and_intake() {
-    let root = TempDir::new().unwrap();
-    let intake = TempDir::new().unwrap();
-    let mut store = ReplayStore::open(root.path(), config(1)).unwrap();
-    store.ingest(1, &chunk(&[(9, 1)])).unwrap();
-    let original = fs::read(root.path().join("replay.sqlite")).unwrap();
-    let source = intake.path().join("chunk.rgo");
-    fs::write(&source, chunk(&[(19, 2)])).unwrap();
-    sync_directory(intake.path()).unwrap();
-    {
-        let _fault = faults::inject([(faults::Operation::Sync, root.path().to_owned())]);
-        assert!(matches!(
-            store.ingest_file(2, &source),
-            Err(ReplayError::Io(_))
-        ));
-        assert_requires_reopen(&mut store, root.path());
-    }
-    assert_eq!(
-        fs::read(root.path().join("replay.sqlite")).unwrap(),
-        original
-    );
-    assert!(source.exists());
-    assert!(chunk_path(&store.chunk_dir, 1).exists());
-    assert!(chunk_path(&store.chunk_dir, 2).exists());
-    drop(store);
-    let mut store = ReplayStore::open(root.path(), config(1)).unwrap();
-    assert_eq!(tags(&store), BTreeSet::from([1]));
-    assert!(!chunk_path(&store.chunk_dir, 2).exists());
-    assert_eq!(
-        store.ingest_file(2, &source).unwrap(),
-        IngestOutcome::Added { records: 1 }
-    );
-    assert_eq!(tags(&store), BTreeSet::from([2]));
-    assert!(!source.exists());
 }
 
 #[test]
@@ -462,60 +333,40 @@ fn window_changes_without_eviction_skip_directory_syncs() {
 #[cfg(unix)]
 #[test]
 fn interrupted_batch_eviction_cleanup_recovers_without_new_evictions() {
-    // Fail partway through deletion, before its directory barrier, or on either
-    // side of the cleanup catalog commit. All receipts must survive each case.
-    for stage in 0..4 {
+    // Fail partway through deletion or at its directory barrier.
+    // The retention decision and acceptance receipts must survive each case.
+    for stage in 0..2 {
         let root = TempDir::new().unwrap();
         let mut store = ReplayStore::open(root.path(), config(4)).unwrap();
         for id in 1..=4 {
             store.ingest(id, &chunk(&[(9, id as u8)])).unwrap();
         }
         {
-            let (operation, path, skip) = match stage {
-                0 => (
-                    faults::Operation::Remove,
-                    chunk_path(&store.chunk_dir, 2),
-                    0,
-                ),
-                1 => (faults::Operation::Sync, store.chunk_dir.clone(), 0),
-                // The eviction decision has its own two root barriers first.
-                _ => (faults::Operation::Sync, root.path().to_owned(), stage),
+            let (operation, path) = match stage {
+                0 => (faults::Operation::Remove, chunk_path(&store.chunk_dir, 2)),
+                _ => (faults::Operation::Sync, store.chunk_dir.clone()),
             };
-            let _fault = faults::inject_after(operation, path, skip);
+            let _fault = faults::inject([(operation, path)]);
             assert!(matches!(store.set_window(1), Err(ReplayError::Io(_))));
             assert_requires_reopen(&mut store, root.path());
         }
-        let pending: u32 = store
-            .db
-            .query_row(
-                "SELECT count(*) FROM chunks WHERE active = 0 AND has_file = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(pending, if stage == 3 { 0 } else { 3 });
         drop(store);
 
-        // Growing on reopen evicts nothing, but must still finish pending cleanup.
+        let expected = BTreeSet::from([4]);
+        // Growing on reopen evicts nothing. The directory scan finishes cleanup.
         let mut store = ReplayStore::open(root.path(), config(4)).unwrap();
-        assert_eq!(tags(&store), BTreeSet::from([4]));
-        assert_eq!(fs::read_dir(&store.chunk_dir).unwrap().count(), 1);
-        let pending: u32 = store
-            .db
-            .query_row(
-                "SELECT count(*) FROM chunks WHERE active = 0 AND has_file = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(pending, 0);
+        assert_eq!(tags(&store), expected);
+        assert_eq!(
+            fs::read_dir(&store.chunk_dir).unwrap().count(),
+            expected.len()
+        );
         for id in 1..=3 {
             assert_eq!(
                 store.ingest(id, &chunk(&[(9, id as u8)])).unwrap(),
                 IngestOutcome::AlreadyAccepted { records: 1 },
             );
         }
-        assert_eq!(tags(&store), BTreeSet::from([4]));
+        assert_eq!(tags(&store), expected);
     }
 }
 
@@ -603,40 +454,6 @@ fn failed_intake_cleanup_retries_committed_acceptance_without_reintroducing_data
         assert_eq!(store.stats().unwrap().retained_records, 2);
         assert_eq!(tags(&store), BTreeSet::from([1, 2]));
     }
-}
-
-#[cfg(unix)]
-#[test]
-fn failed_postcommit_catalog_directory_sync_prevents_intake_and_eviction_cleanup() {
-    let root = TempDir::new().unwrap();
-    let intake = TempDir::new().unwrap();
-    let mut store = ReplayStore::open(root.path(), config(1)).unwrap();
-    store.ingest(1, &chunk(&[(9, 1)])).unwrap();
-    let source = intake.path().join("chunk.rgo");
-    fs::write(&source, chunk(&[(19, 2)])).unwrap();
-    sync_directory(intake.path()).unwrap();
-    {
-        let _fault = faults::inject_after(faults::Operation::Sync, root.path().to_owned(), 1);
-        assert!(matches!(
-            store.ingest_file(2, &source),
-            Err(ReplayError::Io(_))
-        ));
-        assert_requires_reopen(&mut store, root.path());
-    }
-    // Registration committed, but neither intake nor the old file can be
-    // deleted until the explicit catalog directory barrier succeeds.
-    assert!(source.exists());
-    assert!(chunk_path(&store.chunk_dir, 1).exists());
-    assert!(chunk_path(&store.chunk_dir, 2).exists());
-    drop(store);
-    let mut store = ReplayStore::open(root.path(), config(1)).unwrap();
-    assert_eq!(tags(&store), BTreeSet::from([2]));
-    assert!(!chunk_path(&store.chunk_dir, 1).exists());
-    assert_eq!(
-        store.ingest_file(2, &source).unwrap(),
-        IngestOutcome::AlreadyAccepted { records: 1 }
-    );
-    assert!(!source.exists());
 }
 
 #[test]

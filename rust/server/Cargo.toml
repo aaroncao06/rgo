@@ -8,6 +8,7 @@ license.workspace = true
 npyz = { version = "0.9", features = ["half"] }
 rand = { version = "0.10", default-features = false }
 rgo-artifacts = { path = "../artifacts" }
+rgo-fs = { path = "../fs" }
 rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
 tempfile = "3.27"
 zip = { version = "0.6", default-features = false }
