@@ -17,7 +17,7 @@ use crate::inference::runtime::{
 };
 
 mod worker_group;
-use worker_group::{WorkerEvent, WorkerGroup, WorkerSpec};
+use worker_group::{WorkerGroup, WorkerResult, WorkerSpec};
 
 #[derive(Debug)]
 pub(super) enum SelfPlayRunError {
@@ -40,7 +40,7 @@ pub(super) struct SelfPlayOrchestrator {
     worker_groups: Vec<WorkerGroup>,
     writer: ChunkWriter,
     pause_tx: watch::Sender<bool>,
-    paused_rx: mpsc::Receiver<usize>,
+    paused_rx: mpsc::Receiver<()>,
     resume_txs: Vec<mpsc::Sender<ModelHandle>>,
 }
 
@@ -181,9 +181,9 @@ struct RunningPipeline {
     pause_tx: watch::Sender<bool>,
     latest_model_version_rx: watch::Receiver<Option<ModelVersion>>,
     finish_games_rx: watch::Receiver<bool>,
-    paused_rx: mpsc::Receiver<usize>,
+    paused_rx: mpsc::Receiver<()>,
     resume_txs: Vec<mpsc::Sender<ModelHandle>>,
-    events_rx: mpsc::UnboundedReceiver<WorkerEvent>,
+    events_rx: mpsc::UnboundedReceiver<WorkerResult>,
     group_threads: Vec<thread::JoinHandle<()>>,
     writer_thread: thread::JoinHandle<()>,
     writer_result: Option<oneshot::Receiver<Result<(), ChunkWriterError>>>,
@@ -383,11 +383,11 @@ fn check_writer_result(
 }
 
 fn record_worker_event(
-    event: Option<WorkerEvent>,
+    event: Option<WorkerResult>,
     active_workers: &mut usize,
 ) -> Result<(), SelfPlayRunError> {
     match event {
-        Some(WorkerEvent::Finished(result)) => {
+        Some(result) => {
             *active_workers -= 1;
             result
                 .map_err(SelfPlayRunError::Task)?

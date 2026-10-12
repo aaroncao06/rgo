@@ -1,6 +1,7 @@
 //! Self-play worker process supervised by the client over local pipes.
 
 use rgo_engine::{game, inference, search};
+use rgo_protocol::ShutdownSignals;
 use std::{env, fs, future::Future, io, path::Path, process};
 use tokio::{sync::watch, task::JoinSet};
 
@@ -18,7 +19,7 @@ mod orchestrator;
 mod params;
 mod worker;
 
-const USAGE: &str = "Usage: rgo-selfplay <config.toml> (client-supervised worker)";
+const USAGE: &str = "Usage: rgo-selfplay <config.toml> [--model-dir <path>] [--output-dir <path>] (client-supervised worker)";
 
 fn main() {
     let mut args = env::args_os().skip(1);
@@ -26,16 +27,34 @@ fn main() {
         eprintln!("{USAGE}");
         process::exit(2);
     };
-    if args.next().is_some() {
-        eprintln!("{USAGE}");
-        process::exit(2);
-    }
     if path == "--help" || path == "-h" {
         println!("{USAGE}");
         return;
     }
 
-    let config = SelfPlayConfig::load(Path::new(&path)).unwrap_or_else(|error| fatal(error));
+    let mut model_dir = None;
+    let mut output_dir = None;
+    while let Some(flag) = args.next() {
+        let destination = match flag.to_str() {
+            Some("--model-dir") if model_dir.is_none() => &mut model_dir,
+            Some("--output-dir") if output_dir.is_none() => &mut output_dir,
+            _ => {
+                eprintln!("{USAGE}");
+                process::exit(2);
+            }
+        };
+        *destination = Some(args.next().unwrap_or_else(|| {
+            eprintln!("{USAGE}");
+            process::exit(2);
+        }));
+    }
+    let mut config = SelfPlayConfig::load(Path::new(&path)).unwrap_or_else(|error| fatal(error));
+    if let Some(directory) = model_dir {
+        config.inference.model_dir = directory.into();
+    }
+    if let Some(directory) = output_dir {
+        config.output_dir = directory.into();
+    }
     let runtime = build_runtime()
         .unwrap_or_else(|error| fatal(format!("could not start Tokio runtime: {error}")));
     if let Err(error) = runtime.block_on(run(config)) {
@@ -78,6 +97,17 @@ async fn run(config: SelfPlayConfig) -> Result<(), String> {
             config.output_dir.display()
         )
     })?;
+    // The child owns this lock through its entire drain, even if its parent dies.
+    let _output_lock = fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(config.output_dir.join(".selfplay.lock"))
+        .map_err(|error| error.to_string())?;
+    _output_lock
+        .try_lock()
+        .map_err(|error| format!("self-play output directory is already in use: {error}"))?;
     with_shutdown(|finish_tx, finish_rx| async move {
         eprintln!(
             "Starting {} self-play workers; receiving model commands for {}; writing chunks to {}.",
@@ -116,44 +146,6 @@ async fn with_shutdown<F: Future<Output = Result<(), String>>>(
     // JoinSet aborts the signal task on success or error, keeping the sender
     // alive throughout orchestration without leaving a detached task behind.
     run(finish_tx, finish_rx).await
-}
-
-struct ShutdownSignals {
-    #[cfg(unix)]
-    interrupt: tokio::signal::unix::Signal,
-    #[cfg(unix)]
-    terminate: tokio::signal::unix::Signal,
-    #[cfg(windows)]
-    interrupt: tokio::signal::windows::CtrlC,
-}
-
-impl ShutdownSignals {
-    fn new() -> io::Result<Self> {
-        Ok(Self {
-            #[cfg(unix)]
-            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
-            #[cfg(unix)]
-            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
-            #[cfg(windows)]
-            interrupt: tokio::signal::windows::ctrl_c()?,
-        })
-    }
-
-    async fn recv(&mut self) -> io::Result<()> {
-        #[cfg(unix)]
-        {
-            let received = tokio::select! {
-                received = self.interrupt.recv() => received,
-                received = self.terminate.recv() => received,
-            };
-            received.ok_or_else(|| io::Error::other("shutdown signal stream closed"))
-        }
-        #[cfg(windows)]
-        self.interrupt
-            .recv()
-            .await
-            .ok_or_else(|| io::Error::other("shutdown signal stream closed"))
-    }
 }
 
 #[cfg(all(test, unix))]

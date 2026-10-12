@@ -45,7 +45,7 @@ impl From<SearchError> for SelfPlayError {
 pub(super) struct WorkerModelControl {
     pub(super) worker_index: usize,
     pub(super) pause_rx: watch::Receiver<bool>,
-    pub(super) paused_tx: mpsc::Sender<usize>,
+    pub(super) paused_tx: mpsc::Sender<()>,
     pub(super) resume_rx: mpsc::Receiver<ModelHandle>,
 }
 
@@ -133,7 +133,7 @@ impl SelfPlayWorker {
         }
         self.model_control
             .paused_tx
-            .send(self.model_control.worker_index)
+            .send(())
             .await
             .map_err(|_| SelfPlayError::ModelCoordinatorClosed)?;
         let model = self

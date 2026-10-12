@@ -21,9 +21,7 @@ pub(super) struct WorkerSpec {
     pub(super) model_control: WorkerModelControl,
 }
 
-pub(super) enum WorkerEvent {
-    Finished(Result<Result<(), SelfPlayError>, JoinError>),
-}
+pub(super) type WorkerResult = Result<Result<(), SelfPlayError>, JoinError>;
 
 pub(super) struct WorkerGroup {
     member_specs: Vec<WorkerSpec>,
@@ -44,7 +42,7 @@ impl WorkerGroup {
         self,
         max_games_per_worker: Option<usize>,
         finish_games_rx: watch::Receiver<bool>,
-        events_tx: mpsc::UnboundedSender<WorkerEvent>,
+        events_tx: mpsc::UnboundedSender<WorkerResult>,
     ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -76,7 +74,7 @@ impl WorkerGroup {
                 drop(finish_games_rx);
                 while let Some(result) = workers.join_next().await {
                     // sending events allows notifying the orchestrator about individual worker failures to kill promptly
-                    if events_tx.send(WorkerEvent::Finished(result)).is_err() {
+                    if events_tx.send(result).is_err() {
                         break;
                     }
                 }

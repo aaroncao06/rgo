@@ -11,6 +11,16 @@ fn help_and_usage_do_not_start_self_play() {
     for args in [
         vec![],
         vec!["one.toml", "two.toml"],
+        vec!["one.toml", "--model-dir"],
+        vec!["one.toml", "--output-dir"],
+        vec!["one.toml", "--model-dir", "models", "--model-dir", "other"],
+        vec![
+            "one.toml",
+            "--output-dir",
+            "chunks",
+            "--output-dir",
+            "other",
+        ],
         vec!["--managed", "one.toml"],
         vec!["--managed", "one.toml", "two.toml"],
     ] {
@@ -54,6 +64,15 @@ mod unix {
         }
 
         fn start_with_dim(model: Option<&str>, make_model_dir: bool, board_dim: usize) -> Self {
+            Self::start_with_args(model, make_model_dir, board_dim, &[])
+        }
+
+        fn start_with_args(
+            model: Option<&str>,
+            make_model_dir: bool,
+            board_dim: usize,
+            args: &[&str],
+        ) -> Self {
             let dir = std::env::temp_dir().join(format!(
                 "rgo-cli-test-{}-{}",
                 std::process::id(),
@@ -82,6 +101,7 @@ mod unix {
             let output = fs::File::create(dir.join("stdout.log")).unwrap();
             let child = Command::new(env!("CARGO_BIN_EXE_rgo-selfplay"))
                 .arg("config.toml")
+                .args(args)
                 .current_dir(&dir)
                 .stdin(Stdio::piped())
                 .stdout(output)
@@ -181,6 +201,59 @@ mod unix {
         let events = run.events();
         assert_eq!(events.len(), 2);
         assert_eq!(events[1]["type"], "stopped");
+    }
+
+    #[test]
+    fn a_second_worker_cannot_use_an_owned_output_directory() {
+        let mut run = TestProcess::worker(None);
+        run.ready();
+        let second = Command::new(env!("CARGO_BIN_EXE_rgo-selfplay"))
+            .arg("config.toml")
+            .current_dir(&run.dir)
+            .output()
+            .unwrap();
+        assert_eq!(second.status.code(), Some(1));
+        assert!(second.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&second.stderr).contains("already in use"));
+        run.send(r#"{"type":"finish"}"#);
+        assert!(run.finish().success());
+    }
+
+    #[test]
+    fn path_overrides_load_models_and_publish_chunks_outside_configured_directories() {
+        // The configured model directory is absent. The override uses the
+        // existing working directory; chunks go to a different nested path.
+        let mut run = TestProcess::start_with_args(
+            None,
+            false,
+            9,
+            &["--model-dir", ".", "--output-dir", "chosen/chunks"],
+        );
+        run.ready();
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../engine/tests/data/v0.onnx");
+        fs::copy(fixture, run.dir.join("42.onnx")).unwrap();
+        run.send(r#"{"type":"model_ready","version":42}"#);
+        run.until(|run| {
+            run.events()
+                .iter()
+                .any(|event| event["type"] == "chunk_ready")
+        });
+        run.send(r#"{"type":"finish"}"#);
+        assert!(run.finish().success(), "{}", run.log());
+        assert!(!run.dir.join("models").exists());
+        assert!(!run.dir.join("output").exists());
+        assert!(run.dir.join("chosen/chunks/.selfplay.lock").is_file());
+        for event in run
+            .events()
+            .iter()
+            .filter(|event| event["type"] == "chunk_ready")
+        {
+            let path = run.dir.join(event["path"].as_str().unwrap());
+            assert_eq!(path.parent().unwrap(), run.dir.join("chosen/chunks"));
+            assert!(path.is_file());
+        }
+        assert_eq!(run.events().last().unwrap()["type"], "stopped");
     }
 
     #[test]

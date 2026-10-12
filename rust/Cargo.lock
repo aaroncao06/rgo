@@ -664,6 +664,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rgo-protocol"
+version = "0.1.0"
+dependencies = [
+ "rgo-artifacts",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rgo-selfplay"
 version = "0.1.0"
 dependencies = [
@@ -673,6 +683,7 @@ dependencies = [
  "rgo-artifacts",
  "rgo-engine",
  "rgo-fs",
+ "rgo-protocol",
  "serde",
  "serde_json",
  "sha2",

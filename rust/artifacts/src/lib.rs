@@ -1,7 +1,10 @@
 //! Shared artifact identities, naming conventions, and binary schemas.
 //! Callers own storage roots and file/stream delivery; this crate performs no I/O.
 
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::OsStr,
+    path::{Path, PathBuf},
+};
 
 pub mod chunk;
 
@@ -30,6 +33,22 @@ pub fn chunk_path(output_dir: &Path, chunk_id: ChunkId) -> PathBuf {
     ))
 }
 
+/// Extract an ID from a canonical published chunk basename.
+pub fn chunk_id_from_filename(filename: &OsStr) -> Option<ChunkId> {
+    let name = filename.to_str()?;
+    let hex = name
+        .strip_prefix(CHUNK_FILE_PREFIX)?
+        .strip_suffix(CHUNK_FILE_SUFFIX)?;
+    if hex.len() != 32
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    ChunkId::from_str_radix(hex, 16).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -40,5 +59,21 @@ mod tests {
             model_path(Path::new("models"), 42),
             Path::new("models").join("42.onnx")
         );
+    }
+
+    #[test]
+    fn chunk_names_round_trip_and_reject_paths_or_noncanonical_names() {
+        for id in [0, 42, ChunkId::MAX] {
+            let path = chunk_path(Path::new(""), id);
+            assert_eq!(chunk_id_from_filename(path.as_os_str()), Some(id));
+        }
+        for name in [
+            "chunk-1.rgo",
+            "chunk-0000000000000000000000000000000A.rgo",
+            "../chunk-00000000000000000000000000000001.rgo",
+            ".pending-chunk.tmp",
+        ] {
+            assert!(chunk_id_from_filename(OsStr::new(name)).is_none());
+        }
     }
 }

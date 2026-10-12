@@ -8,11 +8,14 @@ mkdir -p models
 cargo run --release --manifest-path rust/Cargo.toml -p rgo-selfplay -- configs/self_play.toml
 ```
 
-The executable takes exactly one configuration path. Directory paths are
+The executable takes a configuration path and optional `--model-dir <path>`
+and `--output-dir <path>` overrides, so a supervisor can select artifact paths.
+Directory paths are
 relative to the worker's working directory, not the configuration file. The
 model directory must already exist; it can be empty while the worker waits for
 a model. The worker creates the output directory. Use one worker process per
-output directory because its writer uses a shared temporary filename.
+output directory. The worker holds `.selfplay.lock` through shutdown because
+its writer uses a shared temporary filename.
 
 The executable is designed to be launched by a supervising process. It uses
 local stdin/stdout pipes; the parent publishes models, consumes chunks, and
@@ -159,13 +162,12 @@ Packed cells occupy the least significant bits first; unused high bits are
 zero. Only active board cells are stored. Records occupy 235 bytes at 9x9,
 466 at 13x13, or 970 at 19x19. The layout is still under development; refer to
 the [shared schema](../rust/artifacts/src/chunk.rs) and the
-[encoder](../rust/selfplay/src/training_data.rs) for the current definition.
+[encoder](../rust/selfplay/src/chunk_encoder.rs) for the current definition.
 
-Rust consumers can use `rgo_artifacts::chunk::Chunk::parse` to validate a
-nonempty chunk's header, checksum, record count, dimensions (1 through 19), and
-record boundaries. Its `records()` iterator exposes each record's board
-dimension, offset within the file, and borrowed packed bytes. This validates
-structure and integrity; tensor values and packed labels remain undecoded.
+The server's [chunk reader](../rust/server/src/replay/chunk_reader.rs) validates
+incoming headers, checksums, record counts, supported dimensions (9, 13, 19),
+and record boundaries. Accepted chunks are trusted during sampling; selected
+record fields are read directly from their packed bytes.
 
 ## Commands and events
 

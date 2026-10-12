@@ -7,41 +7,14 @@ use std::{
 };
 
 use rgo_artifacts::{ModelVersion, model_path};
-use serde::{Deserialize, Serialize};
+use rgo_protocol::selfplay::Command;
+pub(super) use rgo_protocol::selfplay::Event;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
 use super::{config::SelfPlayConfig, orchestrator::SelfPlayOrchestrator};
 
 const MAX_COMMAND_BYTES: u64 = 4096;
-
-/// Commands received from the supervising client.
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum Command {
-    ModelReady { version: ModelVersion },
-    Finish {},
-}
-
-/// Events sent from the self-play process to its supervising client.
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(super) enum Event {
-    Ready {
-        protocol_version: u32,
-    },
-    ChunkReady {
-        path: PathBuf,
-        // No production consumer yet; retained for possible client logging or
-        // size accounting. Can be removed if those uses do not materialize.
-        bytes: usize,
-        records: usize,
-    },
-    Stopped,
-    Error {
-        message: String,
-    },
-}
 
 struct PendingEvent {
     event: Event,
@@ -196,7 +169,7 @@ async fn supervise_self_play(
     ));
     events
         .emit(Event::Ready {
-            protocol_version: 1,
+            protocol_version: rgo_protocol::PROTOCOL_VERSION,
         })
         .await
         .map_err(|error| format!("could not write ready event: {error}"))?;

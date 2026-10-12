@@ -99,7 +99,8 @@ only in tests.
 
 ## Run the self-play worker
 
-The worker takes one TOML configuration path and communicates through
+The worker takes a TOML configuration path, optional `--model-dir` and
+`--output-dir` overrides, and communicates through
 newline-delimited JSON on stdin and stdout. See
 [configuration and the process protocol](configs/README.md).
 
@@ -155,6 +156,9 @@ belong to the engine. See the
   library, independent of self-play.
 - [`rust/selfplay`](rust/selfplay/src/main.rs): process configuration, game
   workers, model handoff, pipe protocol, and chunk publication.
+- [`rust/protocol`](rust/protocol/src/lib.rs): shared JSON messages, framing,
+  and shutdown signal handling.
+- [`rust/fs`](rust/fs/src/lib.rs): directory creation and synchronization.
 - [`rust/server`](rust/server/README.md): chunk reading/validation, persistent
   replay storage, FIFO retention, and sampling into NPZ training shards inside
   the server binary.
