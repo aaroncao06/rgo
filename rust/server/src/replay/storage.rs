@@ -1,6 +1,6 @@
 //! Chunk ingestion, whole-file FIFO retention, and durable catalog recovery.
 
-use rgo_artifacts::{CHUNK_FILE_PREFIX, CHUNK_FILE_SUFFIX, ChunkId, chunk_path};
+use rgo_artifacts::{ChunkId, chunk_id_from_filename, chunk_path};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::{
     collections::{HashSet, VecDeque},
@@ -241,19 +241,10 @@ impl ReplayStore {
         for entry in fs::read_dir(&self.chunk_dir)? {
             let entry = entry?;
             let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            let Some(hex) = name
-                .strip_prefix(CHUNK_FILE_PREFIX)
-                .and_then(|name| name.strip_suffix(CHUNK_FILE_SUFFIX))
-            else {
+            let Some(id) = chunk_id_from_filename(&name) else {
                 continue;
             };
-            let Ok(id) = ChunkId::from_str_radix(hex, 16) else {
-                continue;
-            };
-            if name == format!("{CHUNK_FILE_PREFIX}{id:032x}{CHUNK_FILE_SUFFIX}")
-                && !active.contains(&id)
-            {
+            if !active.contains(&id) {
                 remove_if_exists(&entry.path())?;
             }
         }
@@ -304,7 +295,7 @@ fn remove_if_exists(path: &Path) -> io::Result<()> {
     }
 }
 
-pub(super) fn sync_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     #[cfg(all(test, unix))]
     super::tests::before_directory_sync(path)?;
     rgo_fs::sync_directory(path)

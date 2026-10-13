@@ -2,6 +2,7 @@
 /rust/target
 .DS_Store
 /coreml_cache/
+/data/
 
 # Private project notes and local agent instructions.
 /docs/

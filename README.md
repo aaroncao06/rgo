@@ -7,9 +7,10 @@ and 19x19 boards.
 The Rust engine implements positional superko, area scoring, batched ONNX
 inference with a model-scoped cache, and PUCT graph search. The self-play worker
 generates games and writes training chunks under the control of a parent
-process. The server binary has a replay core that retains packed chunks and
-exports sampled NPZ shards with arrays grouped by board size.
-The trainer, client supervision, server transport, and interactive player are
+process. The local server accepts shared chunk paths over loopback control requests, retains
+packed replay files, publishes model announcements, and exports sampled NPZ
+shards with arrays grouped by board size.
+The trainer, client supervision, remote transfers, and interactive player are
 not implemented yet. No trained model is included; the ONNX files under the
 engine's test directory are synthetic fixtures.
 
@@ -47,9 +48,9 @@ across local and distributed deployments. Scheduling, transfer costs, and
 learning efficiency still need experimental validation.
 
 The current repository implements the engine, self-play worker, and server
-replay core. Next steps:
+loopback control transport. Next steps:
 
-1. Wire local client/server coordination to replay ingestion and shard sampling.
+1. Add client supervision to connect self-play to the local server.
 2. Add the trainer and validate a complete 9x9 training loop.
 3. Add remote artifact transfers behind the same worker interfaces.
 4. Add workload scheduling and checkpoint-based trainer migration.
@@ -96,6 +97,17 @@ operator coverage and throughput must be measured separately.
 
 The project currently emits warnings for unfinished helpers and helpers used
 only in tests.
+
+## Run the local server
+
+After building, start the server from the repository root:
+
+```sh
+rust/target/release/rgo-server configs/server.toml
+```
+
+It provisions `data/` and reports readiness with its loopback listening address.
+See [server configuration and usage](rust/server/README.md).
 
 ## Run the self-play worker
 
@@ -160,8 +172,7 @@ belong to the engine. See the
   and shutdown signal handling.
 - [`rust/fs`](rust/fs/src/lib.rs): directory creation and synchronization.
 - [`rust/server`](rust/server/README.md): chunk reading/validation, persistent
-  replay storage, FIFO retention, and sampling into NPZ training shards inside
-  the server binary.
+  replay storage, FIFO retention, NPZ shard sampling, and local control transport.
 - [`configs`](configs/README.md): example self-play configuration and usage.
 
 Search currently resets its graph for every move. The search defaults are

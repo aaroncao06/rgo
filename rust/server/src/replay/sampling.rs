@@ -2,6 +2,7 @@
 
 use rand::{Rng, seq::SliceRandom};
 use rgo_artifacts::{
+    SUPPORTED_BOARD_DIMS,
     chunk::{CHUNK_HEADER_SIZE, training_record_size},
     chunk_path,
 };
@@ -80,12 +81,10 @@ impl ReplayStore {
         let mut boards = std::array::from_fn(|_| Vec::new());
         for offset in selected.offsets {
             let record = Record::at(&selected.bytes, offset);
-            let index = match record.board_dim() {
-                9 => 0,
-                13 => 1,
-                19 => 2,
-                _ => unreachable!("board size validated at ingestion"),
-            };
+            let index = SUPPORTED_BOARD_DIMS
+                .iter()
+                .position(|&dim| dim == record.board_dim())
+                .expect("board size validated at ingestion");
             boards[index].push(record);
         }
         shard::write(boards, output)?;
@@ -124,6 +123,9 @@ fn sample_group(
     rng: &mut impl Rng,
     selected: &mut SelectedRecords,
 ) -> Result<()> {
+    if quota == 0 {
+        return Ok(());
+    }
     // Keep one stationary buffer for the whole group; shuffle only offsets.
     // This group's bytes and indices are freed before loading the next group.
     let byte_len = chunks.iter().map(|chunk| chunk.byte_len).sum();

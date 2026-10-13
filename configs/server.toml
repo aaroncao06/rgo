@@ -1,0 +1,10 @@
+# Local coordination and shared artifact storage.
+listen = "127.0.0.1:3434"
+data_dir = "data"
+
+[replay]
+capacity_records = 5_000_000
+window_records = 250_000
+sample_group_records = 200_000
+sample_groups_per_shard = 4
+shard_records = 100_000

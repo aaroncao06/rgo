@@ -1,4 +1,10 @@
-# Self-play worker configuration
+# Process configurations
+
+[`server.toml`](server.toml) configures the loopback listener, server data
+directory, and replay limits. See [server usage](../rust/server/README.md).
+All relative paths refer to the process working directory.
+
+## Self-play worker configuration
 
 [`self_play.toml`](self_play.toml) is a runnable CPU configuration for the
 `rgo-selfplay` worker. From the repository root:

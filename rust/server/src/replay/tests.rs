@@ -16,7 +16,7 @@ use super::storage::sync_directory;
 use super::*;
 
 #[cfg(unix)]
-mod faults {
+pub(crate) mod faults {
     use std::cell::RefCell;
 
     use super::*;
@@ -31,7 +31,6 @@ mod faults {
     struct State {
         failures: VecDeque<(Operation, PathBuf)>,
         synced: Vec<PathBuf>,
-        skip_matches: usize,
     }
 
     thread_local! {
@@ -56,12 +55,6 @@ mod faults {
         Guard
     }
 
-    pub fn inject_after(operation: Operation, path: PathBuf, skip_matches: usize) -> Guard {
-        let guard = inject([(operation, path)]);
-        STATE.with(|state| state.borrow_mut().skip_matches = skip_matches);
-        guard
-    }
-
     pub fn before(operation: Operation, path: &Path) -> io::Result<()> {
         STATE.with(|state| {
             let mut state = state.borrow_mut();
@@ -69,10 +62,6 @@ mod faults {
                 state.synced.push(path.to_owned());
             }
             if state.failures.front() == Some(&(operation, path.to_owned())) {
-                if state.skip_matches > 0 {
-                    state.skip_matches -= 1;
-                    return Ok(());
-                }
                 state.failures.pop_front();
                 return Err(io::Error::other("injected filesystem failure"));
             }
@@ -184,6 +173,7 @@ fn shard_tags(bytes: &[u8]) -> Vec<u8> {
 }
 
 fn assert_requires_reopen(store: &mut ReplayStore, root: &Path) {
+    assert!(store.needs_reopen());
     assert!(matches!(store.stats(), Err(ReplayError::ReopenRequired)));
     assert!(matches!(
         store.ingest(99, &chunk(&[(9, 99)])),

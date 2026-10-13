@@ -1,11 +1,63 @@
-# Server replay core
+# Local server
 
-`rgo-server` is a server binary with replay storage and sampling implemented as
-an internal module. Startup, client supervision, transport, model publication,
-and workload scheduling are later steps. Running the binary currently reports
-that startup and transport are not implemented and exits with status 1. It
-depends on the shared artifact schema and performs no neural compute.
+`rgo-server` owns replay storage, NPZ sampling, and explicit model announcements.
+It accepts bounded JSON control requests over loopback TCP; artifact bytes stay
+in shared files. It performs no neural compute. Remote transfers, trainer
+coordination, and workload scheduling are not implemented yet.
 Replay accepts the same 9x9, 13x13, and 19x19 boards as self-play and inference.
+
+Run from the repository root after building the workspace:
+
+```sh
+rust/target/release/rgo-server configs/server.toml
+```
+
+The configuration requires `listen` (a loopback socket address), `data_dir`, and
+the five replay limits shown in [server.toml](../../configs/server.toml).
+Paths are relative to the working directory. Storage-directory symlinks are
+supported. On startup the server provisions the storage tree and emits a JSON
+`ready` line containing its listening address.
+Port zero selects an available port. Storage operations run serially on a
+dedicated thread with a 16-request queue; at most 32 control connections are
+open at once. Sampling holds this thread for the whole shard, so intake and
+eviction happen between requests. Greetings and model-version polls are answered
+directly by connection tasks and do not enter this queue. Greetings use shared
+startup paths; model polls read the shared published version.
+Producers notify the server only after durable model publication completes.
+
+Under `data_dir` (default example: `data/`), the server owns `replay/`, `models/`,
+and `shards/`. A successful hello returns absolute shared paths. Models use
+`<version>.onnx`. The producer writes and syncs a temporary model, atomically
+renames it to its final filename, and syncs the models directory before sending
+`PublishModel`. This notification checks that the file is regular and updates
+the server's cached version; duplicate or older notifications are no-ops.
+Startup recovers the highest numeric version from canonical final filenames,
+including completed exports whose notification was lost. Temporary files and
+other filenames are ignored. Only the highest selected model is checked for
+being a regular file; invalid older entries do not prevent startup. No separate
+publication marker is stored.
+The trainer/exporter is not implemented yet; producers must follow this
+publication contract and keep final models immutable. The self-play worker
+validates their ONNX contract when loading; the server does not load models.
+
+The [shared protocol](../protocol/src/server.rs) defines requests for chunk
+acceptance, model publication, shard sampling, and replay statistics. Client IDs
+and shard stems contain 1–64 ASCII letters, digits, `-`, or `_`. Chunk acceptance
+requests carry absolute producer paths with canonical chunk filenames.
+Producer output and replay must share a filesystem for hard links. These are
+trusted local processes; loopback access does not
+provide authentication or isolation between users on the same machine.
+
+SIGINT/SIGTERM disconnects clients, completes queued storage operations, and
+releases the replay lock. Their replies may be lost, but completed changes
+remain on disk. The queue is not persisted or replayed on restart. Stop clients
+first to drain their games normally. A
+failed storage mutation stops the server; restart it before retrying. A lost
+receipt is recoverable through the intake file and durable replay receipt.
+The replay store's in-memory `needs_reopen` flag stops further use of the current
+handle. It is not persisted; every startup reloads the catalog and performs
+cleanup regardless of that flag. Restart does not automatically rebuild a
+corrupted database.
 
 The replay implementation separates its responsibilities:
 
@@ -180,10 +232,9 @@ with np.load("shard.npz", allow_pickle=False) as shard:
 The trainer and its unpacking/minibatch loader are not implemented yet.
 Canonical self-play and replay storage continue to use `.rgo` files.
 
-Filesystem and SQLite operations are synchronous. The future async server
-should serialize them on a storage worker with bounded requests. The caller
-owns RNG initialization and lifetime; a failed delivery may advance the RNG
-even though replay contents remain unchanged.
+Filesystem and SQLite operations are synchronous on the server's storage
+thread. The server initializes one RNG at startup; a failed delivery may
+advance it even though replay contents remain unchanged.
 
 Run the storage tests independently of the engine and ONNX Runtime:
 

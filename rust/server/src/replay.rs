@@ -1,8 +1,8 @@
 //! Whole-chunk FIFO replay storage and shuffled group sampling.
 //!
 //! The store owns its directory and serializes mutations through one handle.
-//! File I/O and SQLite calls are synchronous; a future async server should run
-//! them on a storage worker. Transport, scheduling, and neural compute belong
+//! File I/O and SQLite calls are synchronous and run on the server storage
+//! worker. Transport, scheduling, and neural compute belong
 //! outside this module.
 
 use self::chunk_reader::{ChunkError, validate_chunk};
@@ -13,9 +13,10 @@ use std::{collections::VecDeque, error::Error, fmt, fs::File, io, path::PathBuf}
 mod chunk_reader;
 mod sampling;
 mod shard;
-mod storage;
+pub(crate) mod storage;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplayConfig {
     /// Upper bound for the configured window target, in records.
     pub capacity_records: usize,
@@ -30,7 +31,7 @@ pub struct ReplayConfig {
 }
 
 impl ReplayConfig {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.capacity_records == 0 || self.capacity_records as u128 > i64::MAX as u128 {
             return Err(ReplayError::InvalidConfig(
                 "capacity_records must fit a positive i64",
@@ -142,6 +143,11 @@ pub struct ReplayStore {
 }
 
 impl ReplayStore {
+    /// Whether a failed mutation requires dropping and reopening this handle.
+    pub fn needs_reopen(&self) -> bool {
+        self.needs_reopen
+    }
+
     /// Report current counts, or require reopening after a failed mutation.
     pub fn stats(&self) -> Result<ReplayStats> {
         self.ensure_usable()?;
@@ -224,4 +230,4 @@ impl From<ChunkError> for ReplayError {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
