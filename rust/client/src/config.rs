@@ -1,4 +1,4 @@
-use rgo_protocol::server::valid_name;
+use rgo_protocol::client_server::valid_name;
 use serde::Deserialize;
 use std::{
     fs,

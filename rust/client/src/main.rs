@@ -2,12 +2,12 @@ mod config;
 mod connection;
 mod supervisor;
 
-use rgo_protocol::server::{Request, Response};
+use rgo_protocol::client_server::{Request, Response};
 use std::path::Path;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    const USAGE: &str = "Usage: rgo-client <client.toml> [selfplay | announce-model <version> | sample-shard <name.npz> | stats]";
+    const USAGE: &str = "Usage: rgo-client <client.toml> [selfplay | stats]";
     let mut args = std::env::args_os().skip(1);
     let Some(path) = args.next() else {
         eprintln!("{USAGE}");
@@ -21,20 +21,12 @@ async fn main() {
     let request = match command.to_str() {
         Some("selfplay") => None,
         Some("stats") => Some(Request::Stats {}),
-        Some("announce-model") => args
-            .next()
-            .and_then(|version| version.to_str()?.parse().ok())
-            .map(|version| Request::AnnounceModel { version }),
-        Some("sample-shard") => args
-            .next()
-            .and_then(|name| name.into_string().ok())
-            .map(|filename| Request::SampleShard { filename }),
         _ => {
             eprintln!("{USAGE}");
             std::process::exit(2);
         }
     };
-    if args.next().is_some() || (command != "selfplay" && request.is_none()) {
+    if args.next().is_some() {
         eprintln!("{USAGE}");
         std::process::exit(2);
     }

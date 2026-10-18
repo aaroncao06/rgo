@@ -3,7 +3,7 @@
 use rgo_artifacts::chunk_path;
 use rgo_protocol::{
     PROTOCOL_VERSION,
-    server::{Request, Response},
+    client_server::{Request, Response},
 };
 use std::{
     fs,

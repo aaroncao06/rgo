@@ -8,7 +8,7 @@ use rand::{SeedableRng, rngs::SmallRng};
 use rgo_artifacts::{
     ModelVersion, chunk_id_from_filename, model_path, model_version_from_filename,
 };
-use rgo_protocol::server::{Request, Response, valid_name};
+use rgo_protocol::client_server::{Request, Response};
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -88,18 +88,12 @@ impl StorageState {
                     already_accepted,
                 })
             }
-            Request::SampleShard { filename } => {
-                let stem = filename
-                    .strip_suffix(".npz")
-                    .ok_or("shard filename must end in .npz")?;
-                if !valid_name(stem) {
-                    return Err("invalid shard filename".into());
-                }
-                let path = self.shards.join(filename);
+            Request::Shard { index } => {
+                let path = self.shards.join(format!("{index}.npz"));
                 match fs::symlink_metadata(&path) {
                     Ok(metadata) if metadata.is_file() => {
-                        // A lost reply can be retried using the same filename.
-                        // Repeat the publication barrier if an earlier sync failed.
+                        // A lost reply can be retried using the same file. Repeat
+                        // the barrier if an earlier directory sync failed.
                         sync_directory(&self.shards)?;
                     }
                     Ok(_) => return Err("shard destination is not a regular file".into()),
@@ -164,6 +158,8 @@ fn require_regular_model_file(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rgo_artifacts::chunk::{chunk_header, training_record_size};
+    use sha2::{Digest, Sha256};
 
     fn replay_config() -> ReplayConfig {
         ReplayConfig {
@@ -173,6 +169,84 @@ mod tests {
             sample_groups_per_shard: 4,
             shard_records: 10,
         }
+    }
+
+    fn add_test_chunk(state: &mut StorageState, directory: &Path, id: u128, tag: u8) {
+        let mut bytes = chunk_header(1).to_vec();
+        let mut record = vec![tag; training_record_size(9)];
+        record[0] = 9;
+        bytes.extend(record);
+        bytes.extend(Sha256::digest(&bytes));
+        let source = directory.join(format!("producer-{id}.rgo"));
+        fs::write(&source, bytes).unwrap();
+        sync_directory(directory).unwrap();
+        state.replay.ingest_file(id, &source).unwrap();
+    }
+
+    fn shard_path(state: &mut StorageState, index: u64) -> PathBuf {
+        match state.handle(Request::Shard { index }).unwrap() {
+            Response::Shard { path } => path,
+            response => panic!("unexpected response: {response:?}"),
+        }
+    }
+
+    #[test]
+    fn indexed_shards_reuse_published_files_across_retries_and_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("server");
+        let mut config = replay_config();
+        config.window_records = 1;
+        let mut state = StorageState::open(&root, config).unwrap();
+        add_test_chunk(&mut state, temp.path(), 1, 1);
+
+        let path = shard_path(&mut state, 0);
+        assert_eq!(path, state.shards.join("0.npz"));
+        let bytes = fs::read(&path).unwrap();
+        assert!(bytes.starts_with(b"PK"));
+        assert_eq!(shard_path(&mut state, 0), path);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::read_dir(&state.shards).unwrap().count(), 1);
+
+        // Requests can run ahead of training to prefetch multiple shards.
+        let next_path = shard_path(&mut state, 1);
+        let next_bytes = fs::read(&next_path).unwrap();
+        let third_path = shard_path(&mut state, 2);
+        let third_bytes = fs::read(&third_path).unwrap();
+
+        add_test_chunk(&mut state, temp.path(), 2, 2);
+        assert_eq!(state.replay.stats().unwrap().retained_chunks, 1);
+        drop(state);
+
+        let mut state = StorageState::open(&root, config).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        // A checkpoint through shard 0 must replay later, uncheckpointed shards.
+        assert_eq!(shard_path(&mut state, 1), next_path);
+        assert_eq!(fs::read(&next_path).unwrap(), next_bytes);
+        assert_eq!(shard_path(&mut state, 2), third_path);
+        assert_eq!(fs::read(&third_path).unwrap(), third_bytes);
+        let new_path = shard_path(&mut state, 3);
+        assert_ne!(fs::read(new_path).unwrap(), bytes);
+        assert!(path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn indexed_shard_retries_after_publication_sync_error_and_restart() {
+        use crate::replay::tests::faults::{self, Operation};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("server");
+        let mut state = StorageState::open(&root, replay_config()).unwrap();
+        add_test_chunk(&mut state, temp.path(), 1, 1);
+        let path = state.shards.join("0.npz");
+        let fault = faults::inject([(Operation::Sync, state.shards.clone())]);
+        assert!(state.handle(Request::Shard { index: 0 }).is_err());
+        assert!(path.exists());
+        drop(fault);
+        assert_eq!(shard_path(&mut state, 0), path);
+        drop(state);
+
+        let mut state = StorageState::open(&root, replay_config()).unwrap();
+        assert_eq!(shard_path(&mut state, 0), path);
     }
 
     #[test]
@@ -206,34 +280,6 @@ mod tests {
         state.announce_model(9).unwrap();
         assert_eq!(*state.latest_model_version.borrow(), Some(10));
         assert!(!state.models.join("latest.json").exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn retry_of_published_shard_repeats_a_failed_directory_sync() {
-        use crate::replay::tests::faults::{self, Operation};
-        let temp = tempfile::tempdir().unwrap();
-        let mut state = StorageState::open(temp.path(), replay_config()).unwrap();
-        let path = state.shards.join("batch.npz");
-        // Stand in for a file published immediately before its directory sync
-        // failed; the sampling test covers publication and NPZ contents.
-        fs::write(&path, b"published shard").unwrap();
-        let fault = faults::inject([(Operation::Sync, state.shards.clone())]);
-        assert!(
-            state
-                .handle(Request::SampleShard {
-                    filename: "batch.npz".into(),
-                })
-                .is_err()
-        );
-        drop(fault);
-        assert!(matches!(
-            state.handle(Request::SampleShard {
-                filename: "batch.npz".into(),
-            }),
-            Ok(Response::Shard { path: returned }) if returned == path
-        ));
-        assert_eq!(fs::read(path).unwrap(), b"published shard");
     }
 
     #[test]

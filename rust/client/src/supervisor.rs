@@ -4,8 +4,8 @@ use crate::{config::Config, connection::Connection};
 use rgo_artifacts::chunk_id_from_filename;
 use rgo_protocol::{
     PROTOCOL_VERSION, ShutdownSignals,
+    client_server::{Request, Response},
     selfplay::{Command, Event},
-    server::{Request, Response},
 };
 use std::{
     fs::{self, File},

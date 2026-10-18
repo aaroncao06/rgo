@@ -1,7 +1,7 @@
 use crate::config::Config;
 use rgo_protocol::{
     PROTOCOL_VERSION,
-    server::{Request, Response},
+    client_server::{Request, Response},
 };
 use std::{io, time::Duration};
 use tokio::{
@@ -325,7 +325,7 @@ mod tests {
         use tokio::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let config = test_config(listener.local_addr().unwrap());
-        let shard = std::env::temp_dir().join("batch.npz");
+        let shard = std::env::temp_dir().join("0.npz");
         let expected = shard.clone();
         let server = tokio::spawn(async move {
             for attempt in 0..2 {
@@ -345,7 +345,7 @@ mod tests {
                 .unwrap();
                 assert!(matches!(
                     rgo_protocol::read::<Request>(&mut stream).await.unwrap(),
-                    Some(Request::SampleShard { filename }) if filename == "batch.npz"
+                    Some(Request::Shard { index: 0 })
                 ));
                 if attempt == 1 {
                     rgo_protocol::write(
@@ -362,9 +362,7 @@ mod tests {
         let mut connection = Connection::open(&config).await.unwrap();
         assert!(matches!(
             connection
-                .request(&Request::SampleShard {
-                    filename: "batch.npz".into(),
-                })
+                .request(&Request::Shard { index: 0 })
                 .await
                 .unwrap(),
             Response::Shard { path } if path == expected

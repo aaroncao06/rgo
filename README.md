@@ -109,17 +109,18 @@ rust/target/release/rgo-client configs/client.toml
 
 The server provisions `data/`; the client recovers pending chunks and starts
 self-play. The example writes producer chunks to `data/selfplay/local/`.
-The worker waits until a model is available. After durably publishing a complete
-immutable ONNX model as `data/models/42.onnx`, notify the server:
+The worker waits until a model is available. To add the first model, stop the
+client, durably publish a complete immutable ONNX model at a canonical path
+such as `data/models/42.onnx` (see [server usage](rust/server/README.md)), then
+restart the server and client. The server discovers the highest version on
+startup; a client left running would wait until its next model poll.
+The client can query replay statistics:
 
 ```sh
-rust/target/release/rgo-client configs/client.toml announce-model 42
 rust/target/release/rgo-client configs/client.toml stats
-rust/target/release/rgo-client configs/client.toml sample-shard batch-0001.npz
 ```
 
-The sampled shard is written under `data/shards/`; its consumer removes it
-after use. Ctrl-C finishes the client's active games and accepts final chunks.
+Ctrl-C finishes the client's active games and accepts final chunks.
 Stop clients before stopping the server. See [client usage](rust/client/README.md)
 and [server configuration and usage](rust/server/README.md).
 

@@ -55,30 +55,25 @@ paths refer to the client's working directory; the worker inherits it.
 Inference devices and search settings remain in the worker configuration.
 Build the worker with the desired provider features independently of the client.
 
-## Control commands
+## Replay statistics
 
-These commands connect without starting self-play and print a JSON response:
+This command connects without starting self-play and prints a JSON response:
 
 ```sh
-rust/target/release/rgo-client configs/client.toml announce-model 42
-rust/target/release/rgo-client configs/client.toml sample-shard batch-0001.npz
 rust/target/release/rgo-client configs/client.toml stats
 ```
 
-With the example server config, durably publish a complete model at
-`data/models/42.onnx`: write and sync a temporary file, atomically rename it to
-the unused final version, then sync the models directory. Keep its bytes
-immutable. The command notifies the running server; it does not write or sync
-the model. Startup recovers the highest canonical model filename, so completed
-exports survive a lost notification. The client and server do not inspect tensors; worker loading validates
-the [model contract](../../README.md#model-contract).
+The server discovers canonical published models on startup. Until the trainer
+publishes and announces models through the protocol, a newly placed model
+requires a server restart to become available to clients. Restart the client
+afterward for prompt adoption; an already running client waits until its next
+model poll. The self-play worker
+validates the [model contract](../../README.md#model-contract) when loading it.
 
-Shard names must have a 1–64 character stem using the client-ID character set,
-followed by `.npz`. Use a new name for each new shard. While the file exists,
-retrying the same name returns it, even after a lost response or server restart.
-The JSON response gives its absolute path; consumers can read row counts from
-the NPZ. The consumer owns each sampled shard and removes it after use. There
-is no background sampling or automatic shard cleanup.
+Indexed training-shard requests are defined by the shared protocol, but trainer
+coordination is not wired into this CLI yet. The server returns a stable shard
+path for a given request index and retains it for recovery. Checkpoint
+acceptance and automatic shard cleanup are not implemented yet.
 
 ## Shutdown and recovery
 

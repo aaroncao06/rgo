@@ -4,7 +4,7 @@ use crate::{Error, config::Config, service::StorageState};
 use rgo_artifacts::model_path;
 use rgo_protocol::{
     PROTOCOL_VERSION, ShutdownSignals,
-    server::{Request, Response, valid_name},
+    client_server::{Request, Response, valid_name},
 };
 use std::{io, path::PathBuf, sync::Arc, thread, time::Duration};
 use tokio::{

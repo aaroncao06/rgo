@@ -4,7 +4,7 @@ use rgo_artifacts::ModelVersion;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Client IDs and shard filename stems contain 1–64 ASCII letters, digits, `-`, or `_`.
+/// Client IDs contain 1–64 ASCII letters, digits, `-`, or `_`.
 pub fn valid_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
         && name
@@ -27,8 +27,9 @@ pub enum Request {
     AnnounceModel {
         version: ModelVersion,
     },
-    SampleShard {
-        filename: String,
+    // The trainer chooses the exact index; a request does not imply consumption.
+    Shard {
+        index: u64,
     },
     Stats {},
 }
@@ -58,4 +59,30 @@ pub enum Response {
     Error {
         message: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn indexed_shard_messages_round_trip() {
+        let request = Request::Shard { index: 8 };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(json, r#"{"type":"shard","index":8}"#);
+        assert!(matches!(
+            serde_json::from_str::<Request>(&json).unwrap(),
+            Request::Shard { index: 8 }
+        ));
+
+        let response = Response::Shard {
+            path: PathBuf::from("/shards/8.npz"),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Response>(&json).unwrap(),
+            Response::Shard { path }
+                if path == PathBuf::from("/shards/8.npz")
+        ));
+    }
 }

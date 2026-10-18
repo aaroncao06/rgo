@@ -6,7 +6,7 @@ use rgo_artifacts::{
 };
 use rgo_protocol::{
     PROTOCOL_VERSION,
-    server::{Request, Response},
+    client_server::{Request, Response},
 };
 use sha2::{Digest, Sha256};
 use std::{fs, net::SocketAddr, path::Path, process::Stdio, time::Duration};
@@ -122,12 +122,7 @@ async fn local_acceptance_sampling_model_publication_and_restart() {
         Request::AcceptChunk {
             path: "../bad.rgo".into(),
         },
-        Request::SampleShard {
-            filename: "../bad.npz".into(),
-        },
-        Request::SampleShard {
-            filename: "empty.npz".into(),
-        },
+        Request::Shard { index: 0 },
         Request::AnnounceModel { version: 1 },
     ] {
         assert!(matches!(
@@ -172,33 +167,22 @@ async fn local_acceptance_sampling_model_publication_and_restart() {
         fs::read(chunk_path(&root.join("replay/chunks"), 42)).unwrap(),
         bytes
     );
-    let Response::Shard { path } = request(
-        &mut stream,
-        Request::SampleShard {
-            filename: "batch.npz".into(),
-        },
-    )
-    .await
+    let Response::Shard {
+        path: training_path,
+    } = request(&mut stream, Request::Shard { index: 0 }).await
     else {
-        panic!("missing shard")
+        panic!("missing indexed training shard")
     };
-    let original = fs::read(&path).unwrap();
-    let mut zip = zip::ZipArchive::new(fs::File::open(&path).unwrap()).unwrap();
+    assert_eq!(
+        training_path,
+        fs::canonicalize(&root).unwrap().join("shards/0.npz")
+    );
+    let training_bytes = fs::read(&training_path).unwrap();
+    let mut zip = zip::ZipArchive::new(fs::File::open(&training_path).unwrap()).unwrap();
     assert_eq!(zip.len(), 17);
     for dim in [9, 13, 19] {
         assert!(zip.by_name(&format!("{dim}/policy.npy")).is_ok());
     }
-    assert!(matches!(
-        request(
-            &mut stream,
-            Request::SampleShard {
-                filename: "batch.npz".into()
-            }
-        )
-        .await,
-        Response::Shard { path: retried } if retried == path
-    ));
-    assert_eq!(fs::read(&path).unwrap(), original);
     fs::write(root.join("models/1.onnx"), b"model").unwrap();
     fs::write(root.join("models/2.onnx.tmp"), b"next model").unwrap();
     let model_dir = fs::canonicalize(root.join("models")).unwrap();
@@ -233,14 +217,12 @@ async fn local_acceptance_sampling_model_publication_and_restart() {
     assert!(matches!(
         request(
             &mut stream,
-            Request::SampleShard {
-                filename: "batch.npz".into()
-            }
+            Request::Shard { index: 0 }
         )
         .await,
-        Response::Shard { path: retried } if retried == path
+        Response::Shard { path } if path == training_path
     ));
-    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(fs::read(&training_path).unwrap(), training_bytes);
     drop(stream);
     stop(&mut server).await;
 }

@@ -40,9 +40,9 @@ The trainer/exporter is not implemented yet; producers must follow this
 publication contract and keep final models immutable. The self-play worker
 validates their ONNX contract when loading; the server does not load models.
 
-The [shared protocol](../protocol/src/server.rs) defines requests for chunk
-acceptance, model announcements, shard sampling, and replay statistics. Client IDs
-and shard stems contain 1–64 ASCII letters, digits, `-`, or `_`. Chunk acceptance
+The [shared protocol](../protocol/src/client_server.rs) defines requests for chunk
+acceptance, model announcements, indexed shard sampling, and replay statistics. Client IDs
+contain 1–64 ASCII letters, digits, `-`, or `_`. Chunk acceptance
 requests carry absolute producer paths with canonical chunk filenames.
 Producer output and replay must share a filesystem for hard links. These are
 trusted local processes; loopback access does not

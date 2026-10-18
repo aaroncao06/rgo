@@ -4,8 +4,8 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::io;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+pub mod client_server;
 pub mod selfplay;
-pub mod server;
 mod shutdown;
 
 pub use shutdown::ShutdownSignals;
