@@ -11,3 +11,8 @@ python -m venv .venv
 python -m pip install -r python/requirements.txt
 PYTHONPATH=python:python/tests python -m unittest discover -s python/tests -p 'test_*.py'
 ```
+
+`TrainingCoordinator` in `trainer/coordinator.py` connects indexed shard paths,
+one-shard training, and local recovery checkpoints. Its shard-path callback is
+the boundary for future Rust client integration; it is not a standalone trainer
+command yet.

@@ -117,7 +117,10 @@ class ShardDatasetTest(unittest.TestCase):
             for model, base_batch_size in ((first, 1), (second, 2)):
                 optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
                 with patch.object(optimizer, "step", wraps=optimizer.step) as step:
-                    train_shard(model, optimizer, Path("sample.npz"), base_batch_size, 8)
+                    self.assertEqual(
+                        train_shard(model, optimizer, Path("sample.npz"), base_batch_size, 8),
+                        11,
+                    )
                 self.assertEqual(step.call_count, 2)
 
         for name, parameter in first.named_parameters():

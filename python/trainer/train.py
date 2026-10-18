@@ -16,14 +16,15 @@ def train_shard(
     path: Path,
     base_batch_size: int,
     effective_batch_size: int,
-) -> None:
-    """Take one optimizer step per effective batch, including a final partial one."""
+) -> int:
+    """Train one shard and return its row count after all optimizer steps finish."""
     dataset = ShardDataset(path, base_batch_size, effective_batch_size)
     loader = DataLoader(dataset, batch_size=None)
     device = next(model.parameters()).device
     model.train()
     optimizer.zero_grad(set_to_none=True)
     rows_in_step = 0
+    trained_rows = 0
     for index, batch in enumerate(loader):
         spatial = batch.spatial.to(device)
         global_features = batch.global_features.to(device)
@@ -45,6 +46,7 @@ def train_shard(
             torch.tanh(ownership_logits[:, 0]), ownership_target.float() - 1
         )
         rows = len(policy_target)
+        trained_rows += rows
         loss = policy_loss + win_loss + score_loss + ownership_loss
         # Sum row losses now; average once across the whole optimizer update.
         (loss * rows).backward()
@@ -57,3 +59,4 @@ def train_shard(
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             rows_in_step = 0
+    return trained_rows
