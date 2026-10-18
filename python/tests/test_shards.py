@@ -38,7 +38,7 @@ class ShardTest(unittest.TestCase):
             path = Path(directory) / "sample.npz"
             np.savez(path, **arrays)
             groups = load_shard(path)
-            dataset = ShardDataset(path, base_batch_size=1)
+            dataset = ShardDataset(path, base_batch_size=1, effective_batch_size=128)
 
         self.assertEqual([group.board_size for group in groups], [9, 13, 19])
         for group in groups:

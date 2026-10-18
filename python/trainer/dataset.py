@@ -22,16 +22,31 @@ class BoardBatch(NamedTuple):
 class ShardDataset(Dataset):
     """Hold one packed shard; expand only the minibatch requested by the loader."""
 
-    def __init__(self, path: Path, base_batch_size: int):
+    def __init__(self, path: Path, base_batch_size: int, effective_batch_size: int):
         if base_batch_size < 1:
             raise ValueError("base_batch_size must be positive")
+        if effective_batch_size < 1 or effective_batch_size & (effective_batch_size - 1):
+            raise ValueError("effective_batch_size must be a power of two")
         self.groups: list[PackedBoardSamples] = load_shard(path)
         self.batches: list[tuple[int, int, int]] = []
+        rows_in_step = 0
         for group_index, group in enumerate(self.groups):
-            batch_size = base_batch_size * 19 * 19 // (group.board_size * group.board_size)
-            for start in range(0, len(group.policy), batch_size):
-                stop = min(start + batch_size, len(group.policy))
+            max_microbatch_size = (
+                base_batch_size * 19 * 19 // (group.board_size * group.board_size)
+            )
+            batch_size = 1 << (
+                min(max_microbatch_size, effective_batch_size).bit_length() - 1
+            )
+            start = 0
+            while start < len(group.policy):
+                stop = min(
+                    start + batch_size,
+                    start + effective_batch_size - rows_in_step,
+                    len(group.policy),
+                )
                 self.batches.append((group_index, start, stop))
+                rows_in_step = (rows_in_step + stop - start) % effective_batch_size
+                start = stop
 
     def __len__(self) -> int:
         return len(self.batches)

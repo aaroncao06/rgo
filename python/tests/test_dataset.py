@@ -1,4 +1,5 @@
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
@@ -9,6 +10,7 @@ from torch.utils.data import DataLoader
 from dummy_model import DummyModel
 from trainer.dataset import ShardDataset
 from trainer.shards import PackedBoardSamples
+from trainer.train import train_shard
 
 
 def group(size, ids):
@@ -40,7 +42,9 @@ class ShardDatasetTest(unittest.TestCase):
             group(19, [200]),
         ]
         with patch("trainer.dataset.load_shard", return_value=groups) as load:
-            dataset = ShardDataset(Path("sample.npz"), base_batch_size=1)
+            dataset = ShardDataset(
+                Path("sample.npz"), base_batch_size=1, effective_batch_size=128
+            )
             self.assertEqual(dataset.groups[0].spatial.dtype, np.uint8)
             batches = list(DataLoader(dataset, batch_size=None))
 
@@ -80,7 +84,58 @@ class ShardDatasetTest(unittest.TestCase):
 
     def test_rejects_empty_base_batch_size(self):
         with self.assertRaises(ValueError):
-            ShardDataset(Path("sample.npz"), base_batch_size=0)
+            ShardDataset(Path("sample.npz"), base_batch_size=0, effective_batch_size=1)
+
+    def test_rejects_empty_effective_batch_size(self):
+        with self.assertRaises(ValueError):
+            ShardDataset(Path("sample.npz"), base_batch_size=1, effective_batch_size=0)
+
+    def test_rejects_non_power_of_two_effective_batch_size(self):
+        with self.assertRaises(ValueError):
+            ShardDataset(Path("sample.npz"), base_batch_size=1, effective_batch_size=3)
+
+    def test_training_updates_at_fixed_row_boundaries_across_board_sizes(self):
+        groups = [
+            group(9, list(range(5))),
+            group(13, list(range(5, 9))),
+            group(19, [9, 10]),
+        ]
+        torch.manual_seed(0)
+        first = DummyModel()
+        second = deepcopy(first)
+        before = {
+            name: parameter.detach().clone()
+            for name, parameter in first.named_parameters()
+        }
+
+        with patch("trainer.dataset.load_shard", return_value=groups):
+            dataset = ShardDataset(Path("sample.npz"), 1, 8)
+            self.assertEqual(
+                [stop - start for _, start, stop in dataset.batches],
+                [4, 1, 2, 1, 1, 1, 1],
+            )
+            for model, base_batch_size in ((first, 1), (second, 2)):
+                optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
+                with patch.object(optimizer, "step", wraps=optimizer.step) as step:
+                    train_shard(model, optimizer, Path("sample.npz"), base_batch_size, 8)
+                self.assertEqual(step.call_count, 2)
+
+        for name, parameter in first.named_parameters():
+            with self.subTest(name=name):
+                self.assertFalse(torch.equal(parameter, before[name]))
+                torch.testing.assert_close(parameter, dict(second.named_parameters())[name])
+
+    def test_partial_final_update_uses_its_actual_row_count(self):
+        torch.manual_seed(1)
+        first = DummyModel()
+        second = deepcopy(first)
+        with patch("trainer.dataset.load_shard", return_value=[group(9, [0, 1])]):
+            for model, effective_batch_size in ((first, 2), (second, 16)):
+                optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
+                train_shard(model, optimizer, Path("sample.npz"), 1, effective_batch_size)
+
+        for first_parameter, second_parameter in zip(first.parameters(), second.parameters()):
+            torch.testing.assert_close(first_parameter, second_parameter)
 
 
 if __name__ == "__main__":
