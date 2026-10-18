@@ -24,7 +24,7 @@ pub enum Request {
     AcceptChunk {
         path: PathBuf,
     },
-    PublishModel {
+    AnnounceModel {
         version: ModelVersion,
     },
     SampleShard {
@@ -39,11 +39,9 @@ pub enum Request {
 pub enum Response {
     Welcome {
         protocol_version: u32,
-        model_dir: PathBuf,
-        shard_dir: PathBuf,
     },
     Model {
-        version: Option<ModelVersion>,
+        path: Option<PathBuf>,
     },
     ChunkAccepted {
         records: usize,
@@ -51,7 +49,6 @@ pub enum Response {
     },
     Shard {
         path: PathBuf,
-        records: usize,
     },
     Stats {
         retained_records: usize,

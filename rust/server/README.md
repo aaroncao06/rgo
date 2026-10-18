@@ -21,15 +21,15 @@ Port zero selects an available port. Storage operations run serially on a
 dedicated thread with a 16-request queue; at most 32 control connections are
 open at once. Sampling holds this thread for the whole shard, so intake and
 eviction happen between requests. Greetings and model-version polls are answered
-directly by connection tasks and do not enter this queue. Greetings use shared
-startup paths; model polls read the shared published version.
+directly by connection tasks and do not enter this queue. Model polls use the
+shared published version and the model directory prepared at startup.
 Producers notify the server only after durable model publication completes.
 
 Under `data_dir` (default example: `data/`), the server owns `replay/`, `models/`,
-and `shards/`. A successful hello returns absolute shared paths. Models use
+and `shards/`. A successful hello confirms the protocol version. Models use
 `<version>.onnx`. The producer writes and syncs a temporary model, atomically
 renames it to its final filename, and syncs the models directory before sending
-`PublishModel`. This notification checks that the file is regular and updates
+`AnnounceModel`. This notification checks that the file is regular and updates
 the server's cached version; duplicate or older notifications are no-ops.
 Startup recovers the highest numeric version from canonical final filenames,
 including completed exports whose notification was lost. Temporary files and
@@ -41,7 +41,7 @@ publication contract and keep final models immutable. The self-play worker
 validates their ONNX contract when loading; the server does not load models.
 
 The [shared protocol](../protocol/src/server.rs) defines requests for chunk
-acceptance, model publication, shard sampling, and replay statistics. Client IDs
+acceptance, model announcements, shard sampling, and replay statistics. Client IDs
 and shard stems contain 1–64 ASCII letters, digits, `-`, or `_`. Chunk acceptance
 requests carry absolute producer paths with canonical chunk filenames.
 Producer output and replay must share a filesystem for hard links. These are
@@ -197,7 +197,9 @@ their packed bytes without materializing separate full tensor arrays.
 NPZ, rejecting an existing destination. The directory must exist. Failed
 sampling or delivery leaves replay usable; `sample_into` may leave partial
 bytes that the caller must discard. A directory-sync failure can leave a
-published file, so callers must handle that destination before retrying.
+published file. The server request handler treats its final filename as the
+request ID: a repeat request returns that published file after syncing the
+directory again, without resampling. Use a fresh filename for a new shard.
 Delivery files belong to the caller and must be removed after consumption.
 
 ## NPZ arrays

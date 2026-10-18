@@ -1,6 +1,5 @@
 //! Existing worker pipe protocol, shared with its supervising client.
 
-use rgo_artifacts::ModelVersion;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -8,7 +7,7 @@ use std::path::PathBuf;
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
-    ModelReady { version: ModelVersion },
+    ModelReady { path: PathBuf },
     Finish {},
 }
 

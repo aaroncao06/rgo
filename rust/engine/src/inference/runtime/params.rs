@@ -1,5 +1,4 @@
 use crate::inference::{SUPPORTED_BOARD_DIMS, onnx::InferenceDevice};
-use std::path::PathBuf;
 
 /// Device and session settings for one backend/executor thread.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -20,8 +19,6 @@ pub struct ExecutorConfig {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelRuntimeConfig {
-    /// Published ONNX models are stored as `<model_dir>/<version>.onnx`.
-    pub model_dir: PathBuf,
     pub executors: Vec<ExecutorConfig>,
     pub cache_capacity: usize,
     pub num_cache_shards: usize,

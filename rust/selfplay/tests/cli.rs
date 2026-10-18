@@ -12,15 +12,8 @@ fn help_and_usage_do_not_start_self_play() {
         vec![],
         vec!["one.toml", "two.toml"],
         vec!["one.toml", "--model-dir"],
-        vec!["one.toml", "--output-dir"],
         vec!["one.toml", "--model-dir", "models", "--model-dir", "other"],
-        vec![
-            "one.toml",
-            "--output-dir",
-            "chunks",
-            "--output-dir",
-            "other",
-        ],
+        vec!["one.toml", "--output-dir", "chunks"],
         vec!["--managed", "one.toml"],
         vec!["--managed", "one.toml", "two.toml"],
     ] {
@@ -64,14 +57,14 @@ mod unix {
         }
 
         fn start_with_dim(model: Option<&str>, make_model_dir: bool, board_dim: usize) -> Self {
-            Self::start_with_args(model, make_model_dir, board_dim, &[])
+            Self::start_with_output_dir(model, make_model_dir, board_dim, "output/chunks")
         }
 
-        fn start_with_args(
+        fn start_with_output_dir(
             model: Option<&str>,
             make_model_dir: bool,
             board_dim: usize,
-            args: &[&str],
+            output_dir: &str,
         ) -> Self {
             let dir = std::env::temp_dir().join(format!(
                 "rgo-cli-test-{}-{}",
@@ -91,7 +84,7 @@ mod unix {
             let config = include_str!("../../../configs/self_play.toml")
                 .replace("worker_threads = 2", "worker_threads = 1")
                 .replace("workers_per_thread = 4", "workers_per_thread = 1")
-                .replace("self_play_chunks", "output/chunks");
+                .replace("data/selfplay/local", output_dir);
             fs::write(
                 dir.join("config.toml"),
                 format!("{config}\n[self_play]\nsearch_budget_policy = [{{ probability = 1.0, budget = {{ max_nodes = 0, max_playouts = 0 }} }}]\n[self_play.rules]\nboard_dim = {board_dim}\n"),
@@ -101,7 +94,6 @@ mod unix {
             let output = fs::File::create(dir.join("stdout.log")).unwrap();
             let child = Command::new(env!("CARGO_BIN_EXE_rgo-selfplay"))
                 .arg("config.toml")
-                .args(args)
                 .current_dir(&dir)
                 .stdin(Stdio::piped())
                 .stdout(output)
@@ -184,9 +176,9 @@ mod unix {
 
     #[test]
     fn startup_errors_exit_with_a_diagnostic() {
-        let mut missing = TestProcess::start(None, false);
+        let mut missing = TestProcess::start_with_output_dir(None, false, 9, "config.toml/chunks");
         assert_eq!(missing.finish().code(), Some(1));
-        assert!(missing.log().contains("could not open model directory"));
+        assert!(missing.log().contains("could not prepare output directory"));
         assert!(!missing.dir.join("output").exists());
     }
 
@@ -220,20 +212,15 @@ mod unix {
     }
 
     #[test]
-    fn path_overrides_load_models_and_publish_chunks_outside_configured_directories() {
-        // The configured model directory is absent. The override uses the
-        // existing working directory; chunks go to a different nested path.
-        let mut run = TestProcess::start_with_args(
-            None,
-            false,
-            9,
-            &["--model-dir", ".", "--output-dir", "chosen/chunks"],
-        );
+    fn model_paths_and_canonical_output_dir_do_not_require_a_fixed_model_directory() {
+        // The model command supplies a complete path; the worker resolves the
+        // configured output directory before publishing chunks.
+        let mut run = TestProcess::start_with_output_dir(None, false, 9, "chosen/chunks");
         run.ready();
         let fixture =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../engine/tests/data/v0.onnx");
         fs::copy(fixture, run.dir.join("42.onnx")).unwrap();
-        run.send(r#"{"type":"model_ready","version":42}"#);
+        run.send(r#"{"type":"model_ready","path":"42.onnx"}"#);
         run.until(|run| {
             run.events()
                 .iter()
@@ -249,8 +236,12 @@ mod unix {
             .iter()
             .filter(|event| event["type"] == "chunk_ready")
         {
-            let path = run.dir.join(event["path"].as_str().unwrap());
-            assert_eq!(path.parent().unwrap(), run.dir.join("chosen/chunks"));
+            let path = PathBuf::from(event["path"].as_str().unwrap());
+            assert!(path.is_absolute());
+            assert_eq!(
+                path.parent().unwrap(),
+                fs::canonicalize(run.dir.join("chosen/chunks")).unwrap()
+            );
             assert!(path.is_file());
         }
         assert_eq!(run.events().last().unwrap()["type"], "stopped");
@@ -263,7 +254,7 @@ mod unix {
         let fixture =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../engine/tests/data/v0.onnx");
         fs::copy(fixture, run.dir.join("models/42.onnx")).unwrap();
-        run.send(r#"{"type":"model_ready","version":42}"#);
+        run.send(r#"{"type":"model_ready","path":"models/42.onnx"}"#);
         run.until(|run| {
             run.events()
                 .iter()
@@ -278,8 +269,8 @@ mod unix {
         // An installed model stays alive in memory. Duplicate/stale messages
         // must not reload it or require older model files to remain on disk.
         fs::remove_file(run.dir.join("models/42.onnx")).unwrap();
-        run.send(r#"{"type":"model_ready","version":42}"#);
-        run.send(r#"{"type":"model_ready","version":0}"#);
+        run.send(r#"{"type":"model_ready","path":"models/42.onnx"}"#);
+        run.send(r#"{"type":"model_ready","path":"models/0.onnx"}"#);
         run.send(r#"{"type":"finish"}"#);
         assert!(run.finish().success(), "{}", run.log());
         let events = run.events();
@@ -325,7 +316,7 @@ mod unix {
     fn disconnected_client_finishes_active_games() {
         let mut run = TestProcess::worker(Some("v0.onnx"));
         run.ready();
-        run.send(r#"{"type":"model_ready","version":0}"#);
+        run.send(r#"{"type":"model_ready","path":"models/0.onnx"}"#);
         run.until(|run| {
             run.events()
                 .iter()
@@ -349,8 +340,16 @@ mod unix {
                 "invalid control command",
             ),
             (
-                r#"{"type":"model_ready","version":0}"#.into(),
+                r#"{"type":"model_ready","path":"models/0.onnx"}"#.into(),
                 "announced model models/0.onnx is unavailable",
+            ),
+            (
+                r#"{"type":"model_ready","path":"models/042.onnx"}"#.into(),
+                "invalid canonical model filename",
+            ),
+            (
+                r#"{"type":"model_ready","path":"models/not-a-model.onnx"}"#.into(),
+                "invalid canonical model filename",
             ),
             ("x".repeat(4097), "control command exceeds 4096 bytes"),
         ] {
@@ -370,7 +369,7 @@ mod unix {
 
         let mut invalid = TestProcess::worker(Some("wrong_version.onnx"));
         invalid.ready();
-        invalid.send(r#"{"type":"model_ready","version":0}"#);
+        invalid.send(r#"{"type":"model_ready","path":"models/0.onnx"}"#);
         assert_eq!(invalid.finish().code(), Some(1));
         assert!(
             invalid.events().last().unwrap()["message"]
@@ -386,7 +385,7 @@ mod unix {
             let mut run = TestProcess::worker(model);
             run.ready();
             if model.is_some() {
-                run.send(r#"{"type":"model_ready","version":0}"#);
+                run.send(r#"{"type":"model_ready","path":"models/0.onnx"}"#);
                 run.until(|run| {
                     run.events()
                         .iter()

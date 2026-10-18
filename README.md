@@ -6,11 +6,11 @@ and 19x19 boards.
 
 The Rust engine implements positional superko, area scoring, batched ONNX
 inference with a model-scoped cache, and PUCT graph search. The self-play worker
-generates games and writes training chunks under the control of a parent
-process. The local server accepts shared chunk paths over loopback control requests, retains
+generates games and writes training chunks under client supervision. The local
+server accepts shared chunk paths over loopback control requests, retains
 packed replay files, publishes model announcements, and exports sampled NPZ
 shards with arrays grouped by board size.
-The trainer, client supervision, remote transfers, and interactive player are
+The trainer, remote transfers, workload scheduling, and interactive player are
 not implemented yet. No trained model is included; the ONNX files under the
 engine's test directory are synthetic fixtures.
 
@@ -47,13 +47,12 @@ The research direction is making these component boundaries work efficiently
 across local and distributed deployments. Scheduling, transfer costs, and
 learning efficiency still need experimental validation.
 
-The current repository implements the engine, self-play worker, and server
-loopback control transport. Next steps:
+The current repository implements the engine and local client/server self-play
+pipeline. Next steps:
 
-1. Add client supervision to connect self-play to the local server.
-2. Add the trainer and validate a complete 9x9 training loop.
-3. Add remote artifact transfers behind the same worker interfaces.
-4. Add workload scheduling and checkpoint-based trainer migration.
+1. Add the trainer and validate a complete 9x9 training loop.
+2. Add remote artifact transfers behind the same worker interfaces.
+3. Add workload scheduling and checkpoint-based trainer migration.
 
 ## Build and test
 
@@ -98,34 +97,47 @@ operator coverage and throughput must be measured separately.
 The project currently emits warnings for unfinished helpers and helpers used
 only in tests.
 
-## Run the local server
+## Run the local pipeline
 
-After building, start the server from the repository root:
+After building, start the server and client from the repository root in
+separate terminals:
 
 ```sh
 rust/target/release/rgo-server configs/server.toml
+rust/target/release/rgo-client configs/client.toml
 ```
 
-It provisions `data/` and reports readiness with its loopback listening address.
-See [server configuration and usage](rust/server/README.md).
+The server provisions `data/`; the client recovers pending chunks and starts
+self-play. The example writes producer chunks to `data/selfplay/local/`.
+The worker waits until a model is available. After durably publishing a complete
+immutable ONNX model as `data/models/42.onnx`, notify the server:
+
+```sh
+rust/target/release/rgo-client configs/client.toml announce-model 42
+rust/target/release/rgo-client configs/client.toml stats
+rust/target/release/rgo-client configs/client.toml sample-shard batch-0001.npz
+```
+
+The sampled shard is written under `data/shards/`; its consumer removes it
+after use. Ctrl-C finishes the client's active games and accepts final chunks.
+Stop clients before stopping the server. See [client usage](rust/client/README.md)
+and [server configuration and usage](rust/server/README.md).
 
 ## Run the self-play worker
 
-The worker takes a TOML configuration path, optional `--model-dir` and
-`--output-dir` overrides, and communicates through
+The worker takes a TOML configuration path and communicates through
 newline-delimited JSON on stdin and stdout. See
 [configuration and the process protocol](configs/README.md).
 
 ```sh
-mkdir -p models
 cargo run --release --manifest-path rust/Cargo.toml -p rgo-selfplay -- configs/self_play.toml
 ```
 
 The example starts eight self-play tasks on two worker threads and uses one
-CPU inference executor. It waits for a `model_ready` command naming a completed
-ONNX model in `models/`. Model files are announced explicitly; the worker does
-not scan the directory. Paths in the configuration are relative to the process
-working directory.
+CPU inference executor. It waits for a `model_ready` command supplying the path
+to a completed `<version>.onnx` model. The version is derived from that filename;
+models are announced explicitly. Relative configuration and model paths refer
+to the process working directory.
 
 Each completed game is sent to a dedicated chunk-writer thread. The writer
 replays its moves, generates position features, and encodes policy targets and
@@ -168,6 +180,8 @@ belong to the engine. See the
   library, independent of self-play.
 - [`rust/selfplay`](rust/selfplay/src/main.rs): process configuration, game
   workers, model handoff, pipe protocol, and chunk publication.
+- [`rust/client`](rust/client/README.md): worker supervision, pending-chunk
+  recovery, model polling, and local server commands.
 - [`rust/protocol`](rust/protocol/src/lib.rs): shared JSON messages, framing,
   and shutdown signal handling.
 - [`rust/fs`](rust/fs/src/lib.rs): directory creation and synchronization.

@@ -26,10 +26,16 @@ pub async fn read<T: DeserializeOwned>(
     if count == 0 {
         return Ok(None);
     }
-    if count > MAX_FRAME_BYTES || bytes.last() != Some(&b'\n') {
+    if count > MAX_FRAME_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "incomplete or oversized control frame",
+            "oversized control frame",
+        ));
+    }
+    if bytes.last() != Some(&b'\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "incomplete control frame",
         ));
     }
     serde_json::from_slice(&bytes)
@@ -60,18 +66,22 @@ mod tests {
 
     #[tokio::test]
     async fn framing_preserves_messages_and_rejects_partial_or_oversized_lines() {
-        let mut input = &b"{\"type\":\"finish\"}\n{\"type\":\"model_ready\",\"version\":42}\n"[..];
+        let mut input =
+            &b"{\"type\":\"finish\"}\n{\"type\":\"model_ready\",\"path\":\"models/42.onnx\"}\n"[..];
         assert!(matches!(
             read::<Command>(&mut input).await.unwrap(),
             Some(Command::Finish {})
         ));
         assert!(matches!(
             read::<Command>(&mut input).await.unwrap(),
-            Some(Command::ModelReady { version: 42 })
+            Some(Command::ModelReady { path }) if path == std::path::Path::new("models/42.onnx")
         ));
         assert!(read::<Command>(&mut input).await.unwrap().is_none());
         let mut input = &b"{\"type\":\"finish\"}"[..];
-        assert!(read::<Command>(&mut input).await.is_err());
+        assert_eq!(
+            read::<Command>(&mut input).await.unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
         let oversized = vec![b' '; MAX_FRAME_BYTES + 1];
         assert!(read::<Command>(&mut oversized.as_slice()).await.is_err());
         let mut input = &b"{\"type\":\"finish\",\"extra\":1}\n"[..];

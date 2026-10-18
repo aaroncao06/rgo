@@ -11,7 +11,6 @@ use std::{
 
 fn onnx_runtime_config() -> ModelRuntimeConfig {
     ModelRuntimeConfig {
-        model_dir: PathBuf::from("unused-models"),
         executors: [1, 4]
             .map(|base_batch_size| ExecutorConfig {
                 device: crate::inference::onnx::InferenceDevice::Cpu {},
@@ -54,11 +53,8 @@ impl TestModelDir {
         dir
     }
 
-    fn config(&self) -> ModelRuntimeConfig {
-        ModelRuntimeConfig {
-            model_dir: self.0.clone(),
-            ..onnx_runtime_config()
-        }
+    fn path(&self, version: ModelVersion) -> PathBuf {
+        self.0.join(format!("{version}.onnx"))
     }
 }
 
@@ -71,7 +67,7 @@ impl Drop for TestModelDir {
 #[tokio::test]
 async fn load_starts_configured_onnx_executors_and_evaluates() {
     let models = TestModelDir::new();
-    let handle = ModelRuntime::load(42, &models.config()).unwrap();
+    let handle = ModelRuntime::load(42, &models.path(42), &onnx_runtime_config()).unwrap();
     assert_eq!(handle.0.executor_threads.len(), 2);
     let state = GameState::new(Rules::TROMP_TAYLORISH_9);
     let mut client = InferenceClient::new(handle, None);
@@ -95,11 +91,11 @@ async fn load_starts_configured_onnx_executors_and_evaluates() {
 }
 
 #[test]
-fn load_returns_checkpoint_errors_through_startup() {
+fn load_reports_model_file_errors_during_startup() {
     let models = TestModelDir::new();
     for version in [43, 44, 45] {
         assert!(matches!(
-            ModelRuntime::load(version, &models.config()),
+            ModelRuntime::load(version, &models.path(version), &onnx_runtime_config()),
             Err(ModelStartupError::Backend(_))
         ));
     }
@@ -109,18 +105,18 @@ fn load_returns_checkpoint_errors_through_startup() {
 #[test]
 fn load_rejects_unsupported_cuda_before_starting_executors() {
     let models = TestModelDir::new();
-    let mut config = models.config();
+    let mut config = onnx_runtime_config();
     config.executors.push(ExecutorConfig {
         device: crate::inference::onnx::InferenceDevice::Cuda { device_id: 0 },
         intra_threads: 1,
         base_batch_size: 8,
     });
     assert!(matches!(
-        ModelRuntime::load(42, &config),
+        ModelRuntime::load(42, &models.path(42), &config),
         Err(ModelStartupError::Backend(_))
     ));
     // Rejection leaves the loader usable for a supported configuration.
-    drop(ModelRuntime::load(42, &models.config()).unwrap());
+    drop(ModelRuntime::load(42, &models.path(42), &onnx_runtime_config()).unwrap());
 }
 
 #[test]
@@ -128,7 +124,7 @@ fn load_rejects_empty_executor_config() {
     let mut config = onnx_runtime_config();
     config.executors.clear();
     assert!(matches!(
-        ModelRuntime::load(0, &config),
+        ModelRuntime::load(0, Path::new("unused-models/0.onnx"), &config),
         Err(ModelStartupError::Backend(_))
     ));
 }
@@ -139,7 +135,7 @@ fn load_validates_all_batch_limits_before_starting_executors() {
         let mut config = onnx_runtime_config();
         config.executors[1].base_batch_size = limit;
         assert!(matches!(
-            ModelRuntime::load(0, &config),
+            ModelRuntime::load(0, Path::new("unused-models/0.onnx"), &config),
             Err(ModelStartupError::Backend(_))
         ));
     }
@@ -152,7 +148,7 @@ fn load_validates_cache_dimensions_before_allocating() {
         config.cache_capacity = capacity;
         config.num_cache_shards = shards;
         assert!(matches!(
-            ModelRuntime::load(0, &config),
+            ModelRuntime::load(0, Path::new("unused-models/0.onnx"), &config),
             Err(ModelStartupError::Backend(_))
         ));
     }
@@ -246,7 +242,7 @@ fn loc(x: usize, y: usize) -> Loc {
 #[tokio::test]
 async fn one_loaded_model_evaluates_all_supported_board_dims() {
     let models = TestModelDir::new();
-    let handle = ModelRuntime::load(42, &models.config()).unwrap();
+    let handle = ModelRuntime::load(42, &models.path(42), &onnx_runtime_config()).unwrap();
     let mut client = InferenceClient::new(handle, Some(0));
     for dim in crate::inference::SUPPORTED_BOARD_DIMS
         .into_iter()
@@ -774,7 +770,7 @@ async fn multiple_clients_share_one_model_runtime() {
 #[tokio::test]
 async fn unsupported_board_dims_return_errors_and_leave_the_client_reusable() {
     let models = TestModelDir::new();
-    let handle = ModelRuntime::load(42, &models.config()).unwrap();
+    let handle = ModelRuntime::load(42, &models.path(42), &onnx_runtime_config()).unwrap();
     let mut client = InferenceClient::new(handle, Some(0));
     for dim in 1..9 {
         let state = GameState::new(Rules {

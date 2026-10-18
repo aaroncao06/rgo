@@ -5,11 +5,10 @@ use crate::{
     replay::{IngestOutcome, ReplayConfig, ReplayStore, storage::sync_directory},
 };
 use rand::{SeedableRng, rngs::SmallRng};
-use rgo_artifacts::{ModelVersion, chunk_id_from_filename, model_path};
-use rgo_protocol::{
-    PROTOCOL_VERSION,
-    server::{Request, Response, valid_name},
+use rgo_artifacts::{
+    ModelVersion, chunk_id_from_filename, model_path, model_version_from_filename,
 };
+use rgo_protocol::server::{Request, Response, valid_name};
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -51,16 +50,12 @@ impl StorageState {
         self.replay.needs_reopen()
     }
 
-    pub fn model_versions(&self) -> watch::Receiver<Option<ModelVersion>> {
+    pub fn subscribe_latest_model_version(&self) -> watch::Receiver<Option<ModelVersion>> {
         self.latest_model_version.subscribe()
     }
 
-    pub fn welcome(&self) -> Response {
-        Response::Welcome {
-            protocol_version: PROTOCOL_VERSION,
-            model_dir: self.models.clone(),
-            shard_dir: self.shards.clone(),
-        }
+    pub fn model_directory(&self) -> &Path {
+        &self.models
     }
 
     pub fn handle(&mut self, request: Request) -> Result<Response, Error> {
@@ -68,10 +63,11 @@ impl StorageState {
             Request::Hello { .. } | Request::LatestModel {} => {
                 Err("request must be handled by the connection task".into())
             }
-            Request::PublishModel { version } => {
-                self.publish_model(version)?;
+            Request::AnnounceModel { version } => {
+                self.announce_model(version)?;
                 Ok(Response::Model {
-                    version: *self.latest_model_version.borrow(),
+                    path: (*self.latest_model_version.borrow())
+                        .map(|version| model_path(&self.models, version)),
                 })
             }
             Request::AcceptChunk { path } => {
@@ -100,8 +96,19 @@ impl StorageState {
                     return Err("invalid shard filename".into());
                 }
                 let path = self.shards.join(filename);
-                let records = self.replay.sample_file(&mut self.rng, &path)?;
-                Ok(Response::Shard { path, records })
+                match fs::symlink_metadata(&path) {
+                    Ok(metadata) if metadata.is_file() => {
+                        // A lost reply can be retried using the same filename.
+                        // Repeat the publication barrier if an earlier sync failed.
+                        sync_directory(&self.shards)?;
+                    }
+                    Ok(_) => return Err("shard destination is not a regular file".into()),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        self.replay.sample_file(&mut self.rng, &path)?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                Ok(Response::Shard { path })
             }
             Request::Stats {} => {
                 let stats = self.replay.stats()?;
@@ -114,7 +121,7 @@ impl StorageState {
         }
     }
 
-    fn publish_model(&mut self, version: u64) -> Result<(), Error> {
+    fn announce_model(&mut self, version: u64) -> Result<(), Error> {
         if self
             .latest_model_version
             .borrow()
@@ -124,7 +131,7 @@ impl StorageState {
         }
         // The producer syncs the model, renames it to its final filename, and
         // syncs the directory before notifying us. No separate marker is needed.
-        require_model(&model_path(&self.models, version))?;
+        require_regular_model_file(&model_path(&self.models, version))?;
         self.latest_model_version.send_replace(Some(version));
         Ok(())
     }
@@ -134,27 +141,17 @@ fn scan_latest_model(models: &Path) -> io::Result<Option<ModelVersion>> {
     let mut latest_model_version = None;
     for entry in fs::read_dir(models)? {
         let entry = entry?;
-        let Some(version) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.strip_suffix(".onnx")?.parse::<ModelVersion>().ok())
-        else {
-            continue;
-        };
-        let path = model_path(models, version);
-        // Only canonical final filenames count; temporary exports are ignored.
-        if entry.path() != path {
-            continue;
+        if let Some(version) = model_version_from_filename(&entry.file_name()) {
+            latest_model_version = latest_model_version.max(Some(version));
         }
-        latest_model_version = latest_model_version.max(Some(version));
     }
     if let Some(version) = latest_model_version {
-        require_model(&model_path(models, version))?;
+        require_regular_model_file(&model_path(models, version))?;
     }
     Ok(latest_model_version)
 }
 
-fn require_model(path: &Path) -> io::Result<()> {
+fn require_regular_model_file(path: &Path) -> io::Result<()> {
     if !fs::symlink_metadata(path)?.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -183,14 +180,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("server");
         let mut state = StorageState::open(&root, replay_config()).unwrap();
-        let models = state.model_versions();
-        assert!(state.publish_model(1).is_err());
+        let models = state.subscribe_latest_model_version();
+        assert!(state.announce_model(1).is_err());
         assert!(!state.needs_restart());
         fs::write(model_path(&state.models, 1), b"model").unwrap();
         fs::write(state.models.join("10.onnx.tmp"), b"unfinished").unwrap();
-        state.publish_model(1).unwrap();
-        state.publish_model(1).unwrap();
-        state.publish_model(0).unwrap();
+        state.announce_model(1).unwrap();
+        state.announce_model(1).unwrap();
+        state.announce_model(0).unwrap();
         assert_eq!(*models.borrow(), Some(1));
         // A completed export survives a lost notification. Compare numerically,
         // and ignore temporary, unrelated, and noncanonical filenames.
@@ -206,18 +203,46 @@ mod tests {
         drop(state);
         let mut state = StorageState::open(&root, replay_config()).unwrap();
         assert_eq!(*state.latest_model_version.borrow(), Some(10));
-        state.publish_model(9).unwrap();
+        state.announce_model(9).unwrap();
         assert_eq!(*state.latest_model_version.borrow(), Some(10));
         assert!(!state.models.join("latest.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retry_of_published_shard_repeats_a_failed_directory_sync() {
+        use crate::replay::tests::faults::{self, Operation};
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = StorageState::open(temp.path(), replay_config()).unwrap();
+        let path = state.shards.join("batch.npz");
+        // Stand in for a file published immediately before its directory sync
+        // failed; the sampling test covers publication and NPZ contents.
+        fs::write(&path, b"published shard").unwrap();
+        let fault = faults::inject([(Operation::Sync, state.shards.clone())]);
+        assert!(
+            state
+                .handle(Request::SampleShard {
+                    filename: "batch.npz".into(),
+                })
+                .is_err()
+        );
+        drop(fault);
+        assert!(matches!(
+            state.handle(Request::SampleShard {
+                filename: "batch.npz".into(),
+            }),
+            Ok(Response::Shard { path: returned }) if returned == path
+        ));
+        assert_eq!(fs::read(path).unwrap(), b"published shard");
     }
 
     #[test]
     fn invalid_final_models_fail_without_updating_the_cached_version() {
         let temp = tempfile::tempdir().unwrap();
         let mut state = StorageState::open(temp.path(), replay_config()).unwrap();
-        let models = state.model_versions();
+        let models = state.subscribe_latest_model_version();
         fs::create_dir(model_path(&state.models, 1)).unwrap();
-        assert!(state.publish_model(1).is_err());
+        assert!(state.announce_model(1).is_err());
         assert_eq!(*models.borrow(), None);
         assert!(!state.needs_restart());
         drop(state);
@@ -236,7 +261,7 @@ mod tests {
         let target = temp.path().join("target");
         fs::write(&target, b"model").unwrap();
         std::os::unix::fs::symlink(target, model_path(&state.models, 1)).unwrap();
-        assert!(state.publish_model(1).is_err());
+        assert!(state.announce_model(1).is_err());
         assert_eq!(*state.latest_model_version.borrow(), None);
         drop(state);
         assert!(StorageState::open(temp.path(), replay_config()).is_err());
@@ -262,24 +287,12 @@ mod tests {
         let mut state = StorageState::open(&alias, replay_config()).unwrap();
         // Different directory names must still share the replay lock.
         assert!(StorageState::open(&root, replay_config()).is_err());
-        let Response::Welcome {
-            model_dir,
-            shard_dir,
-            ..
-        } = state.welcome()
-        else {
-            panic!("missing welcome")
-        };
         assert_eq!(
-            fs::canonicalize(model_dir).unwrap(),
+            fs::canonicalize(state.model_directory()).unwrap(),
             fs::canonicalize(temp.path().join("models-target")).unwrap()
         );
-        assert_eq!(
-            fs::canonicalize(shard_dir).unwrap(),
-            fs::canonicalize(temp.path().join("shards-target")).unwrap()
-        );
         fs::write(model_path(&state.models, 1), b"model").unwrap();
-        state.publish_model(1).unwrap();
+        state.announce_model(1).unwrap();
         assert_eq!(*state.latest_model_version.borrow(), Some(1));
         drop(state);
         let state = StorageState::open(&alias, replay_config()).unwrap();

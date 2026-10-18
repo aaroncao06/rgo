@@ -128,7 +128,7 @@ async fn local_acceptance_sampling_model_publication_and_restart() {
         Request::SampleShard {
             filename: "empty.npz".into(),
         },
-        Request::PublishModel { version: 1 },
+        Request::AnnounceModel { version: 1 },
     ] {
         assert!(matches!(
             request(&mut stream, request_type).await,
@@ -172,7 +172,7 @@ async fn local_acceptance_sampling_model_publication_and_restart() {
         fs::read(chunk_path(&root.join("replay/chunks"), 42)).unwrap(),
         bytes
     );
-    let Response::Shard { path, records: 3 } = request(
+    let Response::Shard { path } = request(
         &mut stream,
         Request::SampleShard {
             filename: "batch.npz".into(),
@@ -182,7 +182,8 @@ async fn local_acceptance_sampling_model_publication_and_restart() {
     else {
         panic!("missing shard")
     };
-    let mut zip = zip::ZipArchive::new(fs::File::open(path).unwrap()).unwrap();
+    let original = fs::read(&path).unwrap();
+    let mut zip = zip::ZipArchive::new(fs::File::open(&path).unwrap()).unwrap();
     assert_eq!(zip.len(), 17);
     for dim in [9, 13, 19] {
         assert!(zip.by_name(&format!("{dim}/policy.npy")).is_ok());
@@ -195,13 +196,15 @@ async fn local_acceptance_sampling_model_publication_and_restart() {
             }
         )
         .await,
-        Response::Error { .. }
+        Response::Shard { path: retried } if retried == path
     ));
+    assert_eq!(fs::read(&path).unwrap(), original);
     fs::write(root.join("models/1.onnx"), b"model").unwrap();
     fs::write(root.join("models/2.onnx.tmp"), b"next model").unwrap();
+    let model_dir = fs::canonicalize(root.join("models")).unwrap();
     assert!(matches!(
-        request(&mut stream, Request::PublishModel { version: 1 }).await,
-        Response::Model { version: Some(1) }
+        request(&mut stream, Request::AnnounceModel { version: 1 }).await,
+        Response::Model { path: Some(path) } if path == model_dir.join("1.onnx")
     ));
     drop(stream);
     stop(&mut server).await;
@@ -217,7 +220,7 @@ async fn local_acceptance_sampling_model_publication_and_restart() {
     let mut stream = connect(address).await;
     assert!(matches!(
         request(&mut stream, Request::LatestModel {}).await,
-        Response::Model { version: Some(2) }
+        Response::Model { path: Some(path) } if path == model_dir.join("2.onnx")
     ));
     assert!(matches!(
         request(&mut stream, Request::Stats {}).await,
@@ -227,6 +230,17 @@ async fn local_acceptance_sampling_model_publication_and_restart() {
             ..
         }
     ));
+    assert!(matches!(
+        request(
+            &mut stream,
+            Request::SampleShard {
+                filename: "batch.npz".into()
+            }
+        )
+        .await,
+        Response::Shard { path: retried } if retried == path
+    ));
+    assert_eq!(fs::read(&path).unwrap(), original);
     drop(stream);
     stop(&mut server).await;
 }

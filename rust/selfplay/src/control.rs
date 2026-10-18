@@ -2,17 +2,19 @@
 
 use std::{
     io::{self, BufRead, Read, Write},
-    path::PathBuf,
     thread,
 };
 
-use rgo_artifacts::{ModelVersion, model_path};
+use rgo_artifacts::model_version_from_filename;
 use rgo_protocol::selfplay::Command;
 pub(super) use rgo_protocol::selfplay::Event;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
-use super::{config::SelfPlayConfig, orchestrator::SelfPlayOrchestrator};
+use super::{
+    config::SelfPlayConfig,
+    orchestrator::{ModelFile, SelfPlayOrchestrator},
+};
 
 const MAX_COMMAND_BYTES: u64 = 4096;
 
@@ -97,8 +99,7 @@ fn read_commands(mut input: impl BufRead, commands: mpsc::Sender<Result<Command,
 
 async fn apply_commands(
     mut commands: mpsc::Receiver<Result<Command, String>>,
-    model_dir: PathBuf,
-    latest_tx: watch::Sender<Option<ModelVersion>>,
+    latest_tx: watch::Sender<Option<ModelFile>>,
     finish_tx: watch::Sender<bool>,
 ) -> Result<(), String> {
     while let Some(command) = commands.recv().await {
@@ -107,11 +108,20 @@ async fn apply_commands(
                 let _ = finish_tx.send(true);
                 return Ok(());
             }
-            Command::ModelReady { version } => {
-                if latest_tx.borrow().is_some_and(|current| version <= current) {
+            Command::ModelReady { path } => {
+                let version = path
+                    .file_name()
+                    .and_then(model_version_from_filename)
+                    .ok_or_else(|| {
+                        format!("invalid canonical model filename: {}", path.display())
+                    })?;
+                if latest_tx
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|current| version <= current.version)
+                {
                     continue;
                 }
-                let path = model_path(&model_dir, version);
                 let metadata = tokio::fs::metadata(&path).await.map_err(|error| {
                     format!("announced model {} is unavailable: {error}", path.display())
                 })?;
@@ -119,7 +129,7 @@ async fn apply_commands(
                     return Err(format!("announced model {} is not a file", path.display()));
                 }
                 latest_tx
-                    .send(Some(version))
+                    .send(Some(ModelFile { version, path }))
                     .map_err(|_| "model control receiver closed".to_owned())?;
             }
         }
@@ -152,7 +162,6 @@ async fn supervise_self_play(
     finish_rx: watch::Receiver<bool>,
     events: &EventPublisher,
 ) -> Result<(), String> {
-    let model_dir = config.inference.model_dir.clone();
     let orchestrator = SelfPlayOrchestrator::new(config, events.clone());
     let (commands_tx, commands_rx) = mpsc::channel(1);
     thread::Builder::new()
@@ -161,12 +170,7 @@ async fn supervise_self_play(
         .map_err(|error| format!("could not start command reader: {error}"))?;
     let (latest_tx, latest_rx) = watch::channel(None);
     let mut controls = JoinSet::new();
-    controls.spawn(apply_commands(
-        commands_rx,
-        model_dir,
-        latest_tx.clone(),
-        finish_tx,
-    ));
+    controls.spawn(apply_commands(commands_rx, latest_tx.clone(), finish_tx));
     events
         .emit(Event::Ready {
             protocol_version: rgo_protocol::PROTOCOL_VERSION,
@@ -178,10 +182,9 @@ async fn supervise_self_play(
     loop {
         tokio::select! {
             biased;
-            command_result = controls.join_next(), if !controls.is_empty() => {
+            Some(command_result) = controls.join_next() => {
                 // controls exits successfully after applying the Finish command
-                command_result.expect("control task exists")
-                    .map_err(|error| format!("control task failed: {error}"))??;
+                command_result.map_err(|error| format!("control task failed: {error}"))??;
             }
             result = &mut pipeline => {
                 result.map_err(|error| format!("self-play failed: {error:?}"))?;

@@ -1,7 +1,9 @@
 # Process configurations
 
 [`server.toml`](server.toml) configures the loopback listener, server data
-directory, and replay limits. See [server usage](../rust/server/README.md).
+directory, and replay limits. [`client.toml`](client.toml) configures worker
+launching, model polling, and request/retry deadlines.
+See [client usage](../rust/client/README.md) and [server usage](../rust/server/README.md).
 All relative paths refer to the process working directory.
 
 ## Self-play worker configuration
@@ -10,23 +12,22 @@ All relative paths refer to the process working directory.
 `rgo-selfplay` worker. From the repository root:
 
 ```sh
-mkdir -p models
 cargo run --release --manifest-path rust/Cargo.toml -p rgo-selfplay -- configs/self_play.toml
 ```
 
-The executable takes a configuration path and optional `--model-dir <path>`
-and `--output-dir <path>` overrides, so a supervisor can select artifact paths.
-Directory paths are
-relative to the worker's working directory, not the configuration file. The
-model directory must already exist; it can be empty while the worker waits for
-a model. The worker creates the output directory. Use one worker process per
-output directory. The worker holds `.selfplay.lock` through shutdown because
-its writer uses a shared temporary filename.
+The executable takes a configuration path. The client reads `output_dir` from
+that configuration for recovery and locking; the worker reads the same value,
+creates the directory, and resolves it to an absolute path before writing
+chunks. The client sends complete model paths over stdin. Relative paths refer
+to each process's working directory, not the configuration file. Use one worker
+process per output directory.
+The worker holds `.selfplay.lock` through shutdown because its writer uses a
+shared temporary filename.
 
 The executable is designed to be launched by a supervising process. It uses
 local stdin/stdout pipes; the parent publishes models, consumes chunks, and
-handles any remote communication. A production supervisor and trainer are not
-included yet.
+handles server communication. The local supervisor is implemented in
+`rgo-client`; the trainer and remote transfers are not implemented yet.
 
 ## Settings and defaults
 
@@ -37,12 +38,10 @@ The top-level operational settings are required:
   example's `2 * 4` configuration runs eight tasks.
 - `output_dir`: directory for published `chunk-<32-hex-digit-id>.rgo` files.
 - `chunk`: publication mode, described below.
-- `inference`: model directory, executor configurations, and cache settings.
+- `inference`: executor configurations and cache settings.
 
 The `[inference]` table contains:
 
-- `model_dir`: directory containing atomically published `<version>.onnx`
-  models, where the version is an unsigned 64-bit integer.
 - `cache_capacity` and `num_cache_shards`: evaluation-cache dimensions. The
   example uses 65,536 entries and 16 shards; both must be powers of two, with
   the shard count no larger than the capacity.
@@ -180,13 +179,16 @@ record fields are read directly from their packed bytes.
 Send one JSON command per line on stdin:
 
 ```json
-{"type":"model_ready","version":42}
+{"type":"model_ready","path":"data/models/42.onnx"}
 {"type":"finish"}
 ```
 
-Send `model_ready` only after completely publishing `<model_dir>/42.onnx`.
-The worker checks that exact file and validates the ONNX contract when loading
-it. Duplicate or older version announcements are ignored. Unannounced files
+Send `model_ready` only after completely publishing the supplied model file.
+Its basename must be canonical `<version>.onnx`, where the version is an unsigned
+64-bit integer. The worker derives the version from that filename, checks the
+file, and validates the ONNX contract when loading it. Paths can point to different
+directories; relative paths use the worker's working directory. Duplicate or
+older version announcements are ignored. Unannounced files
 do not trigger model changes; adopted versions are switched at move boundaries
 through coordinated model handoff. The model must meet the
 [V0 tensor contract](../README.md#model-contract).
@@ -201,7 +203,7 @@ Stdout contains newline-delimited JSON events. An illustrative sequence for a
 
 ```json
 {"type":"ready","protocol_version":1}
-{"type":"chunk_ready","path":"self_play_chunks/chunk-00000000000000000000000000000001.rgo","bytes":47056,"records":200}
+{"type":"chunk_ready","path":"/absolute/path/to/data/selfplay/local/chunk-00000000000000000000000000000001.rgo","bytes":47056,"records":200}
 {"type":"stopped"}
 ```
 
@@ -219,5 +221,5 @@ arguments exit with status 2. `--help` prints usage and exits successfully.
 On Unix, SIGINT or SIGTERM requests a graceful finish; a second shutdown signal
 forces immediate exit. An in-progress model load can delay graceful shutdown.
 There is no force-exit pipe command: a supervisor can send `finish`, then kill
-the child if its shutdown deadline expires. Pipe commands and OS signal counts
+the child after a second signal. Pipe commands and OS signal counts
 are independent.

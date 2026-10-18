@@ -1,0 +1,11 @@
+server = "127.0.0.1:3434"
+# Name carried in Hello; currently validated only. Use separate worker output
+# directories for concurrent clients.
+client_id = "local"
+selfplay_config = "configs/self_play.toml"
+# Omitted selfplay_binary uses rgo-selfplay alongside the client executable.
+# Poll immediately after worker readiness, then every 30 minutes.
+model_poll_interval_ms = 1_800_000
+request_timeout_secs = 300
+# Total budget for connection setup or a retryable request, including waits.
+retry_timeout_secs = 600

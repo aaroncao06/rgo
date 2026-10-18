@@ -26,6 +26,13 @@ pub fn model_path(model_dir: &Path, version: ModelVersion) -> PathBuf {
     model_dir.join(format!("{version}.onnx"))
 }
 
+/// Extract a version from a canonical published model basename.
+pub fn model_version_from_filename(filename: &OsStr) -> Option<ModelVersion> {
+    let name = filename.to_str()?;
+    let version = name.strip_suffix(".onnx")?.parse().ok()?;
+    (name == format!("{version}.onnx")).then_some(version)
+}
+
 /// Canonical path for an immutable training chunk in the caller's directory.
 pub fn chunk_path(output_dir: &Path, chunk_id: ChunkId) -> PathBuf {
     output_dir.join(format!(
@@ -59,6 +66,26 @@ mod tests {
             model_path(Path::new("models"), 42),
             Path::new("models").join("42.onnx")
         );
+    }
+
+    #[test]
+    fn model_names_round_trip_and_reject_noncanonical_names() {
+        for version in [0, 42, ModelVersion::MAX] {
+            let path = model_path(Path::new(""), version);
+            assert_eq!(model_version_from_filename(path.as_os_str()), Some(version));
+        }
+        for name in [
+            "042.onnx",
+            "+42.onnx",
+            "-1.onnx",
+            "42.ONNX",
+            "42.onnx.tmp",
+            "../42.onnx",
+            "model.onnx",
+            "18446744073709551616.onnx",
+        ] {
+            assert!(model_version_from_filename(OsStr::new(name)).is_none());
+        }
     }
 
     #[test]

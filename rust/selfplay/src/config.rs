@@ -76,9 +76,8 @@ impl SelfPlayConfig {
         {
             return Err("self-play worker count overflows usize");
         }
-        if self.output_dir.as_os_str().is_empty() || self.inference.model_dir.as_os_str().is_empty()
-        {
-            return Err("output_dir and model_dir must not be empty");
+        if self.output_dir.as_os_str().is_empty() {
+            return Err("output_dir must not be empty");
         }
         if let ChunkMode::FixedRecords(records) = self.chunk {
             if records == 0 || u32::try_from(records).is_err() {

@@ -1,11 +1,12 @@
 //! Loopback JSON control connections; storage stays on one dedicated thread.
 
 use crate::{Error, config::Config, service::StorageState};
+use rgo_artifacts::model_path;
 use rgo_protocol::{
     PROTOCOL_VERSION, ShutdownSignals,
     server::{Request, Response, valid_name},
 };
-use std::{io, sync::Arc, thread, time::Duration};
+use std::{io, path::PathBuf, sync::Arc, thread, time::Duration};
 use tokio::{
     io::BufReader,
     net::{TcpListener, TcpStream},
@@ -21,7 +22,10 @@ struct StorageJob {
     reply: oneshot::Sender<Response>,
 }
 
-async fn request(jobs: &mpsc::Sender<StorageJob>, request: Request) -> io::Result<Response> {
+async fn forward_to_storage(
+    jobs: &mpsc::Sender<StorageJob>,
+    request: Request,
+) -> io::Result<Response> {
     let (reply, response) = oneshot::channel();
     // All connections share the storage queue, but each job has its own reply
     // channel. Wait here so the connection can send the result to its socket.
@@ -37,7 +41,7 @@ async fn connection(
     stream: TcpStream,
     jobs: mpsc::Sender<StorageJob>,
     models: watch::Receiver<Option<u64>>,
-    welcome: Arc<Response>,
+    model_dir: Arc<PathBuf>,
 ) -> io::Result<()> {
     stream.set_nodelay(true)?;
     let mut stream = BufReader::new(stream);
@@ -75,16 +79,22 @@ async fn connection(
         .await?;
         return Ok(());
     }
-    rgo_protocol::write(stream.get_mut(), welcome.as_ref()).await?;
+    rgo_protocol::write(
+        stream.get_mut(),
+        &Response::Welcome {
+            protocol_version: PROTOCOL_VERSION,
+        },
+    )
+    .await?;
     while let Some(message) = rgo_protocol::read::<Request>(&mut stream).await? {
         let response = match message {
             Request::Hello { .. } => Response::Error {
                 message: "hello may only be sent once".into(),
             },
             Request::LatestModel {} => Response::Model {
-                version: *models.borrow(),
+                path: (*models.borrow()).map(|version| model_path(&model_dir, version)),
             },
-            message => request(&jobs, message).await?,
+            message => forward_to_storage(&jobs, message).await?,
         };
         rgo_protocol::write(stream.get_mut(), &response).await?;
     }
@@ -95,11 +105,14 @@ async fn connection(
 fn storage_worker(
     config: Config,
     mut incoming: mpsc::Receiver<StorageJob>,
-    ready: oneshot::Sender<(watch::Receiver<Option<u64>>, Response)>,
+    ready: oneshot::Sender<(watch::Receiver<Option<u64>>, PathBuf)>,
 ) -> Result<(), Error> {
     let mut state = StorageState::open(&config.data_dir, config.replay)?;
     ready
-        .send((state.model_versions(), state.welcome()))
+        .send((
+            state.subscribe_latest_model_version(),
+            state.model_directory().to_path_buf(),
+        ))
         .map_err(|_| "server stopped during startup")?;
     while let Some(job) = incoming.blocking_recv() {
         let response = match state.handle(job.request) {
@@ -130,11 +143,11 @@ pub async fn run(config: Config) -> Result<(), Error> {
         .spawn(move || {
             let _ = finished.send(storage_worker(config, incoming, ready));
         })?;
-    let (models, welcome) = match startup.await {
+    let (models, model_dir) = match startup.await {
         Ok(connection_state) => connection_state,
         Err(_) => return done.await?,
     };
-    let welcome = Arc::new(welcome);
+    let model_dir = Arc::new(model_dir);
     println!("{{\"type\":\"ready\",\"address\":\"{address}\"}}");
     let mut sessions = JoinSet::new();
     let mut worker_result = None;
@@ -155,7 +168,7 @@ pub async fn run(config: Config) -> Result<(), Error> {
                         stream,
                         jobs.clone(),
                         models.clone(),
-                        welcome.clone(),
+                        model_dir.clone(),
                     ));
                 }
             }
@@ -202,12 +215,8 @@ mod tests {
         })
         .await
         .unwrap();
-        let welcome = Arc::new(Response::Welcome {
-            protocol_version: PROTOCOL_VERSION,
-            model_dir: "/models".into(),
-            shard_dir: "/shards".into(),
-        });
-        let session = tokio::spawn(connection(server, jobs.clone(), models, welcome));
+        let model_dir = Arc::new(PathBuf::from("/models"));
+        let session = tokio::spawn(connection(server, jobs.clone(), models, model_dir));
         let mut client = BufReader::new(client);
         rgo_protocol::write(
             client.get_mut(),
@@ -241,9 +250,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-            assert!(
-                matches!(response, Some(Response::Model { version: actual }) if actual == version)
-            );
+            assert!(matches!(
+                response,
+                Some(Response::Model { path }) if path == version.map(|version| PathBuf::from(format!("/models/{version}.onnx")))
+            ));
         }
         assert_eq!(incoming.len(), 1);
         assert!(matches!(

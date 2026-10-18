@@ -116,7 +116,6 @@ fn invalid_operational_settings_return_errors_without_panicking() {
             "mode = \"per_game\"",
             "mode = \"fixed_records\", records = 0",
         ),
-        EXAMPLE.replace("model_dir = \"models\"", "model_dir = \"\""),
     ] {
         assert!(matches!(
             SelfPlayConfig::from_toml(&source),

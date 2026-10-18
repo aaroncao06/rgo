@@ -19,7 +19,7 @@ mod orchestrator;
 mod params;
 mod worker;
 
-const USAGE: &str = "Usage: rgo-selfplay <config.toml> [--model-dir <path>] [--output-dir <path>] (client-supervised worker)";
+const USAGE: &str = "Usage: rgo-selfplay <config.toml> (client-supervised worker)";
 
 fn main() {
     let mut args = env::args_os().skip(1);
@@ -32,29 +32,11 @@ fn main() {
         return;
     }
 
-    let mut model_dir = None;
-    let mut output_dir = None;
-    while let Some(flag) = args.next() {
-        let destination = match flag.to_str() {
-            Some("--model-dir") if model_dir.is_none() => &mut model_dir,
-            Some("--output-dir") if output_dir.is_none() => &mut output_dir,
-            _ => {
-                eprintln!("{USAGE}");
-                process::exit(2);
-            }
-        };
-        *destination = Some(args.next().unwrap_or_else(|| {
-            eprintln!("{USAGE}");
-            process::exit(2);
-        }));
+    if args.next().is_some() {
+        eprintln!("{USAGE}");
+        process::exit(2);
     }
-    let mut config = SelfPlayConfig::load(Path::new(&path)).unwrap_or_else(|error| fatal(error));
-    if let Some(directory) = model_dir {
-        config.inference.model_dir = directory.into();
-    }
-    if let Some(directory) = output_dir {
-        config.output_dir = directory.into();
-    }
+    let config = SelfPlayConfig::load(Path::new(&path)).unwrap_or_else(|error| fatal(error));
     let runtime = build_runtime()
         .unwrap_or_else(|error| fatal(format!("could not start Tokio runtime: {error}")));
     if let Err(error) = runtime.block_on(run(config)) {
@@ -78,20 +60,8 @@ fn fatal(error: impl std::fmt::Display) -> ! {
     process::exit(1);
 }
 
-async fn run(config: SelfPlayConfig) -> Result<(), String> {
-    let metadata = fs::metadata(&config.inference.model_dir).map_err(|error| {
-        format!(
-            "could not open model directory {}: {error}",
-            config.inference.model_dir.display()
-        )
-    })?;
-    if !metadata.is_dir() {
-        return Err(format!(
-            "model path is not a directory: {}",
-            config.inference.model_dir.display()
-        ));
-    }
-    rgo_fs::prepare_directory(&config.output_dir).map_err(|error| {
+async fn run(mut config: SelfPlayConfig) -> Result<(), String> {
+    config.output_dir = rgo_fs::prepare_directory(&config.output_dir).map_err(|error| {
         format!(
             "could not prepare output directory {}: {error}",
             config.output_dir.display()
@@ -110,9 +80,8 @@ async fn run(config: SelfPlayConfig) -> Result<(), String> {
         .map_err(|error| format!("self-play output directory is already in use: {error}"))?;
     with_shutdown(|finish_tx, finish_rx| async move {
         eprintln!(
-            "Starting {} self-play workers; receiving model commands for {}; writing chunks to {}.",
+            "Starting {} self-play workers; receiving model paths; writing chunks to {}.",
             config.worker_threads * config.workers_per_thread,
-            config.inference.model_dir.display(),
             config.output_dir.display(),
         );
         control::run_client_session(config, finish_tx, finish_rx).await

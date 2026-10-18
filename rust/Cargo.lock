@@ -645,6 +645,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rgo-client"
+version = "0.1.0"
+dependencies = [
+ "rgo-artifacts",
+ "rgo-fs",
+ "rgo-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "rgo-engine"
 version = "0.1.0"
 dependencies = [

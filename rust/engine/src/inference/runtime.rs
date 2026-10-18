@@ -12,8 +12,8 @@ use crate::inference::{
 };
 use rand::{RngExt, SeedableRng, rngs::SmallRng};
 pub use rgo_artifacts::ModelVersion;
-use rgo_artifacts::model_path;
 use std::{
+    path::Path,
     sync::{Arc, mpsc},
     thread::JoinHandle,
 };
@@ -269,27 +269,27 @@ impl InputBatch for SlotBatch<'_> {
 impl ModelRuntime {
     /// Load an immutable model runtime, constructing each ONNX backend on its
     /// executor thread. Returns only after every backend has loaded and validated
-    /// the checkpoint. Failed startup closes the queue and joins all executors.
-    /// Loads `<config.model_dir>/<model_version>.onnx`; versions identify immutable
-    /// published models, not process-local runtime generations.
+    /// the model file. Failed startup closes the queue and joins all executors.
+    /// Loads the supplied model path; versions identify immutable published
+    /// models, not process-local runtime generations.
     ///
     /// Dropping the last handle closes and drains the queue, then joins the
     /// executor threads.
     pub fn load(
         model_version: ModelVersion,
+        model_path: &Path,
         config: &ModelRuntimeConfig,
     ) -> Result<ModelHandle, ModelLoadError> {
         config
             .validate()
             .map_err(|message| ModelStartupError::Backend(ort::Error::new(message)))?;
 
-        let checkpoint_path = model_path(&config.model_dir, model_version);
         let queue = Arc::new(BatchQueue::new());
         let cache = EvaluationCache::new(config.cache_capacity, config.num_cache_shards);
         let mut executor_threads = Vec::with_capacity(config.executors.len());
         let (startup_tx, startup_rx) = mpsc::channel();
         for executor in config.executors.iter().cloned() {
-            let path = checkpoint_path.clone();
+            let path = model_path.to_path_buf();
             let queue = queue.clone();
             let startup_tx = startup_tx.clone();
             executor_threads.push(std::thread::spawn(move || {
