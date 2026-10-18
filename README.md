@@ -187,6 +187,8 @@ belong to the engine. See the
 - [`rust/fs`](rust/fs/src/lib.rs): directory creation and synchronization.
 - [`rust/server`](rust/server/README.md): chunk reading/validation, persistent
   replay storage, FIFO retention, NPZ shard sampling, and local control transport.
+- [`python`](python/README.md): packed-shard loading, batch preparation, and
+  pinned Python dependencies.
 - [`configs`](configs/README.md): example self-play configuration and usage.
 
 Search currently resets its graph for every move. The search defaults are

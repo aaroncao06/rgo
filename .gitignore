@@ -5,6 +5,7 @@
 /data/
 __pycache__/
 *.pyc
+.venv/
 
 # Private project notes and local agent instructions.
 /docs/
