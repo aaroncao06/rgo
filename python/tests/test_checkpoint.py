@@ -6,7 +6,7 @@ from unittest.mock import patch
 import torch
 
 from trainer.dummy_model import DummyModel
-from trainer.checkpoint import load_checkpoint, save_checkpoint
+from trainer.checkpoint import checkpoint_path, load_checkpoint, save_checkpoint
 
 
 def optimizer_step(model, optimizer):
@@ -26,8 +26,8 @@ class CheckpointTest(unittest.TestCase):
         optimizer_step(model, optimizer)
 
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "trainer.pt"
-            save_checkpoint(path, model, optimizer, last_shard_index=7)
+            path = checkpoint_path(Path(directory), 7)
+            save_checkpoint(Path(directory), model, optimizer, last_shard_index=7)
 
             resumed = DummyModel()
             resumed_optimizer = torch.optim.Adam(resumed.parameters(), lr=0.001)
@@ -42,8 +42,8 @@ class CheckpointTest(unittest.TestCase):
         model = DummyModel()
         optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "trainer.pt"
-            save_checkpoint(path, model, optimizer, last_shard_index=7)
+            path = checkpoint_path(Path(directory), 7)
+            save_checkpoint(Path(directory), model, optimizer, last_shard_index=7)
 
             def fail_after_partial_write(_state, file):
                 file.write(b"incomplete")
@@ -51,10 +51,19 @@ class CheckpointTest(unittest.TestCase):
 
             with patch("trainer.checkpoint.torch.save", side_effect=fail_after_partial_write):
                 with self.assertRaises(OSError):
-                    save_checkpoint(path, model, optimizer, last_shard_index=8)
+                    save_checkpoint(Path(directory), model, optimizer, last_shard_index=8)
 
             self.assertEqual(load_checkpoint(path, model, optimizer), 7)
             self.assertEqual(list(Path(directory).iterdir()), [path])
+
+    def test_indexed_checkpoint_cannot_be_overwritten(self):
+        model = DummyModel()
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+        with tempfile.TemporaryDirectory() as directory:
+            first = save_checkpoint(Path(directory), model, optimizer, 0)
+            with self.assertRaises(FileExistsError):
+                save_checkpoint(Path(directory), model, optimizer, 0)
+            self.assertEqual(list(Path(directory).iterdir()), [first])
 
 
 if __name__ == "__main__":

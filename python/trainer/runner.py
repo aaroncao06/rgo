@@ -35,8 +35,7 @@ def run(coordinator: TrainingCoordinator, input: TextIO, output: TextIO) -> None
                 "protocol_version": PROTOCOL_VERSION,
             },
         )
-        if coordinator.last_checkpointed_index >= 0:
-            # The previous process may have exited before the client handled it.
+        if coordinator.created_initial_checkpoint:
             _send_checkpoint(output, coordinator)
         while True:
             _send(output, {"type": "shard_request", "index": coordinator.next_index})

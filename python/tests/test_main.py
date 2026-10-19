@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import subprocess
@@ -9,10 +10,17 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from trainer.main import parse_device
+from trainer.main import parse_device, receive_start
 
 
 class TrainerMainTest(unittest.TestCase):
+    def test_start_requires_an_explicit_server_checkpoint_result(self):
+        self.assertIsNone(receive_start(io.StringIO('{"type":"start","checkpoint_path":null}\n')))
+        with self.assertRaisesRegex(ValueError, "absolute path or null"):
+            receive_start(io.StringIO('{"type":"start","checkpoint_path":"local.pt"}\n'))
+        with self.assertRaisesRegex(ValueError, "expected start command"):
+            receive_start(io.StringIO('{"type":"shard","path":"/shard.npz"}\n'))
+
     def test_accepts_explicit_cuda_index(self):
         self.assertEqual(parse_device("cuda:0"), torch.device("cuda:0"))
         self.assertEqual(parse_device("cuda:1"), torch.device("cuda:1"))
@@ -22,13 +30,13 @@ class TrainerMainTest(unittest.TestCase):
     def test_dummy_trainer_process_trains_and_checkpoints_one_shard(self):
         root = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as directory:
-            checkpoint = Path(directory) / "checkpoint.pt"
+            checkpoint = Path(directory) / "0.pt"
             config = Path(directory) / "trainer.toml"
             config.write_text(
                 'model = "dummy"\n'
                 'device = "cpu"\n'
                 'learning_rate = 0.001\n'
-                f'checkpoint_path = {json.dumps(str(checkpoint))}\n'
+                f'checkpoint_dir = {json.dumps(str(Path(directory)))}\n'
                 'base_batch_size = 1\n'
                 'effective_batch_size = 1\n'
                 'checkpoint_rows = 1\n'
@@ -56,7 +64,8 @@ class TrainerMainTest(unittest.TestCase):
             result = subprocess.run(
                 [sys.executable, "-m", "trainer.main", str(config)],
                 input=(
-                    json.dumps({"type": "shard", "path": str(shard)}) + "\n"
+                    '{"type":"start","checkpoint_path":null}\n'
+                    + json.dumps({"type": "shard", "path": str(shard)}) + "\n"
                     + '{"type":"finish"}\n'
                 ),
                 capture_output=True,
@@ -69,17 +78,22 @@ class TrainerMainTest(unittest.TestCase):
             events = [json.loads(line) for line in result.stdout.splitlines()]
             self.assertEqual(
                 [event["type"] for event in events],
-                ["ready", "shard_request", "checkpoint_ready", "shard_trained", "shard_request", "stopped"],
+                ["ready", "checkpoint_ready", "shard_request", "checkpoint_ready", "shard_trained", "shard_request", "stopped"],
             )
-            self.assertEqual(events[1]["index"], 0)
-            self.assertEqual(events[2]["last_shard_index"], 0)
-            self.assertEqual(events[3]["rows"], 1)
-            self.assertEqual(events[4]["index"], 1)
+            self.assertEqual(events[1]["last_shard_index"], -1)
+            self.assertEqual(events[2]["index"], 0)
+            self.assertEqual(events[3]["last_shard_index"], 0)
+            self.assertEqual(events[4]["rows"], 1)
+            self.assertEqual(events[5]["index"], 1)
+            self.assertTrue((Path(directory) / "-1.pt").is_file())
             self.assertTrue(checkpoint.is_file())
 
             restarted = subprocess.run(
                 [sys.executable, "-m", "trainer.main", str(config)],
-                input='{"type":"finish"}\n',
+                input=(
+                    json.dumps({"type": "start", "checkpoint_path": str(checkpoint)}) + "\n"
+                    + '{"type":"finish"}\n'
+                ),
                 capture_output=True,
                 text=True,
                 cwd=root,
@@ -90,10 +104,22 @@ class TrainerMainTest(unittest.TestCase):
             recovered = [json.loads(line) for line in restarted.stdout.splitlines()]
             self.assertEqual(
                 [event["type"] for event in recovered],
-                ["ready", "checkpoint_ready", "shard_request", "stopped"],
+                ["ready", "shard_request", "stopped"],
             )
-            self.assertEqual(recovered[2]["index"], 1)
-            self.assertEqual(recovered[1]["last_shard_index"], 0)
+            self.assertEqual(recovered[1]["index"], 1)
+
+            fresh = subprocess.run(
+                [sys.executable, "-m", "trainer.main", str(config)],
+                input='{"type":"start","checkpoint_path":null}\n{"type":"finish"}\n',
+                capture_output=True,
+                text=True,
+                cwd=root,
+                env=environment,
+                timeout=30,
+            )
+            self.assertNotEqual(fresh.returncode, 0)
+            self.assertIn("FileExistsError", fresh.stderr)
+            self.assertEqual(fresh.stdout, "")
 
 
 if __name__ == "__main__":

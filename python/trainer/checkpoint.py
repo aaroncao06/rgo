@@ -8,12 +8,19 @@ import torch
 from torch import nn
 
 
+def checkpoint_path(directory: Path, last_shard_index: int) -> Path:
+    if last_shard_index < -1:
+        raise ValueError("checkpoint shard index must be at least -1")
+    return directory / f"{last_shard_index}.pt"
+
+
 def save_checkpoint(
-    path: Path,
+    directory: Path,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     last_shard_index: int,
-) -> None:
+) -> Path:
+    path = checkpoint_path(directory, last_shard_index)
     state = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -28,16 +35,17 @@ def save_checkpoint(
             torch.save(state, file)
             file.flush()
             os.fsync(file.fileno())
-        os.replace(temporary, path)
+        os.link(temporary, path)
         if os.name == "posix":
-            directory = os.open(path.parent, os.O_RDONLY)
+            handle = os.open(path.parent, os.O_RDONLY)
             try:
-                os.fsync(directory)
+                os.fsync(handle)
             finally:
-                os.close(directory)
+                os.close(handle)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+    return path
 
 
 def load_checkpoint(

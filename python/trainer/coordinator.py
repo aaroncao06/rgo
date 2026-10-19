@@ -1,11 +1,12 @@
 """Advance one trainer through indexed shards and durable checkpoint boundaries."""
 
 from pathlib import Path
+from typing import Optional
 
 import torch
 from torch import nn
 
-from .checkpoint import load_checkpoint, save_checkpoint
+from .checkpoint import checkpoint_path, load_checkpoint, save_checkpoint
 from .train import train_shard
 
 
@@ -14,7 +15,8 @@ class TrainingCoordinator:
         self,
         model: nn.Module,
         optimizer: torch.optim.Optimizer,
-        checkpoint_path: Path,
+        checkpoint_dir: Path,
+        resume_path: Optional[Path],
         base_batch_size: int,
         effective_batch_size: int,
         checkpoint_rows: int,
@@ -23,22 +25,33 @@ class TrainingCoordinator:
             raise ValueError("checkpoint_rows must be positive")
         self.model = model
         self.optimizer = optimizer
-        self.checkpoint_path = checkpoint_path
+        self.checkpoint_dir = checkpoint_dir
         self.base_batch_size = base_batch_size
         self.effective_batch_size = effective_batch_size
         self.checkpoint_rows = checkpoint_rows
+        self.created_initial_checkpoint = resume_path is None
         self.last_checkpointed_index = (
-            load_checkpoint(checkpoint_path, model, optimizer)
-            if checkpoint_path.exists()
+            load_checkpoint(resume_path, model, optimizer)
+            if resume_path is not None
             else -1
         )
+        if resume_path is not None and resume_path.name != checkpoint_path(
+            checkpoint_dir, self.last_checkpointed_index
+        ).name:
+            raise ValueError("resume checkpoint filename does not match shard index")
         self.last_consumed_index = self.last_checkpointed_index
         self.rows_since_checkpoint = 0
         self._failed = False
+        if self.created_initial_checkpoint:
+            save_checkpoint(checkpoint_dir, model, optimizer, -1)
 
     @property
     def next_index(self) -> int:
         return self.last_consumed_index + 1
+
+    @property
+    def checkpoint_path(self) -> Path:
+        return checkpoint_path(self.checkpoint_dir, self.last_checkpointed_index)
 
     def train_next(self, path: Path) -> tuple[int, int]:
         """Train the next shard and checkpoint at the row threshold."""
@@ -73,13 +86,13 @@ class TrainingCoordinator:
             return
         try:
             save_checkpoint(
-                self.checkpoint_path,
+                self.checkpoint_dir,
                 self.model,
                 self.optimizer,
                 self.last_consumed_index,
             )
         except BaseException:
-            # Replacement may have succeeded before the error. Reopen to decide.
+            # Publication may have succeeded before the error. Reopen to decide.
             self._failed = True
             raise
         self.last_checkpointed_index = self.last_consumed_index

@@ -6,7 +6,7 @@ from unittest.mock import patch
 import torch
 
 from trainer.dummy_model import DummyModel
-from trainer.checkpoint import save_checkpoint
+from trainer.checkpoint import checkpoint_path, save_checkpoint
 from trainer.coordinator import TrainingCoordinator
 
 
@@ -18,17 +18,29 @@ def train_two_rows(model, optimizer, path, _base_batch_size, _effective_batch_si
     return 2
 
 
-def new_coordinator(path, checkpoint_rows):
+def new_coordinator(directory, checkpoint_rows, resume_path=None):
     model = DummyModel()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    return TrainingCoordinator(model, optimizer, path, 1, 8, checkpoint_rows)
+    return TrainingCoordinator(model, optimizer, directory, resume_path, 1, 8, checkpoint_rows)
 
 
 class TrainingCoordinatorTest(unittest.TestCase):
+    def test_fresh_trainer_saves_resumable_initial_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            fresh = new_coordinator(path, checkpoint_rows=4)
+            initial = checkpoint_path(path, -1)
+            self.assertTrue(initial.is_file())
+
+            resumed = new_coordinator(path, checkpoint_rows=4, resume_path=initial)
+            self.assertEqual(resumed.next_index, 0)
+            for expected, actual in zip(fresh.model.parameters(), resumed.model.parameters()):
+                torch.testing.assert_close(expected, actual)
+
     def test_restart_replays_only_work_after_last_checkpoint(self):
         torch.manual_seed(0)
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "trainer.pt"
+            path = Path(directory)
 
             with patch("trainer.coordinator.train_shard", side_effect=train_two_rows):
                 first = new_coordinator(path, checkpoint_rows=4)
@@ -40,7 +52,7 @@ class TrainingCoordinatorTest(unittest.TestCase):
                 self.assertEqual(first.train_next(Path("2.npz")), (2, 2))
                 self.assertEqual(first.last_checkpointed_index, 1)
 
-                restarted = new_coordinator(path, checkpoint_rows=4)
+                restarted = new_coordinator(path, checkpoint_rows=4, resume_path=checkpoint_path(path, 1))
                 self.assertEqual(restarted.next_index, 2)
                 self.assertEqual(restarted.train_next(Path("2.npz")), (2, 2))
                 for expected, actual in zip(
@@ -49,11 +61,11 @@ class TrainingCoordinatorTest(unittest.TestCase):
                     torch.testing.assert_close(expected, actual)
 
                 restarted.checkpoint()
-                self.assertEqual(new_coordinator(path, 4).next_index, 3)
+                self.assertEqual(new_coordinator(path, 4, checkpoint_path(path, 2)).next_index, 3)
 
     def test_failed_training_cannot_advance_or_retry_dirty_state(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "trainer.pt"
+            path = Path(directory)
             first = new_coordinator(path, checkpoint_rows=1)
             with patch("trainer.coordinator.train_shard", side_effect=train_two_rows):
                 first.train_next(Path("0.npz"))
@@ -67,11 +79,11 @@ class TrainingCoordinatorTest(unittest.TestCase):
                     first.train_next(Path("1.npz"))
             with self.assertRaisesRegex(RuntimeError, "reload the coordinator"):
                 first.train_next(Path("1.npz"))
-            self.assertEqual(new_coordinator(path, 1).next_index, 1)
+            self.assertEqual(new_coordinator(path, 1, checkpoint_path(path, 0)).next_index, 1)
 
     def test_checkpoint_error_after_replacement_recovers_new_index(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "trainer.pt"
+            path = Path(directory)
             first = new_coordinator(path, checkpoint_rows=1)
 
             def save_then_fail(*args):
@@ -84,7 +96,7 @@ class TrainingCoordinatorTest(unittest.TestCase):
                         first.train_next(Path("0.npz"))
             with self.assertRaisesRegex(RuntimeError, "reload the coordinator"):
                 first.checkpoint()
-            self.assertEqual(new_coordinator(path, 1).next_index, 1)
+            self.assertEqual(new_coordinator(path, 1, checkpoint_path(path, 0)).next_index, 1)
 
 
 if __name__ == "__main__":

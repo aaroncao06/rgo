@@ -1,9 +1,11 @@
 """TOML entry point for the client-supervised trainer process."""
 
 import argparse
+import json
 import math
 import sys
 from pathlib import Path
+from typing import Optional, TextIO
 
 import torch
 
@@ -29,13 +31,13 @@ def parse_device(value: str) -> torch.device:
     return device
 
 
-def build_trainer(config: dict) -> TrainingCoordinator:
+def build_trainer(config: dict, resume_path: Optional[Path]) -> TrainingCoordinator:
     """Construct the temporary dummy trainer from local process settings."""
     fields = {
         "model",
         "device",
         "learning_rate",
-        "checkpoint_path",
+        "checkpoint_dir",
         "base_batch_size",
         "effective_batch_size",
         "checkpoint_rows",
@@ -57,21 +59,42 @@ def build_trainer(config: dict) -> TrainingCoordinator:
     size = config["effective_batch_size"]
     if size & (size - 1):
         raise ValueError("effective_batch_size must be a power of two")
-    if not isinstance(config["checkpoint_path"], str) or not config["checkpoint_path"]:
-        raise ValueError("checkpoint_path must be a nonempty string")
+    if not isinstance(config["checkpoint_dir"], str) or not config["checkpoint_dir"]:
+        raise ValueError("checkpoint_dir must be a nonempty string")
 
-    checkpoint = Path(config["checkpoint_path"]).absolute()
-    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = Path(config["checkpoint_dir"]).absolute()
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     model = DummyModel().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=rate)
     return TrainingCoordinator(
         model,
         optimizer,
-        checkpoint,
+        checkpoint_dir,
+        resume_path,
         config["base_batch_size"],
         size,
         config["checkpoint_rows"],
     )
+
+
+def receive_start(input: TextIO) -> Optional[Path]:
+    """Read the server-selected checkpoint forwarded by the supervising client."""
+    line = input.readline()
+    if not line:
+        raise EOFError("client startup pipe closed")
+    message = json.loads(line)
+    if (
+        not isinstance(message, dict)
+        or set(message) != {"type", "checkpoint_path"}
+        or message["type"] != "start"
+    ):
+        raise ValueError("expected start command with checkpoint_path")
+    value = message["checkpoint_path"]
+    if value is None:
+        return None
+    if not isinstance(value, str) or not Path(value).is_absolute():
+        raise ValueError("checkpoint_path must be an absolute path or null")
+    return Path(value)
 
 
 def main(argv=None) -> None:
@@ -80,7 +103,7 @@ def main(argv=None) -> None:
     args = parser.parse_args(argv)
     with args.config.open("rb") as file:
         config = tomllib.load(file)
-    run(build_trainer(config), sys.stdin, sys.stdout)
+    run(build_trainer(config, receive_start(sys.stdin)), sys.stdin, sys.stdout)
 
 
 if __name__ == "__main__":

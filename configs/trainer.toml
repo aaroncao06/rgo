@@ -3,7 +3,7 @@
 model = "dummy"
 device = "cpu"
 learning_rate = 0.001
-checkpoint_path = "data/trainer/checkpoint.pt"
+checkpoint_dir = "data/trainer/checkpoints"
 base_batch_size = 8
 effective_batch_size = 256
 checkpoint_rows = 100000
