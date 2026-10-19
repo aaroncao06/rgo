@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import torch
 
-from dummy_model import DummyModel
+from trainer.dummy_model import DummyModel
 from trainer.checkpoint import save_checkpoint
 from trainer.coordinator import TrainingCoordinator
 
@@ -29,30 +29,24 @@ class TrainingCoordinatorTest(unittest.TestCase):
         torch.manual_seed(0)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trainer.pt"
-            requests = []
-
-            def request_shard(index):
-                requests.append(index)
-                return Path(f"{index}.npz")
 
             with patch("trainer.coordinator.train_shard", side_effect=train_two_rows):
                 first = new_coordinator(path, checkpoint_rows=4)
                 self.assertEqual(first.next_index, 0)
-                self.assertEqual(first.train_next(request_shard), (0, 2))
+                self.assertEqual(first.train_next(Path("0.npz")), (0, 2))
                 self.assertEqual(first.last_checkpointed_index, -1)
-                self.assertEqual(first.train_next(request_shard), (1, 2))
+                self.assertEqual(first.train_next(Path("1.npz")), (1, 2))
                 self.assertEqual(first.last_checkpointed_index, 1)
-                self.assertEqual(first.train_next(request_shard), (2, 2))
+                self.assertEqual(first.train_next(Path("2.npz")), (2, 2))
                 self.assertEqual(first.last_checkpointed_index, 1)
 
                 restarted = new_coordinator(path, checkpoint_rows=4)
                 self.assertEqual(restarted.next_index, 2)
-                self.assertEqual(restarted.train_next(request_shard), (2, 2))
+                self.assertEqual(restarted.train_next(Path("2.npz")), (2, 2))
                 for expected, actual in zip(
                     first.model.parameters(), restarted.model.parameters()
                 ):
                     torch.testing.assert_close(expected, actual)
-                self.assertEqual(requests, [0, 1, 2, 2])
 
                 restarted.checkpoint()
                 self.assertEqual(new_coordinator(path, 4).next_index, 3)
@@ -62,7 +56,7 @@ class TrainingCoordinatorTest(unittest.TestCase):
             path = Path(directory) / "trainer.pt"
             first = new_coordinator(path, checkpoint_rows=1)
             with patch("trainer.coordinator.train_shard", side_effect=train_two_rows):
-                first.train_next(lambda index: Path(f"{index}.npz"))
+                first.train_next(Path("0.npz"))
 
             def partial_training(model, optimizer, shard, base, effective):
                 train_two_rows(model, optimizer, shard, base, effective)
@@ -70,9 +64,9 @@ class TrainingCoordinatorTest(unittest.TestCase):
 
             with patch("trainer.coordinator.train_shard", side_effect=partial_training):
                 with self.assertRaisesRegex(OSError, "failed after optimizer step"):
-                    first.train_next(lambda index: Path(f"{index}.npz"))
+                    first.train_next(Path("1.npz"))
             with self.assertRaisesRegex(RuntimeError, "reload the coordinator"):
-                first.train_next(lambda index: Path(f"{index}.npz"))
+                first.train_next(Path("1.npz"))
             self.assertEqual(new_coordinator(path, 1).next_index, 1)
 
     def test_checkpoint_error_after_replacement_recovers_new_index(self):
@@ -87,7 +81,7 @@ class TrainingCoordinatorTest(unittest.TestCase):
             with patch("trainer.coordinator.train_shard", side_effect=train_two_rows):
                 with patch("trainer.coordinator.save_checkpoint", side_effect=save_then_fail):
                     with self.assertRaisesRegex(OSError, "failed after replacement"):
-                        first.train_next(lambda index: Path(f"{index}.npz"))
+                        first.train_next(Path("0.npz"))
             with self.assertRaisesRegex(RuntimeError, "reload the coordinator"):
                 first.checkpoint()
             self.assertEqual(new_coordinator(path, 1).next_index, 1)

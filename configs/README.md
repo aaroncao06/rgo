@@ -27,7 +27,10 @@ shared temporary filename.
 The executable is designed to be launched by a supervising process. It uses
 local stdin/stdout pipes; the parent publishes models, consumes chunks, and
 handles server communication. The local supervisor is implemented in
-`rgo-client`; the trainer and remote transfers are not implemented yet.
+`rgo-client`; trainer client integration and remote transfers are not
+implemented yet. [`trainer.toml`](trainer.toml) configures the temporary CPU
+trainer used to test the pipe and checkpoint flow; see
+[trainer usage](../python/README.md).
 
 ## Settings and defaults
 

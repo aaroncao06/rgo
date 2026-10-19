@@ -1,7 +1,6 @@
 """Advance one trainer through indexed shards and durable checkpoint boundaries."""
 
 from pathlib import Path
-from typing import Callable
 
 import torch
 from torch import nn
@@ -41,8 +40,8 @@ class TrainingCoordinator:
     def next_index(self) -> int:
         return self.last_consumed_index + 1
 
-    def train_next(self, request_shard: Callable[[int], Path]) -> tuple[int, int]:
-        """Request the next index, train it, and checkpoint at the row threshold."""
+    def train_next(self, path: Path) -> tuple[int, int]:
+        """Train the next shard and checkpoint at the row threshold."""
         if self._failed:
             raise RuntimeError("reload the coordinator from its checkpoint after failure")
         index = self.next_index
@@ -50,7 +49,7 @@ class TrainingCoordinator:
             rows = train_shard(
                 self.model,
                 self.optimizer,
-                request_shard(index),
+                path,
                 self.base_batch_size,
                 self.effective_batch_size,
             )

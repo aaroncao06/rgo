@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from dummy_model import DummyModel
+from trainer.dummy_model import DummyModel
 
 
 class DummyModelTest(unittest.TestCase):
