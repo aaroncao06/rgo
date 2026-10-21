@@ -191,15 +191,17 @@ impl ReplayStore {
         Ok(())
     }
 
-    // The catalog has already committed. If deletion is interrupted, reopening
-    // loads the active inventory and removes the remaining inactive files.
+    // The catalog has already committed. With pruning enabled, reopening
+    // removes any inactive files left by interrupted cleanup.
     fn finish_eviction(&mut self, mut total: u64, evicted: usize) -> Result<()> {
         for _ in 0..evicted {
             let chunk = self.chunks.pop_front().unwrap();
-            remove_if_exists(&chunk_path(&self.chunk_dir, chunk.id))?;
+            if self.config.prune_old_chunks {
+                remove_if_exists(&chunk_path(&self.chunk_dir, chunk.id))?;
+            }
             total -= chunk.records as u64;
         }
-        if evicted > 0 {
+        if evicted > 0 && self.config.prune_old_chunks {
             sync_directory(&self.chunk_dir)?;
         }
         self.retained_records = total as usize;
@@ -237,14 +239,21 @@ impl ReplayStore {
     }
 
     fn remove_orphans(&self) -> Result<()> {
-        let active: HashSet<_> = self.chunks.iter().map(|chunk| chunk.id).collect();
+        let mut keep: HashSet<_> = self.chunks.iter().map(|chunk| chunk.id).collect();
+        if !self.config.prune_old_chunks {
+            let mut statement = self.db.prepare("SELECT id FROM chunks WHERE active = 0")?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                keep.insert(decode_id(&row.get::<_, Vec<u8>>(0)?)?);
+            }
+        }
         for entry in fs::read_dir(&self.chunk_dir)? {
             let entry = entry?;
             let name = entry.file_name();
             let Some(id) = chunk_id_from_filename(&name) else {
                 continue;
             };
-            if !active.contains(&id) {
+            if !keep.contains(&id) {
                 remove_if_exists(&entry.path())?;
             }
         }

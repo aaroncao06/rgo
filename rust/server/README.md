@@ -14,6 +14,11 @@ rust/target/release/rgo-server configs/server.toml
 
 The configuration requires `listen` (a loopback socket address), `data_dir`, and
 the five replay limits shown in [server.toml](../../configs/server.toml).
+Under `[replay]`, `prune_old_chunks` defaults to `true`. Set it to `false` to
+keep accepted chunk files after they leave the active replay window. Old files
+remain excluded from sampling and do not reenter replay if the window grows.
+Turning pruning back on removes those old files at startup. Keeping them uses
+disk space without a configured upper bound.
 Paths are relative to the working directory. Storage-directory symlinks are
 supported. On startup the server provisions the storage tree and emits a JSON
 `ready` line containing its listening address.

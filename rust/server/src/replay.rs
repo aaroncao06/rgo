@@ -22,12 +22,19 @@ pub struct ReplayConfig {
     pub capacity_records: usize,
     /// Target retained records, rounded up to whole newest chunks.
     pub window_records: usize,
+    /// Delete files once they leave the active replay window.
+    #[serde(default = "default_prune_old_chunks")]
+    pub prune_old_chunks: bool,
     /// Soft input-record target per group, rounded up to whole chunks.
     pub sample_group_records: usize,
     /// Maximum fresh, disjoint input groups contributing to one shard.
     pub sample_groups_per_shard: usize,
     /// Target output rows per shard; fewer if selected input is insufficient.
     pub shard_records: usize,
+}
+
+fn default_prune_old_chunks() -> bool {
+    true
 }
 
 impl ReplayConfig {
@@ -96,8 +103,8 @@ impl IndexedChunk {
 /// Accepted chunks are hard-linked into `chunks/`; intake filenames are removed
 /// after durable registration. SQLite records acceptance and FIFO order. Retry
 /// receipts survive eviction and restart, so old retries never reintroduce
-/// records. Those small receipts grow with accepted chunks; the active record
-/// window and chunk files are bounded separately.
+/// records. Those small receipts grow with accepted chunks. The active record
+/// window stays bounded; old files are retained when pruning is disabled.
 ///
 /// Retention rounds the window target up to whole chunks, so overshoot is less
 /// than one retained chunk's record count. All records in retained files are
@@ -121,6 +128,7 @@ impl IndexedChunk {
 /// let mut replay = ReplayStore::open(Path::new("replay"), ReplayConfig {
 ///     capacity_records: 5_000_000,
 ///     window_records: 250_000,
+///     prune_old_chunks: true,
 ///     sample_group_records: 200_000,
 ///     sample_groups_per_shard: 4,
 ///     shard_records: 100_000,

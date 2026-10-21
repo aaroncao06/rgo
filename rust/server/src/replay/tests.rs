@@ -88,10 +88,22 @@ fn config(window: usize) -> ReplayConfig {
     ReplayConfig {
         capacity_records: 100,
         window_records: window,
+        prune_old_chunks: true,
         sample_group_records: 20,
         sample_groups_per_shard: 2,
         shard_records: 2048,
     }
+}
+
+#[test]
+fn pruning_defaults_on_in_toml() {
+    let text = "capacity_records = 100\nwindow_records = 10\nsample_group_records = 20\nsample_groups_per_shard = 2\nshard_records = 2048\n";
+    let default: ReplayConfig = toml::from_str(text).unwrap();
+    assert!(default.prune_old_chunks);
+
+    let disabled: ReplayConfig =
+        toml::from_str(&format!("{text}prune_old_chunks = false\n")).unwrap();
+    assert!(!disabled.prune_old_chunks);
 }
 
 fn intake_path(store: &ReplayStore, id: ChunkId) -> PathBuf {

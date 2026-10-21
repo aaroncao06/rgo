@@ -41,6 +41,48 @@ fn fifo_eviction_keeps_whole_boundary_and_oversized_chunks() {
 }
 
 #[test]
+fn old_chunk_files_can_be_kept_without_reentering_replay() {
+    let root = TempDir::new().unwrap();
+    let directory = root.path().join("chunks");
+    let settings = ReplayConfig {
+        prune_old_chunks: false,
+        ..config(1)
+    };
+    let mut store = ReplayStore::open(root.path(), settings).unwrap();
+    for id in 1..=3 {
+        store.ingest(id, &chunk(&[(9, id as u8)])).unwrap();
+    }
+    assert_eq!(tags(&store), BTreeSet::from([3]));
+    assert_eq!(store.stats().unwrap().retained_chunks, 1);
+    for id in 1..=3 {
+        assert!(chunk_path(&directory, id).exists());
+    }
+    drop(store);
+
+    // An unregistered file can be left by interrupted acceptance; unlike an
+    // intentionally retained old chunk, it must still be removed on startup.
+    fs::write(chunk_path(&directory, 4), chunk(&[(9, 4)])).unwrap();
+    let mut store = ReplayStore::open(root.path(), settings).unwrap();
+    assert_eq!(tags(&store), BTreeSet::from([3]));
+    assert!(chunk_path(&directory, 1).exists());
+    assert!(!chunk_path(&directory, 4).exists());
+    store.set_window(100).unwrap();
+    assert_eq!(tags(&store), BTreeSet::from([3]));
+    drop(store);
+
+    // Enabling pruning later clears historical files, not their receipts.
+    let mut store = ReplayStore::open(root.path(), config(100)).unwrap();
+    for id in [1, 2] {
+        assert!(!chunk_path(&directory, id).exists());
+    }
+    assert_eq!(tags(&store), BTreeSet::from([3]));
+    assert_eq!(
+        store.ingest(1, &chunk(&[(9, 9)])).unwrap(),
+        IngestOutcome::AlreadyAccepted { records: 1 }
+    );
+}
+
+#[test]
 fn window_changes_persist_eviction_and_growth_only_uses_new_arrivals() {
     let root = TempDir::new().unwrap();
     let mut store = ReplayStore::open(root.path(), config(6)).unwrap();

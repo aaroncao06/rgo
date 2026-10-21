@@ -165,6 +165,7 @@ mod tests {
         ReplayConfig {
             capacity_records: 100,
             window_records: 100,
+            prune_old_chunks: true,
             sample_group_records: 20,
             sample_groups_per_shard: 4,
             shard_records: 10,
