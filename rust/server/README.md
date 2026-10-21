@@ -59,7 +59,7 @@ remain on disk. The queue is not persisted or replayed on restart. Stop clients
 first to drain their games normally. A
 failed storage mutation stops the server; restart it before retrying. A lost
 receipt is recoverable through the intake file and durable replay receipt.
-The replay store's in-memory `needs_reopen` flag stops further use of the current
+The replay store's in-memory `failed` flag stops further use of the current
 handle. It is not persisted; every startup reloads the catalog and performs
 cleanup regardless of that flag. Restart does not automatically rebuild a
 corrupted database.

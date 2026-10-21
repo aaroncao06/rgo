@@ -1,5 +1,6 @@
 //! Server process owning replay storage and sampling.
 
+mod checkpoints;
 mod config;
 mod replay;
 mod service;

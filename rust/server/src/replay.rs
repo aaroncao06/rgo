@@ -146,14 +146,14 @@ pub struct ReplayStore {
     db: Connection,
     chunks: VecDeque<IndexedChunk>,
     retained_records: usize,
-    needs_reopen: bool,
+    failed: bool,
     _lock: File,
 }
 
 impl ReplayStore {
-    /// Whether a failed mutation requires dropping and reopening this handle.
-    pub fn needs_reopen(&self) -> bool {
-        self.needs_reopen
+    /// Whether a storage failure has made this handle unusable; the server must stop.
+    pub fn failed(&self) -> bool {
+        self.failed
     }
 
     /// Report current counts, or require reopening after a failed mutation.
@@ -168,7 +168,7 @@ impl ReplayStore {
     }
 
     fn ensure_usable(&self) -> Result<()> {
-        if self.needs_reopen {
+        if self.failed {
             return Err(ReplayError::ReopenRequired);
         }
         Ok(())

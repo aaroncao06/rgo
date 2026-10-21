@@ -185,7 +185,7 @@ fn shard_tags(bytes: &[u8]) -> Vec<u8> {
 }
 
 fn assert_requires_reopen(store: &mut ReplayStore, root: &Path) {
-    assert!(store.needs_reopen());
+    assert!(store.failed());
     assert!(matches!(store.stats(), Err(ReplayError::ReopenRequired)));
     assert!(matches!(
         store.ingest(99, &chunk(&[(9, 99)])),

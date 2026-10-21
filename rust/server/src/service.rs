@@ -47,7 +47,7 @@ impl StorageState {
 
     /// Stop the storage worker when replay requires a fresh handle.
     pub fn needs_restart(&self) -> bool {
-        self.replay.needs_reopen()
+        self.replay.failed()
     }
 
     pub fn subscribe_latest_model_version(&self) -> watch::Receiver<Option<ModelVersion>> {

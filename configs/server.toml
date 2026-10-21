@@ -2,6 +2,10 @@
 listen = "127.0.0.1:3434"
 data_dir = "data"
 
+[checkpoints]
+# Keep every accepted trainer checkpoint for experiment history.
+prune_old_checkpoints = false
+
 [replay]
 capacity_records = 5_000_000
 window_records = 250_000

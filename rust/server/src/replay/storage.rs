@@ -64,7 +64,7 @@ impl ReplayStore {
             db,
             chunks: VecDeque::new(),
             retained_records: 0,
-            needs_reopen: false,
+            failed: false,
             _lock: lock,
         };
         store.load_index()?;
@@ -124,7 +124,7 @@ impl ReplayStore {
             drop(bytes);
             let records = indexed.records;
             // Any error after mutation begins requires reopening.
-            self.needs_reopen = true;
+            self.failed = true;
 
             // Keep intake until the catalog commits. Recovery can remove an
             // uncommitted replay link without losing the producer's only copy.
@@ -160,10 +160,10 @@ impl ReplayStore {
         // Also finish intake cleanup on retries of a committed acceptance.
         // Sync even when the file is already absent: a prior unlink's directory
         // sync may have failed before acknowledgment.
-        self.needs_reopen = true;
+        self.failed = true;
         remove_if_exists(source)?;
         sync_directory(source_dir)?;
-        self.needs_reopen = false;
+        self.failed = false;
         Ok(outcome)
     }
 
@@ -176,7 +176,7 @@ impl ReplayStore {
                 "window_records must be positive and at most capacity_records",
             ));
         }
-        self.needs_reopen = true;
+        self.failed = true;
         let transaction = self.db.transaction()?;
         let evicted = evict_chunks(
             &transaction,
@@ -187,7 +187,7 @@ impl ReplayStore {
         transaction.commit()?;
         self.config.window_records = records;
         self.finish_eviction(self.retained_records as u64, evicted)?;
-        self.needs_reopen = false;
+        self.failed = false;
         Ok(())
     }
 
