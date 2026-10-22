@@ -53,7 +53,7 @@ class TrainingCoordinator:
     def checkpoint_path(self) -> Path:
         return checkpoint_path(self.checkpoint_dir, self.last_checkpointed_index)
 
-    def train_next(self, path: Path) -> tuple[int, int]:
+    def train_next(self, path: Path) -> None:
         """Train the next shard and checkpoint at the row threshold."""
         if self._failed:
             raise RuntimeError("reload the coordinator from its checkpoint after failure")
@@ -72,7 +72,6 @@ class TrainingCoordinator:
             self.rows_since_checkpoint += rows
             if self.rows_since_checkpoint >= self.checkpoint_rows:
                 self.checkpoint()
-            return index, rows
         except BaseException:
             # Optimizer state may have changed even if the shard did not finish.
             self._failed = True

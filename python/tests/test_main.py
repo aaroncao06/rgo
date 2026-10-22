@@ -78,13 +78,12 @@ class TrainerMainTest(unittest.TestCase):
             events = [json.loads(line) for line in result.stdout.splitlines()]
             self.assertEqual(
                 [event["type"] for event in events],
-                ["ready", "checkpoint_ready", "shard_request", "checkpoint_ready", "shard_trained", "shard_request", "stopped"],
+                ["ready", "checkpoint_ready", "shard_request", "checkpoint_ready", "shard_request", "stopped"],
             )
             self.assertEqual(events[1]["last_shard_index"], -1)
             self.assertEqual(events[2]["index"], 0)
             self.assertEqual(events[3]["last_shard_index"], 0)
-            self.assertEqual(events[4]["rows"], 1)
-            self.assertEqual(events[5]["index"], 1)
+            self.assertEqual(events[4]["index"], 1)
             self.assertTrue((Path(directory) / "-1.pt").is_file())
             self.assertTrue(checkpoint.is_file())
 

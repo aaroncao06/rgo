@@ -45,16 +45,20 @@ class TrainingCoordinatorTest(unittest.TestCase):
             with patch("trainer.coordinator.train_shard", side_effect=train_two_rows):
                 first = new_coordinator(path, checkpoint_rows=4)
                 self.assertEqual(first.next_index, 0)
-                self.assertEqual(first.train_next(Path("0.npz")), (0, 2))
+                first.train_next(Path("0.npz"))
+                self.assertEqual(first.next_index, 1)
                 self.assertEqual(first.last_checkpointed_index, -1)
-                self.assertEqual(first.train_next(Path("1.npz")), (1, 2))
+                first.train_next(Path("1.npz"))
+                self.assertEqual(first.next_index, 2)
                 self.assertEqual(first.last_checkpointed_index, 1)
-                self.assertEqual(first.train_next(Path("2.npz")), (2, 2))
+                first.train_next(Path("2.npz"))
+                self.assertEqual(first.next_index, 3)
                 self.assertEqual(first.last_checkpointed_index, 1)
 
                 restarted = new_coordinator(path, checkpoint_rows=4, resume_path=checkpoint_path(path, 1))
                 self.assertEqual(restarted.next_index, 2)
-                self.assertEqual(restarted.train_next(Path("2.npz")), (2, 2))
+                restarted.train_next(Path("2.npz"))
+                self.assertEqual(restarted.next_index, 3)
                 for expected, actual in zip(
                     first.model.parameters(), restarted.model.parameters()
                 ):

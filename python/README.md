@@ -16,7 +16,8 @@ PYTHONPATH=python:python/tests uv run --locked python -m unittest discover -s py
 one-shard training, and local recovery checkpoints. `trainer.runner.run` adapts
 it to newline-delimited JSON streams: it reports `ready`, requests the next
 shard index, accepts either an absolute local path or
-`finish`, and reports training/checkpoint completion. Checkpoints are immutable
+`finish`, and reports checkpoint completion. Requesting the next index implies
+that the previous shard finished training. Checkpoints are immutable
 `<last-shard-index>.pt` files in the configured directory. The client
 can retry any completed files left there after interrupted acceptance before
 starting a new trainer process.

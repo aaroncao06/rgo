@@ -56,10 +56,9 @@ def run(coordinator: TrainingCoordinator, input: TextIO, output: TextIO) -> None
                 raise ValueError("expected shard response with an absolute path or finish")
 
             previous = coordinator.last_checkpointed_index
-            index, rows = coordinator.train_next(Path(response["path"]))
+            coordinator.train_next(Path(response["path"]))
             if coordinator.last_checkpointed_index != previous:
                 _send_checkpoint(output, coordinator)
-            _send(output, {"type": "shard_trained", "index": index, "rows": rows})
     except Exception as error:
         _send(output, {"type": "error", "message": str(error)})
         raise

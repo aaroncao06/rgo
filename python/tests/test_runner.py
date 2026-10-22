@@ -38,7 +38,6 @@ class TrainerRunnerTest(unittest.TestCase):
                     {"type": "ready", "protocol_version": 1},
                     {"type": "checkpoint_ready", "path": str(checkpoint_path(Path(directory), -1)), "last_shard_index": -1},
                     {"type": "shard_request", "index": 0},
-                    {"type": "shard_trained", "index": 0, "rows": 2},
                     {"type": "shard_request", "index": 1},
                     {"type": "checkpoint_ready", "path": str(checkpoint), "last_shard_index": 0},
                     {"type": "stopped"},
@@ -46,7 +45,7 @@ class TrainerRunnerTest(unittest.TestCase):
             )
             self.assertEqual(new_coordinator(Path(directory), 4, checkpoint).next_index, 1)
 
-    def test_automatic_checkpoint_precedes_shard_completion(self):
+    def test_automatic_checkpoint_precedes_next_shard_request(self):
         with tempfile.TemporaryDirectory() as directory:
             checkpoint = checkpoint_path(Path(directory), 0)
             shard = Path(directory) / "0.npz"
@@ -60,7 +59,7 @@ class TrainerRunnerTest(unittest.TestCase):
 
             self.assertEqual(
                 [message["type"] for message in messages(output)],
-                ["ready", "checkpoint_ready", "shard_request", "checkpoint_ready", "shard_trained", "shard_request", "stopped"],
+                ["ready", "checkpoint_ready", "shard_request", "checkpoint_ready", "shard_request", "stopped"],
             )
             self.assertEqual(new_coordinator(Path(directory), 2, checkpoint).next_index, 1)
 
