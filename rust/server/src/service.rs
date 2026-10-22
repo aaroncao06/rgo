@@ -2,7 +2,7 @@
 
 use crate::{
     Error,
-    replay::{IngestOutcome, ReplayConfig, ReplayStore, storage::sync_directory},
+    replay::{IngestOutcome, ReplayConfig, ReplayError, ReplayStore, storage::sync_directory},
 };
 use rand::{SeedableRng, rngs::SmallRng};
 use rgo_artifacts::{
@@ -24,6 +24,8 @@ pub struct StorageState {
     // filenames on startup and updated by producer notifications afterward.
     latest_model_version: watch::Sender<Option<ModelVersion>>,
     rng: SmallRng,
+    // Failures in artifact operations outside ReplayStore also stop the server.
+    failed: bool,
 }
 
 impl StorageState {
@@ -42,12 +44,13 @@ impl StorageState {
             shards: root.join("shards"),
             // Repeatable local sampling for fixed replay contents and request order.
             rng: SmallRng::seed_from_u64(0),
+            failed: false,
         })
     }
 
-    /// Stop the storage worker when replay requires a fresh handle.
-    pub fn needs_restart(&self) -> bool {
-        self.replay.failed()
+    /// Stop the storage worker after a replay or artifact storage failure.
+    pub fn failed(&self) -> bool {
+        self.failed || self.replay.failed()
     }
 
     pub fn subscribe_latest_model_version(&self) -> watch::Receiver<Option<ModelVersion>> {
@@ -59,6 +62,9 @@ impl StorageState {
     }
 
     pub fn handle(&mut self, request: Request) -> Result<Response, Error> {
+        if self.failed {
+            return Err("storage operation failed; restart the server before retrying".into());
+        }
         match request {
             Request::Hello { .. } | Request::LatestModel {} => {
                 Err("request must be handled by the connection task".into())
@@ -90,18 +96,28 @@ impl StorageState {
             }
             Request::Shard { index } => {
                 let path = self.shards.join(format!("{index}.npz"));
+                // Any storage error below is fatal. Clear only after success
+                // or the normal no-data result.
+                self.failed = true;
                 match fs::symlink_metadata(&path) {
                     Ok(metadata) if metadata.is_file() => {
-                        // A lost reply can be retried using the same file. Repeat
-                        // the barrier if an earlier directory sync failed.
+                        // A lost reply reuses the published file. Repeat the
+                        // directory barrier before returning its path.
                         sync_directory(&self.shards)?;
                     }
                     Ok(_) => return Err("shard destination is not a regular file".into()),
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        self.replay.sample_file(&mut self.rng, &path)?;
+                        match self.replay.sample_shard(&mut self.rng, &path) {
+                            Err(ReplayError::EmptyReplay) => {
+                                self.failed = false;
+                                return Err(ReplayError::EmptyReplay.into());
+                            }
+                            result => result?,
+                        }
                     }
                     Err(error) => return Err(error.into()),
                 }
+                self.failed = false;
                 Ok(Response::Shard { path })
             }
             Request::Stats {} => {
@@ -192,6 +208,39 @@ mod tests {
     }
 
     #[test]
+    fn empty_shard_request_leaves_storage_usable() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = StorageState::open(temp.path(), replay_config()).unwrap();
+        let error = state.handle(Request::Shard { index: 0 }).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ReplayError>(),
+            Some(ReplayError::EmptyReplay)
+        ));
+        assert!(!state.failed());
+        assert!(matches!(
+            state.handle(Request::Stats {}).unwrap(),
+            Response::Stats {
+                retained_records: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn missing_shard_directory_requires_restart_before_sampling() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = StorageState::open(temp.path(), replay_config()).unwrap();
+        fs::remove_dir(&state.shards).unwrap();
+        let error = state.handle(Request::Shard { index: 0 }).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ReplayError>(),
+            Some(ReplayError::Io(error)) if error.kind() == io::ErrorKind::NotFound
+        ));
+        assert!(state.failed());
+        assert!(state.handle(Request::Stats {}).is_err());
+    }
+
+    #[test]
     fn indexed_shards_reuse_published_files_across_retries_and_restart() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("server");
@@ -232,22 +281,29 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn indexed_shard_retries_after_publication_sync_error_and_restart() {
+    fn new_and_existing_shard_sync_errors_require_restart() {
         use crate::replay::tests::faults::{self, Operation};
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("server");
-        let mut state = StorageState::open(&root, replay_config()).unwrap();
-        add_test_chunk(&mut state, temp.path(), 1, 1);
-        let path = state.shards.join("0.npz");
-        let fault = faults::inject([(Operation::Sync, state.shards.clone())]);
-        assert!(state.handle(Request::Shard { index: 0 }).is_err());
-        assert!(path.exists());
-        drop(fault);
-        assert_eq!(shard_path(&mut state, 0), path);
-        drop(state);
+        for existing in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("server");
+            let mut state = StorageState::open(&root, replay_config()).unwrap();
+            add_test_chunk(&mut state, temp.path(), 1, 1);
+            let path = state.shards.join("0.npz");
+            if existing {
+                assert_eq!(shard_path(&mut state, 0), path);
+            }
+            let fault = faults::inject([(Operation::Sync, state.shards.clone())]);
+            assert!(state.handle(Request::Shard { index: 0 }).is_err());
+            assert!(state.failed());
+            let bytes = fs::read(&path).unwrap();
+            drop(fault);
+            assert!(state.handle(Request::Shard { index: 0 }).is_err());
+            drop(state);
 
-        let mut state = StorageState::open(&root, replay_config()).unwrap();
-        assert_eq!(shard_path(&mut state, 0), path);
+            let mut state = StorageState::open(&root, replay_config()).unwrap();
+            assert_eq!(shard_path(&mut state, 0), path);
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
     }
 
     #[test]
@@ -257,7 +313,7 @@ mod tests {
         let mut state = StorageState::open(&root, replay_config()).unwrap();
         let models = state.subscribe_latest_model_version();
         assert!(state.announce_model(1).is_err());
-        assert!(!state.needs_restart());
+        assert!(!state.failed());
         fs::write(model_path(&state.models, 1), b"model").unwrap();
         fs::write(state.models.join("10.onnx.tmp"), b"unfinished").unwrap();
         state.announce_model(1).unwrap();
@@ -291,7 +347,7 @@ mod tests {
         fs::create_dir(model_path(&state.models, 1)).unwrap();
         assert!(state.announce_model(1).is_err());
         assert_eq!(*models.borrow(), None);
-        assert!(!state.needs_restart());
+        assert!(!state.failed());
         drop(state);
         assert!(StorageState::open(temp.path(), replay_config()).is_err());
         // An invalid older entry does not prevent using a newer final model.

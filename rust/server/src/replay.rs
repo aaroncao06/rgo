@@ -136,7 +136,7 @@ impl IndexedChunk {
 /// replay.ingest_file(1, Path::new("selfplay/chunk.rgo"))?;
 /// // The caller chooses and maintains the RNG; this example is reproducible.
 /// let mut rng = SmallRng::seed_from_u64(7);
-/// replay.sample_file(&mut rng, Path::new("training/shard.npz"))?;
+/// replay.sample_shard(&mut rng, Path::new("training/shard.npz"))?;
 /// # Ok(())
 /// # }
 /// ```

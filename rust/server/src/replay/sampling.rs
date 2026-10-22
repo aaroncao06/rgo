@@ -91,22 +91,29 @@ impl ReplayStore {
         Ok(count)
     }
 
-    /// Sync and atomically publish an NPZ without replacing an existing file.
+    /// Sync and atomically publish a new NPZ without replacing an existing file.
     /// Delivery files belong to the caller, outside replay retention.
-    pub fn sample_file(&mut self, rng: &mut impl Rng, destination: &Path) -> Result<usize> {
+    /// Storage errors require reopening; an empty replay remains a normal result.
+    pub fn sample_shard(&mut self, rng: &mut impl Rng, destination: &Path) -> Result<()> {
         self.ensure_usable()?;
-        let parent = destination
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let mut pending = tempfile::NamedTempFile::new_in(parent)?;
-        let count = self.sample_into(rng, pending.as_file_mut())?;
-        pending.as_file().sync_all()?;
-        pending
-            .persist_noclobber(destination)
-            .map_err(|error| error.error)?;
-        sync_directory(parent)?;
-        Ok(count)
+        let result = (|| {
+            let parent = destination
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let mut pending = tempfile::NamedTempFile::new_in(parent)?;
+            self.sample_into(rng, pending.as_file_mut())?;
+            pending.as_file().sync_all()?;
+            pending
+                .persist_noclobber(destination)
+                .map_err(|error| error.error)?;
+            sync_directory(parent)?;
+            Ok(())
+        })();
+        if matches!(&result, Err(error) if !matches!(error, ReplayError::EmptyReplay)) {
+            self.failed = true;
+        }
+        result
     }
 }
 

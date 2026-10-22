@@ -208,7 +208,7 @@ fn assert_requires_reopen(store: &mut ReplayStore, root: &Path) {
     assert!(output.get_ref().is_empty());
     let destination = root.join("blocked-shard.rgo");
     assert!(matches!(
-        store.sample_file(&mut rng, &destination),
+        store.sample_shard(&mut rng, &destination),
         Err(ReplayError::ReopenRequired)
     ));
     assert!(!destination.exists());

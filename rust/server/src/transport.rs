@@ -124,7 +124,7 @@ fn storage_worker(
         // A disconnected connection may have dropped its receiver.
         // The storage operation still finishes; only its reply is lost.
         let _ = job.reply.send(response);
-        if state.needs_restart() {
+        if state.failed() {
             return Err("storage mutation failed; restart the server before retrying".into());
         }
     }
@@ -197,6 +197,52 @@ pub async fn run(config: Config) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn shard_sync_failure_stops_storage_worker_before_the_next_job() {
+        use crate::replay::tests::faults::{self, Operation};
+        let temp = tempfile::tempdir().unwrap();
+        let root = rgo_fs::prepare_directory(&temp.path().join("server")).unwrap();
+        let shards = root.join("shards");
+        std::fs::create_dir(&shards).unwrap();
+        std::fs::write(shards.join("0.npz"), b"published shard").unwrap();
+        let config = Config {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            data_dir: root,
+            checkpoints: Default::default(),
+            replay: crate::replay::ReplayConfig {
+                capacity_records: 100,
+                window_records: 100,
+                prune_old_chunks: true,
+                sample_group_records: 20,
+                sample_groups_per_shard: 4,
+                shard_records: 10,
+            },
+        };
+        let (jobs, incoming) = mpsc::channel(2);
+        let (reply, response) = oneshot::channel();
+        jobs.try_send(StorageJob {
+            request: Request::Shard { index: 0 },
+            reply,
+        })
+        .unwrap();
+        let (reply, pending_response) = oneshot::channel();
+        jobs.try_send(StorageJob {
+            request: Request::Stats {},
+            reply,
+        })
+        .unwrap();
+        drop(jobs);
+        let (ready, _startup) = oneshot::channel();
+        let _fault = faults::inject([(Operation::Sync, shards)]);
+        assert!(storage_worker(config, incoming, ready).is_err());
+        assert!(matches!(
+            response.blocking_recv().unwrap(),
+            Response::Error { .. }
+        ));
+        assert!(pending_response.blocking_recv().is_err());
+    }
 
     #[tokio::test]
     async fn hello_and_model_polls_respond_while_the_storage_queue_is_full() {

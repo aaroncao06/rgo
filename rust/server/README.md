@@ -138,9 +138,13 @@ guarantee.
 After a storage mutation fails, every operation (including sampling and stats)
 returns `ReplayError::ReopenRequired`. Drop the handle, reopen the store, and
 retry ingestion with the same ID: a failed operation may have committed before
-reporting an error. Input validation errors, source-file read errors, and shard
-delivery failures leave the handle usable. `stats()` returns a `Result` so it
-cannot report stale state from a failed mutation.
+reporting an error. Input validation and source-file read errors during
+ingestion, and `sample_into` delivery failures, leave the handle usable.
+Shard-file preparation errors require reopening and stop the server, including
+I/O errors while creating or writing a temporary file before synchronization.
+An empty replay is a normal request error and leaves the handle usable.
+`stats()` returns a `Result` so it cannot report stale state from a failed
+mutation.
 
 The in-memory catalog keeps chunk IDs, byte lengths, and record counts.
 Record indices and tensor bytes are loaded only for a sampled group.
@@ -198,13 +202,14 @@ its records. Source files are read once per group without checksum/header
 revalidation. Only selected records are copied; array fields are gathered from
 their packed bytes without materializing separate full tensor arrays.
 
-`sample_file(rng, destination)` syncs and atomically publishes the same
-NPZ, rejecting an existing destination. The directory must exist. Failed
-sampling or delivery leaves replay usable; `sample_into` may leave partial
-bytes that the caller must discard. A directory-sync failure can leave a
-published file. The server request handler treats its final filename as the
-request ID: a repeat request returns that published file after syncing the
-directory again, without resampling. Use a fresh filename for a new shard.
+`sample_shard(rng, destination)` syncs and atomically publishes a new NPZ,
+rejecting an existing destination. The directory must exist. The server request
+handler checks for an existing regular shard first and reuses it after syncing
+the directory, without resampling. Storage errors in either path stop the server,
+including temporary-file writes, publication, and file/directory synchronization.
+A directory-sync failure can leave a published file, which can be reused after
+restart and a successful directory barrier. `sample_into` may leave partial
+bytes that the caller must discard. Use a fresh filename for a new shard.
 Delivery files belong to the caller and must be removed after consumption.
 
 ## NPZ arrays

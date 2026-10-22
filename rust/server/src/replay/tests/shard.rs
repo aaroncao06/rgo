@@ -93,7 +93,7 @@ fn mixed_board_npz_preserves_fields_and_samples_without_replacement() {
 
 #[cfg(unix)]
 #[test]
-fn failed_shard_directory_sync_leaves_published_file_and_replay_usable() {
+fn failed_shard_directory_sync_requires_reopen_and_preserves_published_file() {
     let root = TempDir::new().unwrap();
     let shard_dir = TempDir::new().unwrap();
     let mut settings = config(100);
@@ -105,21 +105,22 @@ fn failed_shard_directory_sync_leaves_published_file_and_replay_usable() {
     }
     let before = store.stats().unwrap();
     let destination = shard_dir.path().join("shard.npz");
-    let _fault = faults::inject([(faults::Operation::Sync, shard_dir.path().to_owned())]);
+    let fault = faults::inject([(faults::Operation::Sync, shard_dir.path().to_owned())]);
     assert!(matches!(
-        store.sample_file(&mut SmallRng::seed_from_u64(1), &destination),
+        store.sample_shard(&mut SmallRng::seed_from_u64(1), &destination),
         Err(ReplayError::Io(_))
     ));
-    assert_eq!(shard_tags(&fs::read(&destination).unwrap()).len(), 1);
-    assert_eq!(store.stats().unwrap(), before);
-    // Caller removes the possibly published destination before retrying.
-    fs::remove_file(&destination).unwrap();
-    assert_eq!(
-        store
-            .sample_file(&mut SmallRng::seed_from_u64(2), &destination)
-            .unwrap(),
-        1
-    );
+    let bytes = fs::read(&destination).unwrap();
+    assert_eq!(shard_tags(&bytes).len(), 1);
+    assert_requires_reopen(&mut store, root.path());
+    drop(fault);
+    assert!(matches!(
+        store.sample_shard(&mut SmallRng::seed_from_u64(2), &destination),
+        Err(ReplayError::ReopenRequired)
+    ));
+    drop(store);
+    let store = ReplayStore::open(root.path(), settings).unwrap();
+    assert_eq!(fs::read(&destination).unwrap(), bytes);
     assert_eq!(store.stats().unwrap(), before);
 }
 
@@ -129,39 +130,49 @@ fn local_shards_publish_atomically_without_overwriting_existing_artifacts() {
     fs::create_dir(root.path().join("replay")).unwrap();
     sync_directory(root.path()).unwrap();
     let mut store = ReplayStore::open(&root.path().join("replay"), config(100)).unwrap();
-    store.ingest(1, &chunk(&[(9, 1), (13, 2)])).unwrap();
     let output_dir = root.path().join("shards");
     fs::create_dir(&output_dir).unwrap();
     let destination = output_dir.join("shard.npz");
-    assert_eq!(
-        store
-            .sample_file(&mut SmallRng::seed_from_u64(12), &destination)
-            .unwrap(),
-        2
-    );
+    assert!(matches!(
+        store.sample_shard(&mut SmallRng::seed_from_u64(12), &destination),
+        Err(ReplayError::EmptyReplay)
+    ));
+    assert!(!store.failed());
+    assert!(!destination.exists());
+    store.ingest(1, &chunk(&[(9, 1), (13, 2)])).unwrap();
+    store
+        .sample_shard(&mut SmallRng::seed_from_u64(12), &destination)
+        .unwrap();
     let bytes = fs::read(&destination).unwrap();
     assert_eq!(shard_tags(&bytes), vec![1, 2]);
     let before = store.stats().unwrap();
-    assert!(
-        store
-            .sample_file(&mut SmallRng::seed_from_u64(1), &destination)
-            .is_err()
-    );
-    assert_eq!(store.stats().unwrap(), before);
+    assert!(matches!(
+        store.sample_shard(&mut SmallRng::seed_from_u64(1), &destination),
+        Err(ReplayError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists
+    ));
     assert_eq!(fs::read(&destination).unwrap(), bytes);
     assert_eq!(fs::read_dir(&output_dir).unwrap().count(), 1);
+    assert_requires_reopen(&mut store, &root.path().join("replay"));
+    drop(store);
+    let mut store = ReplayStore::open(&root.path().join("replay"), config(100)).unwrap();
+    assert_eq!(store.stats().unwrap(), before);
     let failed = output_dir.join("failed.npz");
     let source = chunk_path(&store.chunk_dir, 1);
     let unavailable = root.path().join("unavailable");
     fs::rename(&source, &unavailable).unwrap();
     assert!(
         store
-            .sample_file(&mut SmallRng::seed_from_u64(1), &failed)
+            .sample_shard(&mut SmallRng::seed_from_u64(1), &failed)
             .is_err()
     );
     assert!(!failed.exists());
     assert_eq!(fs::read_dir(&output_dir).unwrap().count(), 1);
     fs::rename(unavailable, source).unwrap();
+    // A file-publication request fails the run even when its I/O error occurs
+    // before reaching synchronization. Pure sample_into delivery is separate.
+    assert_requires_reopen(&mut store, &root.path().join("replay"));
+    drop(store);
+    let store = ReplayStore::open(&root.path().join("replay"), config(100)).unwrap();
     assert_eq!(store.stats().unwrap(), before);
 }
 
