@@ -87,7 +87,7 @@ async fn checkpoint_handoff_retries_and_recovers_after_restart() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("server");
     let config = temp.path().join("server.toml");
-    fs::write(&config, format!("listen = '127.0.0.1:0'\ndata_dir = {root:?}\n[checkpoints]\nprune_old_checkpoints = false\n[replay]\ncapacity_records = 100\nwindow_records = 100\nsample_group_records = 20\nsample_groups_per_shard = 4\nrecords_per_shard = 10\n")).unwrap();
+    fs::write(&config, format!("listen = '127.0.0.1:0'\ndata_dir = {root:?}\nprune_old_shards = false\n[checkpoints]\nprune_old_checkpoints = false\n[replay]\ncapacity_records = 100\nwindow_records = 100\nsample_group_records = 20\nsample_groups_per_shard = 4\nrecords_per_shard = 10\n")).unwrap();
     let (mut server, address) = start(&config).await;
     let mut stream = connect(address).await;
     assert!(matches!(
@@ -95,6 +95,9 @@ async fn checkpoint_handoff_retries_and_recovers_after_restart() {
         Response::Checkpoint { path: None }
     ));
     let directory = fs::canonicalize(root.join("checkpoints")).unwrap();
+    let shards = fs::canonicalize(root.join("shards")).unwrap();
+    fs::write(shards.join("0.npz"), b"covered shard").unwrap();
+    fs::write(shards.join("1.npz"), b"prefetched shard").unwrap();
     for index in [-1, 0] {
         let source = temp.path().join(format!("{index}.pt"));
         // Validation rejection must leave the connection and server usable.
@@ -123,18 +126,33 @@ async fn checkpoint_handoff_retries_and_recovers_after_restart() {
                 Response::CheckpointAccepted {}
             ));
             assert!(!source.exists());
+            assert!(shards.join("0.npz").exists());
+            assert!(shards.join("1.npz").exists());
         }
         assert!(matches!(
             request(&mut stream, Request::GetLatestCheckpoint {}).await,
             Response::Checkpoint { path: Some(path) } if path == directory.join(format!("{index}.pt"))
         ));
     }
+    assert!(matches!(
+        request(&mut stream, Request::GetTrainingShard { index: 0 }).await,
+        Response::Error { .. }
+    ));
     assert!(directory.join("-1.pt").exists());
     drop(stream);
     stop(&mut server).await;
 
+    fs::write(
+        &config,
+        fs::read_to_string(&config)
+            .unwrap()
+            .replace("prune_old_shards = false", "prune_old_shards = true"),
+    )
+    .unwrap();
     let (mut server, address) = start(&config).await;
     let mut stream = connect(address).await;
+    assert!(!shards.join("0.npz").exists());
+    assert_eq!(fs::read(shards.join("1.npz")).unwrap(), b"prefetched shard");
     assert!(matches!(
         request(&mut stream, Request::GetLatestCheckpoint {}).await,
         Response::Checkpoint { path: Some(path) } if path == directory.join("0.pt")

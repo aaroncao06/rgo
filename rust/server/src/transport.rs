@@ -107,7 +107,12 @@ fn storage_worker(
     mut incoming: mpsc::Receiver<StorageJob>,
     ready: oneshot::Sender<(watch::Receiver<Option<u64>>, PathBuf)>,
 ) -> Result<(), Error> {
-    let mut state = StorageState::open(&config.data_dir, config.replay, config.checkpoints)?;
+    let mut state = StorageState::open(
+        &config.data_dir,
+        config.replay,
+        config.checkpoints,
+        config.prune_old_shards,
+    )?;
     ready
         .send((
             state.subscribe_latest_model_version(),
@@ -210,6 +215,7 @@ mod tests {
         let config = Config {
             listen: "127.0.0.1:0".parse().unwrap(),
             data_dir: root,
+            prune_old_shards: true,
             checkpoints: Default::default(),
             replay: crate::replay::ReplayConfig {
                 capacity_records: 100,

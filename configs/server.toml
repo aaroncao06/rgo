@@ -1,6 +1,8 @@
 # Local coordination and shared artifact storage.
 listen = "127.0.0.1:3434"
 data_dir = "data"
+# Keep checkpointed training shards for later experiments.
+prune_old_shards = false
 
 [checkpoints]
 # Keep every accepted trainer checkpoint for experiment history.

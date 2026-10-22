@@ -56,8 +56,8 @@ Read requests are `GetLatestModel`, `GetLatestCheckpoint`, `GetTrainingShard`,
 and `GetReplayStats`. Local chunk handoff uses `SubmitChunk`; the training-shard
 response is `TrainingShard { path }`. For a new shard, `path` is `null` until
 replay can fill all `records_per_shard` rows. This is a normal response: wait and
-retry the same index on the same connection. Existing shards are returned even
-if replay has since shrunk; requests do not wait for new data on the server.
+retry the same index on the same connection. Uncheckpointed shards are returned
+even if replay has since shrunk; requests do not wait for new data on the server.
 
 `SubmitCheckpoint { path }` transfers an immutable local checkpoint into
 `checkpoints/<index>.pt` by hard-linking it and removing the producer filename
@@ -67,8 +67,17 @@ an accepted index acknowledges the retry even if the producer filename is gone.
 `GetLatestCheckpoint` returns the highest accepted index's absolute path, or
 `null` when none exists. Checkpoints share the replay storage thread and failure
 policy. Under `[checkpoints]`, `prune_old_checkpoints` defaults to `true`;
-set it to `false` to retain history. Acceptance does not yet export ONNX models
-or delete covered training shards.
+set it to `false` to retain history. After durable checkpoint acceptance, the
+server deletes shards through that checkpoint's index and syncs the shards
+directory before acknowledging. Top-level `prune_old_shards` defaults to `true`;
+set it to `false` to keep those files for experiments. It is independent of
+checkpoint retention. Turning it back on cleans up covered shards at startup.
+Startup also finishes interrupted cleanup. Requests
+for those checkpointed indices are rejected rather than sampled again; newer,
+prefetched shards remain available. Only the latest checkpoint is used for
+automatic recovery; retaining older checkpoints preserves experiment history,
+not their original replay shards unless shard pruning is disabled. Acceptance
+does not yet export ONNX models.
 
 SIGINT/SIGTERM disconnects clients, completes queued storage operations, and
 releases the replay lock. Their replies may be lost, but completed changes
@@ -231,7 +240,8 @@ including temporary-file writes, publication, and file/directory synchronization
 A directory-sync failure can leave a published file, which can be reused after
 restart and a successful directory barrier. `sample_into` may leave partial
 bytes that the caller must discard. Use a fresh filename for a new shard.
-Delivery files belong to the caller and must be removed after consumption.
+With shard pruning enabled, server delivery files are removed after durable
+checkpoint acceptance.
 
 ## NPZ arrays
 

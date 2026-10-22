@@ -11,9 +11,15 @@ use std::{
 pub struct Config {
     pub listen: SocketAddr,
     pub data_dir: PathBuf,
+    #[serde(default = "default_prune_old_shards")]
+    pub prune_old_shards: bool,
     #[serde(default)]
     pub checkpoints: CheckpointConfig,
     pub replay: ReplayConfig,
+}
+
+fn default_prune_old_shards() -> bool {
+    true
 }
 
 impl Config {
@@ -36,19 +42,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn checkpoint_pruning_defaults_on_but_can_be_disabled() {
+    fn retention_defaults_on_but_can_be_disabled() {
         let base = "listen = '127.0.0.1:0'\ndata_dir = 'data'\n";
         let replay = "[replay]\ncapacity_records = 10\nwindow_records = 5\nsample_group_records = 5\nsample_groups_per_shard = 1\nrecords_per_shard = 5\n";
         let default: Config = toml::from_str(&format!("{base}{replay}")).unwrap();
         assert!(default.checkpoints.prune_old_checkpoints);
+        assert!(default.prune_old_shards);
 
         let empty: Config = toml::from_str(&format!("{base}[checkpoints]\n{replay}")).unwrap();
         assert!(empty.checkpoints.prune_old_checkpoints);
 
         let disabled: Config = toml::from_str(&format!(
-            "{base}[checkpoints]\nprune_old_checkpoints = false\n{replay}"
+            "{base}prune_old_shards = false\n[checkpoints]\nprune_old_checkpoints = false\n{replay}"
         ))
         .unwrap();
         assert!(!disabled.checkpoints.prune_old_checkpoints);
+        assert!(!disabled.prune_old_shards);
     }
 }

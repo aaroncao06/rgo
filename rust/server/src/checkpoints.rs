@@ -65,10 +65,14 @@ impl CheckpointStore {
     }
 
     pub fn latest(&self) -> io::Result<Option<PathBuf>> {
-        self.ensure_usable()?;
         Ok(self
-            .latest_index
+            .latest_index()?
             .map(|index| self.directory.join(format!("{index}.pt"))))
+    }
+
+    pub fn latest_index(&self) -> io::Result<Option<i64>> {
+        self.ensure_usable()?;
+        Ok(self.latest_index)
     }
 
     /// Hard-link a published local checkpoint, then remove its producer name.
