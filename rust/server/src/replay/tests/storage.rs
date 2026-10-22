@@ -369,7 +369,13 @@ fn invalid_configuration_is_rejected_before_creating_storage() {
             ..config(1)
         },
         ReplayConfig {
-            shard_records: 0,
+            records_per_shard: 0,
+            ..config(1)
+        },
+        ReplayConfig {
+            sample_group_records: 1,
+            sample_groups_per_shard: 2,
+            records_per_shard: 3,
             ..config(1)
         },
     ] {

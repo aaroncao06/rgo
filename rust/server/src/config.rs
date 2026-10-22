@@ -38,7 +38,7 @@ mod tests {
     #[test]
     fn checkpoint_pruning_defaults_on_but_can_be_disabled() {
         let base = "listen = '127.0.0.1:0'\ndata_dir = 'data'\n";
-        let replay = "[replay]\ncapacity_records = 10\nwindow_records = 5\nsample_group_records = 5\nsample_groups_per_shard = 1\nshard_records = 5\n";
+        let replay = "[replay]\ncapacity_records = 10\nwindow_records = 5\nsample_group_records = 5\nsample_groups_per_shard = 1\nrecords_per_shard = 5\n";
         let default: Config = toml::from_str(&format!("{base}{replay}")).unwrap();
         assert!(default.checkpoints.prune_old_checkpoints);
 

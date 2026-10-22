@@ -29,8 +29,8 @@ pub struct ReplayConfig {
     pub sample_group_records: usize,
     /// Maximum fresh, disjoint input groups contributing to one shard.
     pub sample_groups_per_shard: usize,
-    /// Target output rows per shard; fewer if selected input is insufficient.
-    pub shard_records: usize,
+    /// Output row target; published shard files must contain this many rows.
+    pub records_per_shard: usize,
 }
 
 fn default_prune_old_chunks() -> bool {
@@ -59,8 +59,19 @@ impl ReplayConfig {
                 "sample_groups_per_shard must be positive",
             ));
         }
-        if self.shard_records == 0 {
-            return Err(ReplayError::InvalidConfig("shard_records must be positive"));
+        if self.records_per_shard == 0 {
+            return Err(ReplayError::InvalidConfig(
+                "records_per_shard must be positive",
+            ));
+        }
+        if self
+            .sample_group_records
+            .saturating_mul(self.sample_groups_per_shard)
+            < self.records_per_shard
+        {
+            return Err(ReplayError::InvalidConfig(
+                "sampling groups must cover at least records_per_shard input records",
+            ));
         }
         Ok(())
     }
@@ -131,7 +142,7 @@ impl IndexedChunk {
 ///     prune_old_chunks: true,
 ///     sample_group_records: 200_000,
 ///     sample_groups_per_shard: 4,
-///     shard_records: 100_000,
+///     records_per_shard: 100_000,
 /// })?;
 /// replay.ingest_file(1, Path::new("selfplay/chunk.rgo"))?;
 /// // The caller chooses and maintains the RNG; this example is reproducible.
@@ -167,6 +178,8 @@ impl ReplayStore {
         })
     }
 
+    // The storage worker already stops after a failure. This guard also enforces
+    // that rule for callers using ReplayStore directly.
     fn ensure_usable(&self) -> Result<()> {
         if self.failed {
             return Err(ReplayError::ReopenRequired);

@@ -16,24 +16,24 @@ fn a_small_window_retains_all_and_is_eligible_again_next_request() {
 }
 
 #[test]
-fn soft_groups_keep_whole_chunks_when_retaining_all() {
+fn soft_groups_include_the_whole_final_chunk_before_subsampling() {
     let root = TempDir::new().unwrap();
     let mut settings = config(100);
     settings.sample_group_records = 4;
     settings.sample_groups_per_shard = 1;
     let mut store = ReplayStore::open(root.path(), settings).unwrap();
-    store.ingest(1, &chunk(&[(9, 1), (9, 2)])).unwrap();
-    store.ingest(2, &chunk(&[(9, 3), (9, 4), (9, 5)])).unwrap();
-    store.ingest(3, &chunk(&[(9, 6)])).unwrap();
+    store
+        .ingest(1, &chunk(&[(9, 1), (9, 2), (9, 3), (9, 4), (9, 5)]))
+        .unwrap();
+    let mut selected_tail = false;
     for seed in 0..20 {
-        let rows = shard_tags(&samples(&mut store, 100, seed));
-        assert!((4..=6).contains(&rows.len()));
-        let rows: BTreeSet<_> = rows.into_iter().collect();
-        for tags in [&[1, 2][..], &[3, 4, 5][..], &[6][..]] {
-            let included = tags.iter().filter(|tag| rows.contains(tag)).count();
-            assert!(included == 0 || included == tags.len());
-        }
+        let rows = shard_tags(&samples(&mut store, 4, seed));
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.iter().collect::<BTreeSet<_>>().len(), 4);
+        selected_tail |= rows.contains(&5);
     }
+    // The group target must not truncate the last chunk's eligible rows.
+    assert!(selected_tail);
 }
 
 #[test]
@@ -66,7 +66,7 @@ fn uneven_groups_round_quotas_and_insufficient_input_retains_all() {
     let root = TempDir::new().unwrap();
     let mut settings = config(100);
     settings.sample_group_records = 1;
-    settings.sample_groups_per_shard = 4;
+    settings.sample_groups_per_shard = 6;
     let mut store = ReplayStore::open(root.path(), settings).unwrap();
     store.ingest(1, &chunk(&[(9, 1)])).unwrap();
     store
@@ -80,7 +80,7 @@ fn uneven_groups_round_quotas_and_insufficient_input_retains_all() {
         kept_small |= rows.contains(&1);
         omitted_small |= !rows.contains(&1);
         assert_eq!(rows.iter().collect::<BTreeSet<_>>().len(), 5);
-        let mut all = shard_tags(&samples(&mut store, 100, seed));
+        let mut all = shard_tags(&samples(&mut store, 6, seed));
         all.sort_unstable();
         assert_eq!(all, vec![1, 2, 3, 4, 5, 6]);
         assert_eq!(shard_tags(&samples(&mut store, 1, seed)).len(), 1);
@@ -94,8 +94,8 @@ fn uneven_groups_receive_proportional_quotas_without_repeating_rows() {
     let root = TempDir::new().unwrap();
     let mut settings = config(1000);
     settings.capacity_records = 1000;
-    settings.sample_group_records = 1;
-    settings.sample_groups_per_shard = 3;
+    settings.sample_group_records = 20;
+    settings.sample_groups_per_shard = 5;
     let mut store = ReplayStore::open(root.path(), settings).unwrap();
     for (dim, records) in [(9, 200), (13, 200), (19, 20)] {
         let rows: Vec<_> = (1..=records).map(|tag| (dim, tag as u8)).collect();
@@ -126,12 +126,12 @@ fn each_request_uses_the_current_window_including_arrivals_and_evictions() {
     for id in 1..=3 {
         store.ingest(id, &chunk(&[(9, id as u8)])).unwrap();
     }
-    assert_eq!(shard_tags(&samples(&mut store, 100, 1)).len(), 2);
+    assert_eq!(shard_tags(&samples(&mut store, 2, 1)).len(), 2);
     store.ingest(4, &chunk(&[(9, 4)])).unwrap();
-    assert!((0..20).any(|seed| shard_tags(&samples(&mut store, 100, seed)).contains(&4)));
+    assert!((0..20).any(|seed| shard_tags(&samples(&mut store, 2, seed)).contains(&4)));
     store.set_window(2).unwrap();
     for seed in 0..10 {
-        let mut rows = shard_tags(&samples(&mut store, 100, seed));
+        let mut rows = shard_tags(&samples(&mut store, 2, seed));
         rows.sort_unstable();
         assert_eq!(rows, vec![3, 4]);
     }
@@ -141,7 +141,7 @@ fn each_request_uses_the_current_window_including_arrivals_and_evictions() {
 fn subsampling_is_uniform_within_the_loaded_group_and_rows_are_shuffled() {
     let root = TempDir::new().unwrap();
     let mut settings = config(100);
-    settings.shard_records = 2;
+    settings.records_per_shard = 2;
     let mut store = ReplayStore::open(root.path(), settings).unwrap();
     store
         .ingest(1, &chunk(&[(9, 1), (9, 2), (9, 3), (9, 4), (9, 5)]))
@@ -223,7 +223,7 @@ fn failed_source_read_leaves_replay_usable_and_writes_nothing() {
 fn configured_shard_target_handles_empty_and_insufficient_replay() {
     let root = TempDir::new().unwrap();
     let mut settings = config(100);
-    settings.shard_records = 3;
+    settings.records_per_shard = 3;
     let mut store = ReplayStore::open(root.path(), settings).unwrap();
     let mut output = Cursor::new(Vec::new());
     let mut rng = SmallRng::seed_from_u64(3);

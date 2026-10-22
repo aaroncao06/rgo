@@ -89,15 +89,15 @@ fn config(window: usize) -> ReplayConfig {
         capacity_records: 100,
         window_records: window,
         prune_old_chunks: true,
-        sample_group_records: 20,
+        sample_group_records: 100,
         sample_groups_per_shard: 2,
-        shard_records: 2048,
+        records_per_shard: 2,
     }
 }
 
 #[test]
 fn pruning_defaults_on_in_toml() {
-    let text = "capacity_records = 100\nwindow_records = 10\nsample_group_records = 20\nsample_groups_per_shard = 2\nshard_records = 2048\n";
+    let text = "capacity_records = 100\nwindow_records = 10\nsample_group_records = 20\nsample_groups_per_shard = 2\nrecords_per_shard = 2\n";
     let default: ReplayConfig = toml::from_str(text).unwrap();
     assert!(default.prune_old_chunks);
 
@@ -137,10 +137,11 @@ fn chunk(samples: &[(usize, u8)]) -> Vec<u8> {
     bytes
 }
 
-fn samples(store: &mut ReplayStore, shard_records: usize, seed: u64) -> Vec<u8> {
+fn samples(store: &mut ReplayStore, records_per_shard: usize, seed: u64) -> Vec<u8> {
     // Test-only access lets the same fixtures exercise different configurations.
-    assert!(shard_records > 0);
-    store.config.shard_records = shard_records;
+    assert!(records_per_shard > 0);
+    store.config.records_per_shard = records_per_shard;
+    store.config.validate().unwrap();
     let mut bytes = Cursor::new(Vec::new());
     store
         .sample_into(&mut SmallRng::seed_from_u64(seed), &mut bytes)

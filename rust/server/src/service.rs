@@ -3,7 +3,7 @@
 use crate::{
     Error,
     checkpoints::{CheckpointConfig, CheckpointStore},
-    replay::{ReplayConfig, ReplayError, ReplayStore, storage::sync_directory},
+    replay::{ReplayConfig, ReplayStore, storage::sync_directory},
 };
 use rand::{SeedableRng, rngs::SmallRng};
 use rgo_artifacts::{
@@ -100,26 +100,23 @@ impl StorageState {
                 // Any storage error below is fatal. Clear only after success
                 // or the normal no-data result.
                 self.failed = true;
-                match fs::symlink_metadata(&path) {
+                let ready = match fs::symlink_metadata(&path) {
                     Ok(metadata) if metadata.is_file() => {
                         // A lost reply reuses the published file. Repeat the
                         // directory barrier before returning its path.
                         sync_directory(&self.shards)?;
+                        true
                     }
                     Ok(_) => return Err("shard destination is not a regular file".into()),
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        match self.replay.sample_shard(&mut self.rng, &path) {
-                            Err(ReplayError::EmptyReplay) => {
-                                self.failed = false;
-                                return Err(ReplayError::EmptyReplay.into());
-                            }
-                            result => result?,
-                        }
+                        self.replay.sample_shard(&mut self.rng, &path)?
                     }
                     Err(error) => return Err(error.into()),
-                }
+                };
                 self.failed = false;
-                Ok(Response::TrainingShard { path })
+                Ok(Response::TrainingShard {
+                    path: ready.then_some(path),
+                })
             }
             Request::GetReplayStats {} => {
                 let stats = self.replay.stats()?;
@@ -160,6 +157,7 @@ fn require_regular_model_file(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replay::ReplayError;
     use rgo_artifacts::chunk::{chunk_header, training_record_size};
     use sha2::{Digest, Sha256};
 
@@ -170,7 +168,7 @@ mod tests {
             prune_old_chunks: true,
             sample_group_records: 20,
             sample_groups_per_shard: 4,
-            shard_records: 10,
+            records_per_shard: 1,
         }
     }
 
@@ -188,7 +186,7 @@ mod tests {
 
     fn shard_path(state: &mut StorageState, index: u64) -> PathBuf {
         match state.handle(Request::GetTrainingShard { index }).unwrap() {
-            Response::TrainingShard { path } => path,
+            Response::TrainingShard { path: Some(path) } => path,
             response => panic!("unexpected response: {response:?}"),
         }
     }
@@ -243,22 +241,44 @@ mod tests {
     }
 
     #[test]
-    fn empty_shard_request_leaves_storage_usable() {
+    fn full_shards_wait_for_replay_and_existing_shards_remain_available() {
         let temp = tempfile::tempdir().unwrap();
-        let mut state =
-            StorageState::open(temp.path(), replay_config(), CheckpointConfig::default()).unwrap();
-        let error = state
-            .handle(Request::GetTrainingShard { index: 0 })
-            .unwrap_err();
+        let root = temp.path().join("server");
+        let config = ReplayConfig {
+            records_per_shard: 3,
+            ..replay_config()
+        };
+        let mut state = StorageState::open(&root, config, CheckpointConfig::default()).unwrap();
+        for id in 0..3 {
+            assert!(matches!(
+                state
+                    .handle(Request::GetTrainingShard { index: 0 })
+                    .unwrap(),
+                Response::TrainingShard { path: None }
+            ));
+            assert!(!state.failed());
+            assert_eq!(fs::read_dir(&state.shards).unwrap().count(), 0);
+            add_test_chunk(&mut state, temp.path(), id, id as u8);
+        }
+        let path = shard_path(&mut state, 0);
+        let bytes = fs::read(&path).unwrap();
+        state.replay.set_window(1).unwrap();
+        assert_eq!(state.replay.stats().unwrap().retained_records, 1);
+        assert_eq!(shard_path(&mut state, 0), path);
         assert!(matches!(
-            error.downcast_ref::<ReplayError>(),
-            Some(ReplayError::EmptyReplay)
+            state
+                .handle(Request::GetTrainingShard { index: 1 })
+                .unwrap(),
+            Response::TrainingShard { path: None }
         ));
-        assert!(!state.failed());
+        drop(state);
+        let mut state = StorageState::open(&root, config, CheckpointConfig::default()).unwrap();
+        assert_eq!(shard_path(&mut state, 0), path);
+        assert_eq!(fs::read(path).unwrap(), bytes);
         assert!(matches!(
             state.handle(Request::GetReplayStats {}).unwrap(),
             Response::Stats {
-                retained_records: 0,
+                retained_records: 1,
                 ..
             }
         ));
@@ -269,6 +289,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut state =
             StorageState::open(temp.path(), replay_config(), CheckpointConfig::default()).unwrap();
+        add_test_chunk(&mut state, temp.path(), 1, 1);
         fs::remove_dir(&state.shards).unwrap();
         let error = state
             .handle(Request::GetTrainingShard { index: 0 })

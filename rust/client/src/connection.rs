@@ -321,7 +321,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shard_request_retries_after_a_lost_reply() {
+    async fn shard_request_retries_after_a_lost_reply_and_preserves_not_ready_connection() {
         use tokio::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let config = test_config(listener.local_addr().unwrap());
@@ -348,10 +348,17 @@ mod tests {
                     Some(Request::GetTrainingShard { index: 0 })
                 ));
                 if attempt == 1 {
+                    rgo_protocol::write(stream.get_mut(), &Response::TrainingShard { path: None })
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        rgo_protocol::read::<Request>(&mut stream).await.unwrap(),
+                        Some(Request::GetTrainingShard { index: 0 })
+                    ));
                     rgo_protocol::write(
                         stream.get_mut(),
                         &Response::TrainingShard {
-                            path: shard.clone(),
+                            path: Some(shard.clone()),
                         },
                     )
                     .await
@@ -365,7 +372,14 @@ mod tests {
                 .request(&Request::GetTrainingShard { index: 0 })
                 .await
                 .unwrap(),
-            Response::TrainingShard { path } if path == expected
+            Response::TrainingShard { path: None }
+        ));
+        assert!(matches!(
+            connection
+                .request(&Request::GetTrainingShard { index: 0 })
+                .await
+                .unwrap(),
+            Response::TrainingShard { path: Some(path) } if path == expected
         ));
         server.await.unwrap();
     }

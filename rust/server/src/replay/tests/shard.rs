@@ -5,7 +5,7 @@ fn mixed_board_npz_preserves_fields_and_samples_without_replacement() {
     let root = TempDir::new().unwrap();
     let mut settings = config(100);
     settings.sample_group_records = 1;
-    settings.sample_groups_per_shard = 3;
+    settings.sample_groups_per_shard = 6;
     let mut store = ReplayStore::open(root.path(), settings).unwrap();
     let inputs = [
         chunk(&[(9, 1), (13, 2)]),
@@ -16,7 +16,7 @@ fn mixed_board_npz_preserves_fields_and_samples_without_replacement() {
         store.ingest(id as u128, bytes).unwrap();
     }
     let before = store.stats().unwrap();
-    let output = samples(&mut store, 1000, 7);
+    let output = samples(&mut store, 6, 7);
     assert_eq!(
         shard_tags(&output).into_iter().collect::<BTreeSet<_>>(),
         BTreeSet::from([1, 2, 3, 4, 5, 6])
@@ -98,7 +98,7 @@ fn failed_shard_directory_sync_requires_reopen_and_preserves_published_file() {
     let shard_dir = TempDir::new().unwrap();
     let mut settings = config(100);
     settings.sample_group_records = 1;
-    settings.shard_records = 1;
+    settings.records_per_shard = 1;
     let mut store = ReplayStore::open(root.path(), settings).unwrap();
     for id in 1..=2 {
         store.ingest(id, &chunk(&[(9, id as u8)])).unwrap();
@@ -129,14 +129,19 @@ fn local_shards_publish_atomically_without_overwriting_existing_artifacts() {
     let root = TempDir::new().unwrap();
     fs::create_dir(root.path().join("replay")).unwrap();
     sync_directory(root.path()).unwrap();
-    let mut store = ReplayStore::open(&root.path().join("replay"), config(100)).unwrap();
+    let settings = ReplayConfig {
+        records_per_shard: 2,
+        ..config(100)
+    };
+    let mut store = ReplayStore::open(&root.path().join("replay"), settings).unwrap();
     let output_dir = root.path().join("shards");
     fs::create_dir(&output_dir).unwrap();
     let destination = output_dir.join("shard.npz");
-    assert!(matches!(
-        store.sample_shard(&mut SmallRng::seed_from_u64(12), &destination),
-        Err(ReplayError::EmptyReplay)
-    ));
+    assert!(
+        !store
+            .sample_shard(&mut SmallRng::seed_from_u64(12), &destination)
+            .unwrap()
+    );
     assert!(!store.failed());
     assert!(!destination.exists());
     store.ingest(1, &chunk(&[(9, 1), (13, 2)])).unwrap();
@@ -154,7 +159,7 @@ fn local_shards_publish_atomically_without_overwriting_existing_artifacts() {
     assert_eq!(fs::read_dir(&output_dir).unwrap().count(), 1);
     assert_requires_reopen(&mut store, &root.path().join("replay"));
     drop(store);
-    let mut store = ReplayStore::open(&root.path().join("replay"), config(100)).unwrap();
+    let mut store = ReplayStore::open(&root.path().join("replay"), settings).unwrap();
     assert_eq!(store.stats().unwrap(), before);
     let failed = output_dir.join("failed.npz");
     let source = chunk_path(&store.chunk_dir, 1);
@@ -172,7 +177,7 @@ fn local_shards_publish_atomically_without_overwriting_existing_artifacts() {
     // before reaching synchronization. Pure sample_into delivery is separate.
     assert_requires_reopen(&mut store, &root.path().join("replay"));
     drop(store);
-    let store = ReplayStore::open(&root.path().join("replay"), config(100)).unwrap();
+    let store = ReplayStore::open(&root.path().join("replay"), settings).unwrap();
     assert_eq!(store.stats().unwrap(), before);
 }
 

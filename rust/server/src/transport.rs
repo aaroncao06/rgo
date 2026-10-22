@@ -217,7 +217,7 @@ mod tests {
                 prune_old_chunks: true,
                 sample_group_records: 20,
                 sample_groups_per_shard: 4,
-                shard_records: 10,
+                records_per_shard: 10,
             },
         };
         let (jobs, incoming) = mpsc::channel(2);

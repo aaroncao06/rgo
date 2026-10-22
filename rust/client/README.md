@@ -75,7 +75,8 @@ validates the [model contract](../../README.md#model-contract) when loading it.
 
 Indexed `GetTrainingShard` requests are defined by the shared protocol, but trainer
 coordination is not wired into this CLI yet. The server returns a stable shard
-path for a given request index and retains it for recovery. Checkpoint
+path for a ready request index and retains it for recovery. Until enough replay
+exists for a new full shard, its response path is `null`. Checkpoint
 acceptance is implemented on the server; client trainer integration and automatic
 shard cleanup remain deferred.
 

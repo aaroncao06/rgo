@@ -50,7 +50,8 @@ pub enum Response {
         path: Option<PathBuf>,
     },
     TrainingShard {
-        path: PathBuf,
+        // None means a new full shard is not ready; retry the same index later.
+        path: Option<PathBuf>,
     },
     Stats {
         retained_records: usize,
@@ -105,14 +106,13 @@ mod tests {
             Request::GetTrainingShard { index: 8 }
         ));
 
-        let response = Response::TrainingShard {
-            path: PathBuf::from("/shards/8.npz"),
-        };
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(matches!(
-            serde_json::from_str::<Response>(&json).unwrap(),
-            Response::TrainingShard { path }
-                if path == PathBuf::from("/shards/8.npz")
-        ));
+        for path in [None, Some(PathBuf::from("/shards/8.npz"))] {
+            let json =
+                serde_json::to_string(&Response::TrainingShard { path: path.clone() }).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Response>(&json).unwrap(),
+                Response::TrainingShard { path: decoded } if decoded == path
+            ));
+        }
     }
 }

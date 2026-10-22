@@ -87,7 +87,7 @@ async fn checkpoint_handoff_retries_and_recovers_after_restart() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("server");
     let config = temp.path().join("server.toml");
-    fs::write(&config, format!("listen = '127.0.0.1:0'\ndata_dir = {root:?}\n[checkpoints]\nprune_old_checkpoints = false\n[replay]\ncapacity_records = 100\nwindow_records = 100\nsample_group_records = 20\nsample_groups_per_shard = 4\nshard_records = 10\n")).unwrap();
+    fs::write(&config, format!("listen = '127.0.0.1:0'\ndata_dir = {root:?}\n[checkpoints]\nprune_old_checkpoints = false\n[replay]\ncapacity_records = 100\nwindow_records = 100\nsample_group_records = 20\nsample_groups_per_shard = 4\nrecords_per_shard = 10\n")).unwrap();
     let (mut server, address) = start(&config).await;
     let mut stream = connect(address).await;
     assert!(matches!(
@@ -160,7 +160,7 @@ async fn local_acceptance_sampling_model_publication_and_restart() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("nested/server");
     let config = temp.path().join("server.toml");
-    fs::write(&config, format!("listen = '127.0.0.1:0'\ndata_dir = {:?}\n[replay]\ncapacity_records = 100\nwindow_records = 100\nsample_group_records = 20\nsample_groups_per_shard = 4\nshard_records = 10\n", root)).unwrap();
+    fs::write(&config, format!("listen = '127.0.0.1:0'\ndata_dir = {:?}\n[replay]\ncapacity_records = 100\nwindow_records = 100\nsample_group_records = 20\nsample_groups_per_shard = 4\nrecords_per_shard = 3\n", root)).unwrap();
     let (mut server, address) = start(&config).await;
     for (protocol_version, client_id) in [
         (PROTOCOL_VERSION + 1, "local"),
@@ -191,17 +191,18 @@ async fn local_acceptance_sampling_model_publication_and_restart() {
         );
     }
     let mut stream = connect(address).await;
-    for request_type in [
-        Request::SubmitChunk {
-            path: "../bad.rgo".into(),
-        },
-        Request::GetTrainingShard { index: 0 },
-    ] {
+    for request_type in [Request::SubmitChunk {
+        path: "../bad.rgo".into(),
+    }] {
         assert!(matches!(
             request(&mut stream, request_type).await,
             Response::Error { .. }
         ));
     }
+    assert!(matches!(
+        request(&mut stream, Request::GetTrainingShard { index: 0 }).await,
+        Response::TrainingShard { path: None }
+    ));
     let mut bytes = chunk_header(3).to_vec();
     for dim in [9, 13, 19] {
         let mut record = vec![0; training_record_size(dim)];
@@ -234,7 +235,7 @@ async fn local_acceptance_sampling_model_publication_and_restart() {
         bytes
     );
     let Response::TrainingShard {
-        path: training_path,
+        path: Some(training_path),
     } = request(&mut stream, Request::GetTrainingShard { index: 0 }).await
     else {
         panic!("missing indexed training shard")
@@ -246,9 +247,12 @@ async fn local_acceptance_sampling_model_publication_and_restart() {
     let training_bytes = fs::read(&training_path).unwrap();
     let mut zip = zip::ZipArchive::new(fs::File::open(&training_path).unwrap()).unwrap();
     assert_eq!(zip.len(), 17);
+    let mut rows = 0;
     for dim in [9, 13, 19] {
-        assert!(zip.by_name(&format!("{dim}/policy.npy")).is_ok());
+        let entry = zip.by_name(&format!("{dim}/policy.npy")).unwrap();
+        rows += npyz::NpyFile::new(entry).unwrap().shape()[0];
     }
+    assert_eq!(rows, 3);
     fs::write(root.join("models/1.onnx"), b"model").unwrap();
     fs::write(root.join("models/2.onnx.tmp"), b"next model").unwrap();
     let model_dir = fs::canonicalize(root.join("models")).unwrap();
@@ -282,7 +286,7 @@ async fn local_acceptance_sampling_model_publication_and_restart() {
             Request::GetTrainingShard { index: 0 }
         )
         .await,
-        Response::TrainingShard { path } if path == training_path
+        Response::TrainingShard { path: Some(path) } if path == training_path
     ));
     assert_eq!(fs::read(&training_path).unwrap(), training_bytes);
     drop(stream);

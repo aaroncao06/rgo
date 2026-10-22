@@ -20,10 +20,10 @@ use super::{
 impl ReplayStore {
     /// Shuffle the current window and form up to `sample_groups_per_shard`
     /// disjoint groups of whole chunks, each reaching the soft input-record
-    /// target if possible. Allocate the configured `shard_records` target in
+    /// target if possible. Allocate the configured `records_per_shard` target in
     /// proportion to each group's record count, uniformly selecting without
     /// replacement within each group, and write one NPZ.
-    /// Returns fewer rows if the selected groups together cannot fill the target.
+    /// Returns fewer rows if replay contains fewer than the target.
     ///
     /// Each request starts fresh. Rows are unique within a shard and can recur
     /// on later requests. Group quotas use integer rounding, so this approximates
@@ -50,7 +50,7 @@ impl ReplayStore {
         let limit = self
             .config
             .sample_groups_per_shard
-            .min(self.config.shard_records);
+            .min(self.config.records_per_shard);
         while start < order.len() && groups.len() < limit {
             let mut end = start;
             let mut records = 0usize;
@@ -65,7 +65,7 @@ impl ReplayStore {
             start = end;
         }
         let mut remaining_records: usize = groups.iter().map(|(_, records)| records).sum();
-        let count = self.config.shard_records.min(remaining_records);
+        let count = self.config.records_per_shard.min(remaining_records);
         let mut selected = SelectedRecords {
             bytes: Vec::new(),
             offsets: Vec::with_capacity(count),
@@ -91,11 +91,15 @@ impl ReplayStore {
         Ok(count)
     }
 
-    /// Sync and atomically publish a new NPZ without replacing an existing file.
+    /// Sync and atomically publish a full NPZ without replacing an existing file.
+    /// Return false when replay cannot fill the shard.
     /// Delivery files belong to the caller, outside replay retention.
-    /// Storage errors require reopening; an empty replay remains a normal result.
-    pub fn sample_shard(&mut self, rng: &mut impl Rng, destination: &Path) -> Result<()> {
+    /// Storage errors require reopening.
+    pub fn sample_shard(&mut self, rng: &mut impl Rng, destination: &Path) -> Result<bool> {
         self.ensure_usable()?;
+        if self.retained_records < self.config.records_per_shard {
+            return Ok(false);
+        }
         let result = (|| {
             let parent = destination
                 .parent()
@@ -108,9 +112,9 @@ impl ReplayStore {
                 .persist_noclobber(destination)
                 .map_err(|error| error.error)?;
             sync_directory(parent)?;
-            Ok(())
+            Ok(true)
         })();
-        if matches!(&result, Err(error) if !matches!(error, ReplayError::EmptyReplay)) {
+        if result.is_err() {
             self.failed = true;
         }
         result

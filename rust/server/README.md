@@ -54,7 +54,10 @@ provide authentication or isolation between users on the same machine.
 
 Read requests are `GetLatestModel`, `GetLatestCheckpoint`, `GetTrainingShard`,
 and `GetReplayStats`. Local chunk handoff uses `SubmitChunk`; the training-shard
-response is `TrainingShard { path }`.
+response is `TrainingShard { path }`. For a new shard, `path` is `null` until
+replay can fill all `records_per_shard` rows. This is a normal response: wait and
+retry the same index on the same connection. Existing shards are returned even
+if replay has since shrunk; requests do not wait for new data on the server.
 
 `SubmitCheckpoint { path }` transfers an immutable local checkpoint into
 `checkpoints/<index>.pt` by hard-linking it and removing the producer filename
@@ -156,7 +159,7 @@ reporting an error. Input validation and source-file read errors during
 ingestion, and `sample_into` delivery failures, leave the handle usable.
 Shard-file preparation errors require reopening and stop the server, including
 I/O errors while creating or writing a temporary file before synchronization.
-An empty replay is a normal request error and leaves the handle usable.
+Insufficient replay returns a normal not-ready response and leaves storage usable.
 `stats()` returns a `Result` so it cannot report stale state from a failed
 mutation.
 
@@ -171,9 +174,10 @@ data; receipt metadata grows with the number of accepted chunks.
 
 `sample_group_records` is the soft input-record target per group.
 `sample_groups_per_shard` bounds the number of fresh groups contributing to one
-shard; the example configuration uses four. `shard_records` sets the output-row
-target for every shard. All three must be positive and are independent of the
-replay window target.
+shard; the example configuration uses four. `records_per_shard` sets the output-row
+target for every published shard. All three must be positive. Replay configuration
+requires `sample_group_records * sample_groups_per_shard >= records_per_shard`,
+so the selected groups can fill a shard when replay has enough rows.
 
 `sample_into(rng, output)` writes one uncompressed NPZ. It requires an
 empty, seekable output and returns the actual number of selected rows:
@@ -216,8 +220,11 @@ its records. Source files are read once per group without checksum/header
 revalidation. Only selected records are copied; array fields are gathered from
 their packed bytes without materializing separate full tensor arrays.
 
-`sample_shard(rng, destination)` syncs and atomically publishes a new NPZ,
-rejecting an existing destination. The directory must exist. The server request
+`sample_shard(rng, destination)` syncs and atomically publishes a full NPZ,
+returning `true` on publication or `false` when there are insufficient input rows.
+It never publishes a short shard and rejects an existing destination. The
+directory must exist. The lower-level `sample_into` can still write fewer rows.
+The server request
 handler checks for an existing regular shard first and reuses it after syncing
 the directory, without resampling. Storage errors in either path stop the server,
 including temporary-file writes, publication, and file/directory synchronization.
