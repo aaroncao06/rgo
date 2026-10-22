@@ -1,6 +1,5 @@
 //! Shared-filesystem server requests; artifact bytes stay outside the connection.
 
-use rgo_artifacts::ModelVersion;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -20,18 +19,19 @@ pub enum Request {
         protocol_version: u32,
         client_id: String,
     },
-    LatestModel {},
-    AcceptChunk {
+    GetLatestModel {},
+    SubmitChunk {
         path: PathBuf,
     },
-    AnnounceModel {
-        version: ModelVersion,
+    SubmitCheckpoint {
+        path: PathBuf,
     },
+    GetLatestCheckpoint {},
     // The trainer chooses the exact index; a request does not imply consumption.
-    Shard {
+    GetTrainingShard {
         index: u64,
     },
-    Stats {},
+    GetReplayStats {},
 }
 
 // server > client
@@ -44,11 +44,12 @@ pub enum Response {
     Model {
         path: Option<PathBuf>,
     },
-    ChunkAccepted {
-        records: usize,
-        already_accepted: bool,
+    ChunkAccepted {},
+    CheckpointAccepted {},
+    Checkpoint {
+        path: Option<PathBuf>,
     },
-    Shard {
+    TrainingShard {
         path: PathBuf,
     },
     Stats {
@@ -66,22 +67,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn indexed_shard_messages_round_trip() {
-        let request = Request::Shard { index: 8 };
+    fn checkpoint_messages_round_trip() {
+        let request = Request::SubmitCheckpoint {
+            path: "/trainer/7.pt".into(),
+        };
         let json = serde_json::to_string(&request).unwrap();
-        assert_eq!(json, r#"{"type":"shard","index":8}"#);
         assert!(matches!(
             serde_json::from_str::<Request>(&json).unwrap(),
-            Request::Shard { index: 8 }
+            Request::SubmitCheckpoint { path } if path == PathBuf::from("/trainer/7.pt")
+        ));
+        let json = serde_json::to_string(&Request::GetLatestCheckpoint {}).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Request>(&json).unwrap(),
+            Request::GetLatestCheckpoint {}
+        ));
+        let json = serde_json::to_string(&Response::CheckpointAccepted {}).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Response>(&json).unwrap(),
+            Response::CheckpointAccepted {}
+        ));
+        for path in [None, Some(PathBuf::from("/checkpoints/7.pt"))] {
+            let json = serde_json::to_string(&Response::Checkpoint { path: path.clone() }).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Response>(&json).unwrap(),
+                Response::Checkpoint { path: decoded } if decoded == path
+            ));
+        }
+    }
+
+    #[test]
+    fn indexed_shard_messages_round_trip() {
+        let request = Request::GetTrainingShard { index: 8 };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(json, r#"{"type":"get_training_shard","index":8}"#);
+        assert!(matches!(
+            serde_json::from_str::<Request>(&json).unwrap(),
+            Request::GetTrainingShard { index: 8 }
         ));
 
-        let response = Response::Shard {
+        let response = Response::TrainingShard {
             path: PathBuf::from("/shards/8.npz"),
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(matches!(
             serde_json::from_str::<Response>(&json).unwrap(),
-            Response::Shard { path }
+            Response::TrainingShard { path }
                 if path == PathBuf::from("/shards/8.npz")
         ));
     }

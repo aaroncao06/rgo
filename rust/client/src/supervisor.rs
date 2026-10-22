@@ -23,18 +23,11 @@ use tokio::{
 /// Submit one completed local chunk and wait for the server's acceptance receipt.
 async fn submit_chunk(connection: &mut Connection<'_>, path: &std::path::Path) -> io::Result<()> {
     match connection
-        .request(&Request::AcceptChunk { path: path.into() })
+        .request(&Request::SubmitChunk { path: path.into() })
         .await?
     {
-        Response::ChunkAccepted {
-            records,
-            already_accepted,
-        } => {
-            eprintln!(
-                "rgo-client: accepted {}: {records} records{}",
-                path.display(),
-                if already_accepted { " (retry)" } else { "" }
-            );
+        Response::ChunkAccepted {} => {
+            eprintln!("rgo-client: accepted {}", path.display());
             Ok(())
         }
         Response::Error { message } => Err(io::Error::other(message)),
@@ -68,7 +61,7 @@ async fn run_supervision_loop(
                 event => return Err(io::Error::other(format!("unexpected worker event: {event:?}"))),
             },
             _ = poll.tick(), if ready && !*finishing.borrow() => {
-                let path = match connection.request(&Request::LatestModel {}).await? {
+                let path = match connection.request(&Request::GetLatestModel {}).await? {
                     Response::Model { path } => path,
                     Response::Error { message } => return Err(io::Error::other(message)),
                     _ => return Err(io::Error::other("invalid model response")),

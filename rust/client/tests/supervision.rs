@@ -64,7 +64,7 @@ impl Server {
                         } => Response::Welcome {
                             protocol_version: PROTOCOL_VERSION,
                         },
-                        Request::LatestModel {} => {
+                        Request::GetLatestModel {} => {
                             model_polls += 1;
                             let version = if lose_first_receipt {
                                 if lose_receipt { 42 } else { 43 }
@@ -82,7 +82,7 @@ impl Server {
                                 path: Some(root.join(directory).join(format!("{version}.onnx"))),
                             }
                         }
-                        Request::AcceptChunk { path } => {
+                        Request::SubmitChunk { path } => {
                             request_log.lock().unwrap().push(path.clone());
                             sleep(delay).await;
                             let name = path.file_name().unwrap().to_str().unwrap().to_owned();
@@ -97,10 +97,7 @@ impl Server {
                                 lose_receipt = false;
                                 break;
                             }
-                            Response::ChunkAccepted {
-                                records: 1,
-                                already_accepted,
-                            }
+                            Response::ChunkAccepted {}
                         }
                         other => panic!("unexpected request: {other:?}"),
                     };
@@ -479,7 +476,7 @@ exit 2
     wait_for(&mut client, || {
         fs::read_to_string(root.join("client.log"))
             .unwrap_or_default()
-            .contains("(retry)")
+            .contains("rgo-client: accepted")
     })
     .await;
     let expected_path = root.join("models-after-reconnect/43.onnx");

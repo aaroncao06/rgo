@@ -91,7 +91,7 @@ async fn connection(
             Request::Hello { .. } => Response::Error {
                 message: "hello may only be sent once".into(),
             },
-            Request::LatestModel {} => Response::Model {
+            Request::GetLatestModel {} => Response::Model {
                 path: (*models.borrow()).map(|version| model_path(&model_dir, version)),
             },
             message => forward_to_storage(&jobs, message).await?,
@@ -107,7 +107,7 @@ fn storage_worker(
     mut incoming: mpsc::Receiver<StorageJob>,
     ready: oneshot::Sender<(watch::Receiver<Option<u64>>, PathBuf)>,
 ) -> Result<(), Error> {
-    let mut state = StorageState::open(&config.data_dir, config.replay)?;
+    let mut state = StorageState::open(&config.data_dir, config.replay, config.checkpoints)?;
     ready
         .send((
             state.subscribe_latest_model_version(),
@@ -223,13 +223,13 @@ mod tests {
         let (jobs, incoming) = mpsc::channel(2);
         let (reply, response) = oneshot::channel();
         jobs.try_send(StorageJob {
-            request: Request::Shard { index: 0 },
+            request: Request::GetTrainingShard { index: 0 },
             reply,
         })
         .unwrap();
         let (reply, pending_response) = oneshot::channel();
         jobs.try_send(StorageJob {
-            request: Request::Stats {},
+            request: Request::GetReplayStats {},
             reply,
         })
         .unwrap();
@@ -256,7 +256,7 @@ mod tests {
         // A greeting and subsequent model polls must not need queue capacity.
         let (reply, _response) = oneshot::channel();
         jobs.send(StorageJob {
-            request: Request::Stats {},
+            request: Request::GetReplayStats {},
             reply,
         })
         .await
@@ -286,7 +286,7 @@ mod tests {
 
         for version in [None, Some(42)] {
             published.send_replace(version);
-            rgo_protocol::write(client.get_mut(), &Request::LatestModel {})
+            rgo_protocol::write(client.get_mut(), &Request::GetLatestModel {})
                 .await
                 .unwrap();
             let response = tokio::time::timeout(
@@ -304,7 +304,7 @@ mod tests {
         assert_eq!(incoming.len(), 1);
         assert!(matches!(
             incoming.recv().await.unwrap().request,
-            Request::Stats {}
+            Request::GetReplayStats {}
         ));
         drop(client);
         session.await.unwrap().unwrap();

@@ -2,7 +2,8 @@
 
 use crate::{
     Error,
-    replay::{IngestOutcome, ReplayConfig, ReplayError, ReplayStore, storage::sync_directory},
+    checkpoints::{CheckpointConfig, CheckpointStore},
+    replay::{ReplayConfig, ReplayError, ReplayStore, storage::sync_directory},
 };
 use rand::{SeedableRng, rngs::SmallRng};
 use rgo_artifacts::{
@@ -18,10 +19,11 @@ use tokio::sync::watch;
 /// Replay and artifact state owned by the server's storage thread.
 pub struct StorageState {
     replay: ReplayStore,
+    checkpoints: CheckpointStore,
     models: PathBuf,
     shards: PathBuf,
     // Shared model-version snapshot for connection tasks. Recovered from final
-    // filenames on startup and updated by producer notifications afterward.
+    // filenames on startup; future server-side export will update it directly.
     latest_model_version: watch::Sender<Option<ModelVersion>>,
     rng: SmallRng,
     // Failures in artifact operations outside ReplayStore also stop the server.
@@ -29,16 +31,22 @@ pub struct StorageState {
 }
 
 impl StorageState {
-    pub fn open(data_dir: &Path, replay_config: ReplayConfig) -> Result<Self, Error> {
+    pub fn open(
+        data_dir: &Path,
+        replay_config: ReplayConfig,
+        checkpoint_config: CheckpointConfig,
+    ) -> Result<Self, Error> {
         let root = rgo_fs::prepare_directory_with_sync(data_dir, sync_directory)?;
-        for name in ["replay", "models", "shards"] {
+        for name in ["replay", "models", "shards", "checkpoints"] {
             rgo_fs::prepare_directory_with_sync(&root.join(name), sync_directory)?;
         }
         let replay = ReplayStore::open(&root.join("replay"), replay_config)?;
+        let checkpoints = CheckpointStore::open(root.join("checkpoints"), checkpoint_config)?;
         let models = root.join("models");
         let latest_model_version = scan_latest_model(&models)?;
         Ok(Self {
             replay,
+            checkpoints,
             models,
             latest_model_version: watch::Sender::new(latest_model_version),
             shards: root.join("shards"),
@@ -50,7 +58,7 @@ impl StorageState {
 
     /// Stop the storage worker after a replay or artifact storage failure.
     pub fn failed(&self) -> bool {
-        self.failed || self.replay.failed()
+        self.failed || self.replay.failed() || self.checkpoints.failed()
     }
 
     pub fn subscribe_latest_model_version(&self) -> watch::Receiver<Option<ModelVersion>> {
@@ -62,21 +70,14 @@ impl StorageState {
     }
 
     pub fn handle(&mut self, request: Request) -> Result<Response, Error> {
-        if self.failed {
+        if self.failed() {
             return Err("storage operation failed; restart the server before retrying".into());
         }
         match request {
-            Request::Hello { .. } | Request::LatestModel {} => {
+            Request::Hello { .. } | Request::GetLatestModel {} => {
                 Err("request must be handled by the connection task".into())
             }
-            Request::AnnounceModel { version } => {
-                self.announce_model(version)?;
-                Ok(Response::Model {
-                    path: (*self.latest_model_version.borrow())
-                        .map(|version| model_path(&self.models, version)),
-                })
-            }
-            Request::AcceptChunk { path } => {
+            Request::SubmitChunk { path } => {
                 if !path.is_absolute() {
                     return Err("chunk path must be absolute".into());
                 }
@@ -84,17 +85,17 @@ impl StorageState {
                     .file_name()
                     .and_then(chunk_id_from_filename)
                     .ok_or("invalid canonical chunk filename")?;
-                let outcome = self.replay.ingest_file(id, &path)?;
-                let (records, already_accepted) = match outcome {
-                    IngestOutcome::Added { records } => (records, false),
-                    IngestOutcome::AlreadyAccepted { records } => (records, true),
-                };
-                Ok(Response::ChunkAccepted {
-                    records,
-                    already_accepted,
-                })
+                self.replay.ingest_file(id, &path)?;
+                Ok(Response::ChunkAccepted {})
             }
-            Request::Shard { index } => {
+            Request::SubmitCheckpoint { path } => {
+                self.checkpoints.accept(&path)?;
+                Ok(Response::CheckpointAccepted {})
+            }
+            Request::GetLatestCheckpoint {} => Ok(Response::Checkpoint {
+                path: self.checkpoints.latest()?,
+            }),
+            Request::GetTrainingShard { index } => {
                 let path = self.shards.join(format!("{index}.npz"));
                 // Any storage error below is fatal. Clear only after success
                 // or the normal no-data result.
@@ -118,9 +119,9 @@ impl StorageState {
                     Err(error) => return Err(error.into()),
                 }
                 self.failed = false;
-                Ok(Response::Shard { path })
+                Ok(Response::TrainingShard { path })
             }
-            Request::Stats {} => {
+            Request::GetReplayStats {} => {
                 let stats = self.replay.stats()?;
                 Ok(Response::Stats {
                     retained_records: stats.retained_records,
@@ -129,21 +130,6 @@ impl StorageState {
                 })
             }
         }
-    }
-
-    fn announce_model(&mut self, version: u64) -> Result<(), Error> {
-        if self
-            .latest_model_version
-            .borrow()
-            .is_some_and(|current| version <= current)
-        {
-            return Ok(());
-        }
-        // The producer syncs the model, renames it to its final filename, and
-        // syncs the directory before notifying us. No separate marker is needed.
-        require_regular_model_file(&model_path(&self.models, version))?;
-        self.latest_model_version.send_replace(Some(version));
-        Ok(())
     }
 }
 
@@ -201,24 +187,76 @@ mod tests {
     }
 
     fn shard_path(state: &mut StorageState, index: u64) -> PathBuf {
-        match state.handle(Request::Shard { index }).unwrap() {
-            Response::Shard { path } => path,
+        match state.handle(Request::GetTrainingShard { index }).unwrap() {
+            Response::TrainingShard { path } => path,
             response => panic!("unexpected response: {response:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_sync_failures_require_restart_and_recover() {
+        use crate::replay::tests::faults::{self, Operation};
+        for source_cleanup in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = fs::canonicalize(temp.path()).unwrap().join("server");
+            let mut state =
+                StorageState::open(&root, replay_config(), CheckpointConfig::default()).unwrap();
+            let source = root.parent().unwrap().join("0.pt");
+            fs::write(&source, b"checkpoint").unwrap();
+            let directory = if source_cleanup {
+                source.parent().unwrap().to_owned()
+            } else {
+                root.join("checkpoints")
+            };
+            let fault = faults::inject([(Operation::Sync, directory)]);
+            assert!(
+                state
+                    .handle(Request::SubmitCheckpoint {
+                        path: source.clone()
+                    })
+                    .is_err()
+            );
+            assert!(state.failed());
+            assert!(!state.replay.failed());
+            assert!(root.join("checkpoints/0.pt").exists());
+            assert_eq!(source.exists(), !source_cleanup);
+            drop(fault);
+            assert!(state.handle(Request::GetLatestCheckpoint {}).is_err());
+            assert!(state.handle(Request::GetReplayStats {}).is_err());
+            drop(state);
+
+            let mut state =
+                StorageState::open(&root, replay_config(), CheckpointConfig::default()).unwrap();
+            assert!(matches!(
+                state
+                    .handle(Request::SubmitCheckpoint { path: source })
+                    .unwrap(),
+                Response::CheckpointAccepted {}
+            ));
+            assert!(matches!(
+                state.handle(Request::GetLatestCheckpoint {}).unwrap(),
+                Response::Checkpoint { path: Some(path) } if path == root.join("checkpoints/0.pt")
+            ));
+            assert!(!state.failed());
         }
     }
 
     #[test]
     fn empty_shard_request_leaves_storage_usable() {
         let temp = tempfile::tempdir().unwrap();
-        let mut state = StorageState::open(temp.path(), replay_config()).unwrap();
-        let error = state.handle(Request::Shard { index: 0 }).unwrap_err();
+        let mut state =
+            StorageState::open(temp.path(), replay_config(), CheckpointConfig::default()).unwrap();
+        let error = state
+            .handle(Request::GetTrainingShard { index: 0 })
+            .unwrap_err();
         assert!(matches!(
             error.downcast_ref::<ReplayError>(),
             Some(ReplayError::EmptyReplay)
         ));
         assert!(!state.failed());
         assert!(matches!(
-            state.handle(Request::Stats {}).unwrap(),
+            state.handle(Request::GetReplayStats {}).unwrap(),
             Response::Stats {
                 retained_records: 0,
                 ..
@@ -229,15 +267,18 @@ mod tests {
     #[test]
     fn missing_shard_directory_requires_restart_before_sampling() {
         let temp = tempfile::tempdir().unwrap();
-        let mut state = StorageState::open(temp.path(), replay_config()).unwrap();
+        let mut state =
+            StorageState::open(temp.path(), replay_config(), CheckpointConfig::default()).unwrap();
         fs::remove_dir(&state.shards).unwrap();
-        let error = state.handle(Request::Shard { index: 0 }).unwrap_err();
+        let error = state
+            .handle(Request::GetTrainingShard { index: 0 })
+            .unwrap_err();
         assert!(matches!(
             error.downcast_ref::<ReplayError>(),
             Some(ReplayError::Io(error)) if error.kind() == io::ErrorKind::NotFound
         ));
         assert!(state.failed());
-        assert!(state.handle(Request::Stats {}).is_err());
+        assert!(state.handle(Request::GetReplayStats {}).is_err());
     }
 
     #[test]
@@ -246,7 +287,7 @@ mod tests {
         let root = temp.path().join("server");
         let mut config = replay_config();
         config.window_records = 1;
-        let mut state = StorageState::open(&root, config).unwrap();
+        let mut state = StorageState::open(&root, config, CheckpointConfig::default()).unwrap();
         add_test_chunk(&mut state, temp.path(), 1, 1);
 
         let path = shard_path(&mut state, 0);
@@ -267,7 +308,7 @@ mod tests {
         assert_eq!(state.replay.stats().unwrap().retained_chunks, 1);
         drop(state);
 
-        let mut state = StorageState::open(&root, config).unwrap();
+        let mut state = StorageState::open(&root, config, CheckpointConfig::default()).unwrap();
         assert_eq!(fs::read(&path).unwrap(), bytes);
         // A checkpoint through shard 0 must replay later, uncheckpointed shards.
         assert_eq!(shard_path(&mut state, 1), next_path);
@@ -286,42 +327,48 @@ mod tests {
         for existing in [false, true] {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("server");
-            let mut state = StorageState::open(&root, replay_config()).unwrap();
+            let mut state =
+                StorageState::open(&root, replay_config(), CheckpointConfig::default()).unwrap();
             add_test_chunk(&mut state, temp.path(), 1, 1);
             let path = state.shards.join("0.npz");
             if existing {
                 assert_eq!(shard_path(&mut state, 0), path);
             }
             let fault = faults::inject([(Operation::Sync, state.shards.clone())]);
-            assert!(state.handle(Request::Shard { index: 0 }).is_err());
+            assert!(
+                state
+                    .handle(Request::GetTrainingShard { index: 0 })
+                    .is_err()
+            );
             assert!(state.failed());
             let bytes = fs::read(&path).unwrap();
             drop(fault);
-            assert!(state.handle(Request::Shard { index: 0 }).is_err());
+            assert!(
+                state
+                    .handle(Request::GetTrainingShard { index: 0 })
+                    .is_err()
+            );
             drop(state);
 
-            let mut state = StorageState::open(&root, replay_config()).unwrap();
+            let mut state =
+                StorageState::open(&root, replay_config(), CheckpointConfig::default()).unwrap();
             assert_eq!(shard_path(&mut state, 0), path);
             assert_eq!(fs::read(&path).unwrap(), bytes);
         }
     }
 
     #[test]
-    fn startup_recovers_final_models_and_notifications_never_regress() {
+    fn startup_recovers_highest_final_model() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("server");
-        let mut state = StorageState::open(&root, replay_config()).unwrap();
+        let state =
+            StorageState::open(&root, replay_config(), CheckpointConfig::default()).unwrap();
         let models = state.subscribe_latest_model_version();
-        assert!(state.announce_model(1).is_err());
-        assert!(!state.failed());
+        assert_eq!(*models.borrow(), None);
         fs::write(model_path(&state.models, 1), b"model").unwrap();
         fs::write(state.models.join("10.onnx.tmp"), b"unfinished").unwrap();
-        state.announce_model(1).unwrap();
-        state.announce_model(1).unwrap();
-        state.announce_model(0).unwrap();
-        assert_eq!(*models.borrow(), Some(1));
-        // A completed export survives a lost notification. Compare numerically,
-        // and ignore temporary, unrelated, and noncanonical filenames.
+        // Compare numerically, and ignore temporary, unrelated, and
+        // noncanonical filenames.
         for name in [
             "9.onnx",
             "10.onnx",
@@ -332,44 +379,45 @@ mod tests {
             fs::write(state.models.join(name), b"model").unwrap();
         }
         drop(state);
-        let mut state = StorageState::open(&root, replay_config()).unwrap();
-        assert_eq!(*state.latest_model_version.borrow(), Some(10));
-        state.announce_model(9).unwrap();
+        let state =
+            StorageState::open(&root, replay_config(), CheckpointConfig::default()).unwrap();
         assert_eq!(*state.latest_model_version.borrow(), Some(10));
         assert!(!state.models.join("latest.json").exists());
     }
 
     #[test]
-    fn invalid_final_models_fail_without_updating_the_cached_version() {
+    fn invalid_highest_final_model_fails_startup() {
         let temp = tempfile::tempdir().unwrap();
-        let mut state = StorageState::open(temp.path(), replay_config()).unwrap();
-        let models = state.subscribe_latest_model_version();
+        let state =
+            StorageState::open(temp.path(), replay_config(), CheckpointConfig::default()).unwrap();
         fs::create_dir(model_path(&state.models, 1)).unwrap();
-        assert!(state.announce_model(1).is_err());
-        assert_eq!(*models.borrow(), None);
-        assert!(!state.failed());
         drop(state);
-        assert!(StorageState::open(temp.path(), replay_config()).is_err());
+        assert!(
+            StorageState::open(temp.path(), replay_config(), CheckpointConfig::default()).is_err()
+        );
         // An invalid older entry does not prevent using a newer final model.
         fs::write(model_path(&temp.path().join("models"), 2), b"model").unwrap();
-        let state = StorageState::open(temp.path(), replay_config()).unwrap();
+        let state =
+            StorageState::open(temp.path(), replay_config(), CheckpointConfig::default()).unwrap();
         assert_eq!(*state.latest_model_version.borrow(), Some(2));
     }
 
     #[cfg(unix)]
     #[test]
-    fn model_symlinks_are_rejected_on_notification_and_restart() {
+    fn model_symlinks_are_rejected_on_restart() {
         let temp = tempfile::tempdir().unwrap();
-        let mut state = StorageState::open(temp.path(), replay_config()).unwrap();
+        let state =
+            StorageState::open(temp.path(), replay_config(), CheckpointConfig::default()).unwrap();
         let target = temp.path().join("target");
         fs::write(&target, b"model").unwrap();
         std::os::unix::fs::symlink(target, model_path(&state.models, 1)).unwrap();
-        assert!(state.announce_model(1).is_err());
-        assert_eq!(*state.latest_model_version.borrow(), None);
         drop(state);
-        assert!(StorageState::open(temp.path(), replay_config()).is_err());
+        assert!(
+            StorageState::open(temp.path(), replay_config(), CheckpointConfig::default()).is_err()
+        );
         fs::write(model_path(&temp.path().join("models"), 2), b"model").unwrap();
-        let state = StorageState::open(temp.path(), replay_config()).unwrap();
+        let state =
+            StorageState::open(temp.path(), replay_config(), CheckpointConfig::default()).unwrap();
         assert_eq!(*state.latest_model_version.borrow(), Some(2));
     }
 
@@ -387,18 +435,18 @@ mod tests {
             fs::create_dir(&target).unwrap();
             symlink(target, root.join(name)).unwrap();
         }
-        let mut state = StorageState::open(&alias, replay_config()).unwrap();
+        let state =
+            StorageState::open(&alias, replay_config(), CheckpointConfig::default()).unwrap();
         // Different directory names must still share the replay lock.
-        assert!(StorageState::open(&root, replay_config()).is_err());
+        assert!(StorageState::open(&root, replay_config(), CheckpointConfig::default()).is_err());
         assert_eq!(
             fs::canonicalize(state.model_directory()).unwrap(),
             fs::canonicalize(temp.path().join("models-target")).unwrap()
         );
         fs::write(model_path(&state.models, 1), b"model").unwrap();
-        state.announce_model(1).unwrap();
-        assert_eq!(*state.latest_model_version.borrow(), Some(1));
         drop(state);
-        let state = StorageState::open(&alias, replay_config()).unwrap();
+        let state =
+            StorageState::open(&alias, replay_config(), CheckpointConfig::default()).unwrap();
         assert_eq!(*state.latest_model_version.borrow(), Some(1));
     }
 
@@ -416,7 +464,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let ancestor = fs::canonicalize(temp.path()).unwrap().join("execute-only");
         let root = ancestor.join("server");
-        drop(StorageState::open(&root, replay_config()).unwrap());
+        drop(StorageState::open(&root, replay_config(), CheckpointConfig::default()).unwrap());
         let _restore = Restore(
             ancestor.clone(),
             fs::metadata(&ancestor).unwrap().permissions(),
@@ -424,6 +472,6 @@ mod tests {
         fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o111)).unwrap();
         // Detect an unnecessary sync even if the test has elevated privileges.
         let _fault = faults::inject([(Operation::Sync, ancestor)]);
-        StorageState::open(&root, replay_config()).unwrap();
+        StorageState::open(&root, replay_config(), CheckpointConfig::default()).unwrap();
     }
 }

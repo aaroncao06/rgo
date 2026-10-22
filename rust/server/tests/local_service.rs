@@ -83,6 +83,79 @@ async fn connect(address: SocketAddr) -> BufReader<TcpStream> {
 }
 
 #[tokio::test]
+async fn checkpoint_handoff_retries_and_recovers_after_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("server");
+    let config = temp.path().join("server.toml");
+    fs::write(&config, format!("listen = '127.0.0.1:0'\ndata_dir = {root:?}\n[checkpoints]\nprune_old_checkpoints = false\n[replay]\ncapacity_records = 100\nwindow_records = 100\nsample_group_records = 20\nsample_groups_per_shard = 4\nshard_records = 10\n")).unwrap();
+    let (mut server, address) = start(&config).await;
+    let mut stream = connect(address).await;
+    assert!(matches!(
+        request(&mut stream, Request::GetLatestCheckpoint {}).await,
+        Response::Checkpoint { path: None }
+    ));
+    let directory = fs::canonicalize(root.join("checkpoints")).unwrap();
+    for index in [-1, 0] {
+        let source = temp.path().join(format!("{index}.pt"));
+        // Validation rejection must leave the connection and server usable.
+        fs::write(&source, b"").unwrap();
+        assert!(matches!(
+            request(
+                &mut stream,
+                Request::SubmitCheckpoint {
+                    path: source.clone()
+                }
+            )
+            .await,
+            Response::Error { .. }
+        ));
+        fs::write(&source, b"checkpoint").unwrap();
+        for _ in 0..2 {
+            // The repeat models a lost acceptance reply: the source is gone.
+            assert!(matches!(
+                request(
+                    &mut stream,
+                    Request::SubmitCheckpoint {
+                        path: source.clone()
+                    }
+                )
+                .await,
+                Response::CheckpointAccepted {}
+            ));
+            assert!(!source.exists());
+        }
+        assert!(matches!(
+            request(&mut stream, Request::GetLatestCheckpoint {}).await,
+            Response::Checkpoint { path: Some(path) } if path == directory.join(format!("{index}.pt"))
+        ));
+    }
+    assert!(directory.join("-1.pt").exists());
+    drop(stream);
+    stop(&mut server).await;
+
+    let (mut server, address) = start(&config).await;
+    let mut stream = connect(address).await;
+    assert!(matches!(
+        request(&mut stream, Request::GetLatestCheckpoint {}).await,
+        Response::Checkpoint { path: Some(path) } if path == directory.join("0.pt")
+    ));
+    assert!(directory.join("-1.pt").exists());
+    assert_eq!(fs::read(directory.join("0.pt")).unwrap(), b"checkpoint");
+    assert!(matches!(
+        request(
+            &mut stream,
+            Request::SubmitCheckpoint {
+                path: temp.path().join("0.pt")
+            }
+        )
+        .await,
+        Response::CheckpointAccepted {}
+    ));
+    drop(stream);
+    stop(&mut server).await;
+}
+
+#[tokio::test]
 async fn local_acceptance_sampling_model_publication_and_restart() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("nested/server");
@@ -119,11 +192,10 @@ async fn local_acceptance_sampling_model_publication_and_restart() {
     }
     let mut stream = connect(address).await;
     for request_type in [
-        Request::AcceptChunk {
+        Request::SubmitChunk {
             path: "../bad.rgo".into(),
         },
-        Request::Shard { index: 0 },
-        Request::AnnounceModel { version: 1 },
+        Request::GetTrainingShard { index: 0 },
     ] {
         assert!(matches!(
             request(&mut stream, request_type).await,
@@ -145,31 +217,25 @@ async fn local_acceptance_sampling_model_publication_and_restart() {
     assert!(matches!(
         request(
             &mut stream,
-            Request::AcceptChunk {
+            Request::SubmitChunk {
                 path: source.clone()
             }
         )
         .await,
-        Response::ChunkAccepted {
-            records: 3,
-            already_accepted: false
-        }
+        Response::ChunkAccepted {}
     ));
     assert!(!source.exists());
     assert!(matches!(
-        request(&mut stream, Request::AcceptChunk { path: source }).await,
-        Response::ChunkAccepted {
-            records: 3,
-            already_accepted: true
-        }
+        request(&mut stream, Request::SubmitChunk { path: source }).await,
+        Response::ChunkAccepted {}
     ));
     assert_eq!(
         fs::read(chunk_path(&root.join("replay/chunks"), 42)).unwrap(),
         bytes
     );
-    let Response::Shard {
+    let Response::TrainingShard {
         path: training_path,
-    } = request(&mut stream, Request::Shard { index: 0 }).await
+    } = request(&mut stream, Request::GetTrainingShard { index: 0 }).await
     else {
         panic!("missing indexed training shard")
     };
@@ -186,14 +252,10 @@ async fn local_acceptance_sampling_model_publication_and_restart() {
     fs::write(root.join("models/1.onnx"), b"model").unwrap();
     fs::write(root.join("models/2.onnx.tmp"), b"next model").unwrap();
     let model_dir = fs::canonicalize(root.join("models")).unwrap();
-    assert!(matches!(
-        request(&mut stream, Request::AnnounceModel { version: 1 }).await,
-        Response::Model { path: Some(path) } if path == model_dir.join("1.onnx")
-    ));
     drop(stream);
     stop(&mut server).await;
     // Simulate a producer finishing publication while the server is down.
-    // Restart must discover the final model without a notification or marker.
+    // Restart must discover the final model without a separate marker.
     fs::File::open(root.join("models/2.onnx.tmp"))
         .unwrap()
         .sync_all()
@@ -203,11 +265,11 @@ async fn local_acceptance_sampling_model_publication_and_restart() {
     let (mut server, address) = start(&config).await;
     let mut stream = connect(address).await;
     assert!(matches!(
-        request(&mut stream, Request::LatestModel {}).await,
+        request(&mut stream, Request::GetLatestModel {}).await,
         Response::Model { path: Some(path) } if path == model_dir.join("2.onnx")
     ));
     assert!(matches!(
-        request(&mut stream, Request::Stats {}).await,
+        request(&mut stream, Request::GetReplayStats {}).await,
         Response::Stats {
             retained_records: 3,
             retained_chunks: 1,
@@ -217,10 +279,10 @@ async fn local_acceptance_sampling_model_publication_and_restart() {
     assert!(matches!(
         request(
             &mut stream,
-            Request::Shard { index: 0 }
+            Request::GetTrainingShard { index: 0 }
         )
         .await,
-        Response::Shard { path } if path == training_path
+        Response::TrainingShard { path } if path == training_path
     ));
     assert_eq!(fs::read(&training_path).unwrap(), training_bytes);
     drop(stream);

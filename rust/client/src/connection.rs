@@ -282,7 +282,7 @@ mod tests {
                 .unwrap();
                 assert!(matches!(
                     rgo_protocol::read::<Request>(&mut stream).await.unwrap(),
-                    Some(Request::LatestModel {})
+                    Some(Request::GetLatestModel {})
                 ));
                 if attempt == 0 {
                     stream.get_mut().write_all(b"{\"type\":").await.unwrap();
@@ -304,7 +304,7 @@ mod tests {
             }
         });
         let mut connection = Connection::open(&config).await.unwrap();
-        let response = connection.request(&Request::LatestModel {}).await;
+        let response = connection.request(&Request::GetLatestModel {}).await;
         let Response::Model { path: Some(path) } = response.unwrap() else {
             panic!("missing model path")
         };
@@ -345,12 +345,12 @@ mod tests {
                 .unwrap();
                 assert!(matches!(
                     rgo_protocol::read::<Request>(&mut stream).await.unwrap(),
-                    Some(Request::Shard { index: 0 })
+                    Some(Request::GetTrainingShard { index: 0 })
                 ));
                 if attempt == 1 {
                     rgo_protocol::write(
                         stream.get_mut(),
-                        &Response::Shard {
+                        &Response::TrainingShard {
                             path: shard.clone(),
                         },
                     )
@@ -362,10 +362,10 @@ mod tests {
         let mut connection = Connection::open(&config).await.unwrap();
         assert!(matches!(
             connection
-                .request(&Request::Shard { index: 0 })
+                .request(&Request::GetTrainingShard { index: 0 })
                 .await
                 .unwrap(),
-            Response::Shard { path } if path == expected
+            Response::TrainingShard { path } if path == expected
         ));
         server.await.unwrap();
     }
@@ -405,7 +405,7 @@ mod tests {
             .unwrap();
             assert!(matches!(
                 rgo_protocol::read::<Request>(&mut stream).await.unwrap(),
-                Some(Request::Stats {})
+                Some(Request::GetReplayStats {})
             ));
             rgo_protocol::write(
                 stream.get_mut(),
@@ -417,7 +417,7 @@ mod tests {
             .unwrap();
             assert!(matches!(
                 rgo_protocol::read::<Request>(&mut stream).await.unwrap(),
-                Some(Request::AcceptChunk { .. })
+                Some(Request::SubmitChunk { .. })
             ));
             rgo_protocol::write(
                 stream.get_mut(),
@@ -429,7 +429,7 @@ mod tests {
             .unwrap();
             assert!(matches!(
                 rgo_protocol::read::<Request>(&mut stream).await.unwrap(),
-                Some(Request::LatestModel {})
+                Some(Request::GetLatestModel {})
             ));
             rgo_protocol::write(
                 stream.get_mut(),
@@ -442,15 +442,15 @@ mod tests {
         });
         let mut connection = Connection::open(&config).await.unwrap();
         assert!(
-            matches!(connection.request(&Request::Stats {}).await.unwrap(),
+            matches!(connection.request(&Request::GetReplayStats {}).await.unwrap(),
             Response::Error { message } if message == "stats rejected")
         );
         assert!(
-            matches!(connection.request(&Request::AcceptChunk { path }).await.unwrap(),
+            matches!(connection.request(&Request::SubmitChunk { path }).await.unwrap(),
             Response::Error { message } if message == "chunk rejected")
         );
         assert!(matches!(
-            connection.request(&Request::LatestModel {}).await.unwrap(),
+            connection.request(&Request::GetLatestModel {}).await.unwrap(),
             Response::Model { path: Some(path) } if path.file_name().unwrap() == "42.onnx"
         ));
         server.await.unwrap();

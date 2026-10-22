@@ -25,7 +25,8 @@ filesystem with server replay storage. After the worker's `ready` event, it
 immediately polls for the latest published model path and repeats that same request
 at the configured interval. Each model notification supplies its complete file
 path; the worker derives its version from the canonical `<version>.onnx` basename.
-The greeting confirms the protocol version.
+The greeting confirms the protocol version. Model polls use `GetLatestModel`;
+completed chunks use `SubmitChunk`.
 Completed chunk paths are submitted for acceptance one at a time. The server validates new IDs,
 durably registers their hard links, and removes the producer filenames. The client
 does not delete accepted files.
@@ -63,17 +64,20 @@ This command connects without starting self-play and prints a JSON response:
 rust/target/release/rgo-client configs/client.toml stats
 ```
 
-The server discovers canonical published models on startup. Until the trainer
-publishes and announces models through the protocol, a newly placed model
-requires a server restart to become available to clients. Restart the client
+It sends `GetReplayStats` to the server.
+
+The server discovers canonical published models on startup. Until server-side
+checkpoint export is implemented, a newly placed model requires a server
+restart to become available to clients. Restart the client
 afterward for prompt adoption; an already running client waits until its next
 model poll. The self-play worker
 validates the [model contract](../../README.md#model-contract) when loading it.
 
-Indexed training-shard requests are defined by the shared protocol, but trainer
+Indexed `GetTrainingShard` requests are defined by the shared protocol, but trainer
 coordination is not wired into this CLI yet. The server returns a stable shard
 path for a given request index and retains it for recovery. Checkpoint
-acceptance and automatic shard cleanup are not implemented yet.
+acceptance is implemented on the server; client trainer integration and automatic
+shard cleanup remain deferred.
 
 ## Shutdown and recovery
 
@@ -94,7 +98,7 @@ Completed chunks remaining in the output directory are retried before launching 
 durable server receipts make retries safe even after replay eviction.
 Connection failures and timeouts discard the socket, wait 1, 2, 4, 8, 16,
 then 30 seconds between attempts, and reconnect with a new Hello. Model polls,
-chunk acceptance, model announcements, shard requests, and stats requests can
+chunk acceptance, checkpoint acceptance, shard requests, and stats requests can
 be repeated safely. A model poll after reconnection
 returns the server's current file path. Healthy workers stay alive during retries, with bounded
 queues applying backpressure while acceptance is unavailable. Signals and worker

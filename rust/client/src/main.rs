@@ -20,7 +20,7 @@ async fn main() {
     let command = args.next().unwrap_or_else(|| "selfplay".into());
     let request = match command.to_str() {
         Some("selfplay") => None,
-        Some("stats") => Some(Request::Stats {}),
+        Some("stats") => Some(Request::GetReplayStats {}),
         _ => {
             eprintln!("{USAGE}");
             std::process::exit(2);

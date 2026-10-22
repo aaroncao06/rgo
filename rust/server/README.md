@@ -1,6 +1,7 @@
 # Local server
 
-`rgo-server` owns replay storage, NPZ sampling, and explicit model announcements.
+`rgo-server` owns replay storage, recovery checkpoints, NPZ sampling, and
+published-model discovery.
 It accepts bounded JSON control requests over loopback TCP; artifact bytes stay
 in shared files. It performs no neural compute. Remote transfers, trainer
 coordination, and workload scheduling are not implemented yet.
@@ -28,30 +29,43 @@ open at once. Sampling holds this thread for the whole shard, so intake and
 eviction happen between requests. Greetings and model-version polls are answered
 directly by connection tasks and do not enter this queue. Model polls use the
 shared published version and the model directory prepared at startup.
-Producers notify the server only after durable model publication completes.
 
 Under `data_dir` (default example: `data/`), the server owns `replay/`, `models/`,
-and `shards/`. A successful hello confirms the protocol version. Models use
+`shards/`, and `checkpoints/`. A successful hello confirms the protocol version. Models use
 `<version>.onnx`. The producer writes and syncs a temporary model, atomically
-renames it to its final filename, and syncs the models directory before sending
-`AnnounceModel`. This notification checks that the file is regular and updates
-the server's cached version; duplicate or older notifications are no-ops.
+renames it to its final filename, and syncs the models directory.
 Startup recovers the highest numeric version from canonical final filenames,
-including completed exports whose notification was lost. Temporary files and
+including completed exports interrupted before an in-memory update. Temporary files and
 other filenames are ignored. Only the highest selected model is checked for
 being a regular file; invalid older entries do not prevent startup. No separate
 publication marker is stored.
-The trainer/exporter is not implemented yet; producers must follow this
+Server-side checkpoint export is not implemented yet; model producers must follow this
 publication contract and keep final models immutable. The self-play worker
 validates their ONNX contract when loading; the server does not load models.
 
 The [shared protocol](../protocol/src/client_server.rs) defines requests for chunk
-acceptance, model announcements, indexed shard sampling, and replay statistics. Client IDs
+acceptance, checkpoint handoff and lookup, model lookup, indexed shard
+sampling, and replay statistics. Client IDs
 contain 1–64 ASCII letters, digits, `-`, or `_`. Chunk acceptance
 requests carry absolute producer paths with canonical chunk filenames.
-Producer output and replay must share a filesystem for hard links. These are
+Producer output and its destination store must share a filesystem for hard links. These are
 trusted local processes; loopback access does not
 provide authentication or isolation between users on the same machine.
+
+Read requests are `GetLatestModel`, `GetLatestCheckpoint`, `GetTrainingShard`,
+and `GetReplayStats`. Local chunk handoff uses `SubmitChunk`; the training-shard
+response is `TrainingShard { path }`.
+
+`SubmitCheckpoint { path }` transfers an immutable local checkpoint into
+`checkpoints/<index>.pt` by hard-linking it and removing the producer filename
+before acknowledging acceptance. Index `-1` is the initial checkpoint.
+One trainer submits immutable checkpoint indices in increasing order; repeating
+an accepted index acknowledges the retry even if the producer filename is gone.
+`GetLatestCheckpoint` returns the highest accepted index's absolute path, or
+`null` when none exists. Checkpoints share the replay storage thread and failure
+policy. Under `[checkpoints]`, `prune_old_checkpoints` defaults to `true`;
+set it to `false` to retain history. Acceptance does not yet export ONNX models
+or delete covered training shards.
 
 SIGINT/SIGTERM disconnects clients, completes queued storage operations, and
 releases the replay lock. Their replies may be lost, but completed changes
