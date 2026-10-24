@@ -14,8 +14,9 @@ try:
 except ModuleNotFoundError:  # Python 3.9–3.10
     import tomli as tomllib
 
+from model.dummy_model import DummyModel
+
 from .coordinator import TrainingCoordinator
-from .dummy_model import DummyModel
 from .runner import run
 
 

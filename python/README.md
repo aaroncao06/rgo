@@ -1,5 +1,8 @@
 # Python trainer components
 
+Shared model definitions live in `model/`, training code in `trainer/`, and
+Python helpers invoked by the Rust server in `server/`.
+
 Use [uv](https://docs.astral.sh/uv/) from the repository root. `pyproject.toml`
 declares Python 3.9–3.12 and pins NumPy 1.26.4 with PyTorch 2.2.2; `uv.lock`
 records their resolved dependencies. The default local Python is 3.12.
@@ -38,3 +41,17 @@ specifies a model, device, learning rate, checkpoint directory, and batch sizes.
 currently constructs the temporary `DummyModel` and Adam optimizer; there is
 no importable factory name in the TOML. The real ViT model and Rust client
 launcher are still to be implemented.
+
+`server.export` converts a checkpoint using the same temporary `DummyModel`
+architecture into a float32 ONNX model with dynamic batch and board dimensions
+and the engine's `rgo.io_version = "0"` metadata:
+
+```sh
+PYTHONPATH=python uv run --locked python -m server.export data/checkpoints/-1.pt data/models/0.onnx
+```
+
+The output directory must exist. Export syncs a temporary file, publishes the
+final filename without overwriting an existing model, and syncs its directory
+on POSIX. ONNX Runtime is a development dependency used to test numerical
+agreement with PyTorch. Server-side invocation, publication cadence, and pruning
+are not wired up yet.

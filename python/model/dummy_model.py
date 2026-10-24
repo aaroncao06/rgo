@@ -1,4 +1,4 @@
-"""Temporary network for end-to-end trainer tests, not the production model."""
+"""Shared temporary network for training and export, not the production model."""
 
 import torch
 from torch import nn

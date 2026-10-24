@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from trainer.dummy_model import DummyModel
+from model.dummy_model import DummyModel
 from trainer.dataset import ShardDataset
 from trainer.shards import PackedBoardSamples
 from trainer.train import train_shard

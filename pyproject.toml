@@ -6,7 +6,13 @@ dependencies = [
     "numpy==1.26.4",
     "torch==2.2.2",
     "tomli==2.0.1; python_version < '3.11'",
+    "onnx==1.17.0",
 ]
 
 [tool.uv]
 package = false
+
+[dependency-groups]
+dev = [
+    "onnxruntime==1.19.2",
+]

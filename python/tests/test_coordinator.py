@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import torch
 
-from trainer.dummy_model import DummyModel
+from model.dummy_model import DummyModel
 from trainer.checkpoint import checkpoint_path, save_checkpoint
 from trainer.coordinator import TrainingCoordinator
 
