@@ -2,6 +2,7 @@
 
 mod checkpoints;
 mod config;
+mod model_export;
 mod replay;
 mod service;
 mod transport;

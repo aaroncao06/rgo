@@ -101,10 +101,11 @@ async fn connection(
     Ok(())
 }
 
-/// Own storage for the server run, replying to each queued job before continuing.
+/// Open storage, expose its model snapshot, finish any recovery export, then
+/// serve queued requests on this thread.
 fn storage_worker(
     config: Config,
-    mut incoming: mpsc::Receiver<StorageJob>,
+    incoming: mpsc::Receiver<StorageJob>,
     ready: oneshot::Sender<(watch::Receiver<Option<u64>>, PathBuf)>,
 ) -> Result<(), Error> {
     let mut state = StorageState::open(
@@ -112,6 +113,7 @@ fn storage_worker(
         config.replay,
         config.checkpoints,
         config.prune_old_shards,
+        config.model_export,
     )?;
     ready
         .send((
@@ -119,18 +121,31 @@ fn storage_worker(
             state.model_directory().to_path_buf(),
         ))
         .map_err(|_| "server stopped during startup")?;
+    state.export_model_if_due()?;
+    serve_storage_requests(&mut state, incoming)
+}
+
+/// Dispatch requests and send their results to the waiting connections.
+/// Stop on a fatal storage error; each request finishes before the next starts.
+fn serve_storage_requests(
+    state: &mut StorageState,
+    mut incoming: mpsc::Receiver<StorageJob>,
+) -> Result<(), Error> {
     while let Some(job) = incoming.blocking_recv() {
-        let response = match state.handle(job.request) {
-            Ok(response) => response,
-            Err(error) => Response::Error {
-                message: error.to_string(),
-            },
-        };
         // A disconnected connection may have dropped its receiver.
         // The storage operation still finishes; only its reply is lost.
-        let _ = job.reply.send(response);
-        if state.failed() {
-            return Err("storage mutation failed; restart the server before retrying".into());
+        match state.handle(job.request) {
+            Ok(response) => {
+                let _ = job.reply.send(response);
+            }
+            Err(error) => {
+                let _ = job.reply.send(Response::Error {
+                    message: error.to_string(),
+                });
+                if state.failed() {
+                    return Err(error);
+                }
+            }
         }
     }
     Ok(())
@@ -142,7 +157,7 @@ pub async fn run(config: Config) -> Result<(), Error> {
     let address = listener.local_addr()?;
     let (jobs, incoming) = mpsc::channel::<StorageJob>(16);
     let (ready, startup) = oneshot::channel();
-    let (finished, mut done) = oneshot::channel();
+    let (finished, done) = oneshot::channel();
     thread::Builder::new()
         .name("server-storage".into())
         .spawn(move || {
@@ -155,11 +170,9 @@ pub async fn run(config: Config) -> Result<(), Error> {
     let model_dir = Arc::new(model_dir);
     println!("{{\"type\":\"ready\",\"address\":\"{address}\"}}");
     let mut sessions = JoinSet::new();
-    let mut worker_result = None;
     let result: Result<(), Error> = loop {
         tokio::select! {
-            result = &mut done => {
-                worker_result = Some(result.map_err(Into::into).and_then(|result| result));
+            _ = jobs.closed() => {
                 break Ok(());
             }
             signal = signals.recv() => { break signal.map_err(Into::into); }
@@ -192,10 +205,7 @@ pub async fn run(config: Config) -> Result<(), Error> {
     drop(listener);
     sessions.shutdown().await;
     drop(jobs);
-    let storage = match worker_result {
-        Some(result) => result,
-        None => done.await?,
-    };
+    let storage = done.await?;
     result.and(storage)
 }
 
@@ -205,19 +215,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn shard_sync_failure_stops_storage_worker_before_the_next_job() {
+    fn shard_sync_failure_preserves_error_and_stops_before_the_next_job() {
         use crate::replay::tests::faults::{self, Operation};
         let temp = tempfile::tempdir().unwrap();
         let root = rgo_fs::prepare_directory(&temp.path().join("server")).unwrap();
         let shards = root.join("shards");
         std::fs::create_dir(&shards).unwrap();
         std::fs::write(shards.join("0.npz"), b"published shard").unwrap();
-        let config = Config {
-            listen: "127.0.0.1:0".parse().unwrap(),
-            data_dir: root,
-            prune_old_shards: true,
-            checkpoints: Default::default(),
-            replay: crate::replay::ReplayConfig {
+        let mut state = StorageState::open(
+            &root,
+            crate::replay::ReplayConfig {
                 capacity_records: 100,
                 window_records: 100,
                 prune_old_chunks: true,
@@ -225,7 +232,11 @@ mod tests {
                 sample_groups_per_shard: 4,
                 records_per_shard: 10,
             },
-        };
+            Default::default(),
+            true,
+            crate::model_export::ModelExportConfig { every_shards: 10 },
+        )
+        .unwrap();
         let (jobs, incoming) = mpsc::channel(2);
         let (reply, response) = oneshot::channel();
         jobs.try_send(StorageJob {
@@ -240,12 +251,13 @@ mod tests {
         })
         .unwrap();
         drop(jobs);
-        let (ready, _startup) = oneshot::channel();
         let _fault = faults::inject([(Operation::Sync, shards)]);
-        assert!(storage_worker(config, incoming, ready).is_err());
+        let error = serve_storage_requests(&mut state, incoming).unwrap_err();
+        assert!(error.downcast_ref::<io::Error>().is_some());
+        assert_eq!(error.to_string(), "injected filesystem failure");
         assert!(matches!(
             response.blocking_recv().unwrap(),
-            Response::Error { .. }
+            Response::Error { message } if message == error.to_string()
         ));
         assert!(pending_response.blocking_recv().is_err());
     }

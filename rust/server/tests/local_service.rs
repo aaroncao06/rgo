@@ -9,7 +9,13 @@ use rgo_protocol::{
     client_server::{Request, Response},
 };
 use sha2::{Digest, Sha256};
-use std::{fs, net::SocketAddr, path::Path, process::Stdio, time::Duration};
+use std::{
+    fs,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     net::TcpStream,
@@ -20,6 +26,8 @@ use tokio::{
 async fn start(config: &Path) -> (Child, SocketAddr) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rgo-server"))
         .arg(config)
+        .process_group(0)
+        .current_dir(config.parent().unwrap())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
@@ -82,12 +90,402 @@ async fn connect(address: SocketAddr) -> BufReader<TcpStream> {
     stream
 }
 
+fn write_test_python(directory: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let helper = directory.join(".venv/bin/python");
+    fs::create_dir_all(helper.parent().unwrap()).unwrap();
+    fs::write(
+        &helper,
+        r#"#!/bin/sh
+set -eu
+base=$(cd "$(dirname "$0")/../.." && pwd)
+basename "$4" >> "$base/exports"
+if [ -f "$base/pause" ]; then
+    touch "$base/started"
+    attempts=0
+    while [ ! -f "$base/release" ]; do
+        attempts=$((attempts + 1))
+        [ "$attempts" -lt 1000 ] || exit 9
+        sleep 0.01
+    done
+fi
+cp "$3" "$4"
+if [ -f "$base/fail" ]; then exit 7; fi
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn export_test_config(directory: &Path) -> PathBuf {
+    write_test_python(directory);
+    let config = directory.join("server.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"listen = '127.0.0.1:0'
+data_dir = {:?}
+[model_export]
+every_shards = 2
+[replay]
+capacity_records = 100
+window_records = 100
+sample_group_records = 20
+sample_groups_per_shard = 4
+records_per_shard = 10
+"#,
+            directory.join("server")
+        ),
+    )
+    .unwrap();
+    config
+}
+
+async fn send_checkpoint(
+    stream: &mut BufReader<TcpStream>,
+    directory: &Path,
+    index: i64,
+) -> PathBuf {
+    let source = directory.join(format!("{index}.pt"));
+    fs::write(&source, format!("checkpoint {index}")).unwrap();
+    rgo_protocol::write(
+        stream.get_mut(),
+        &Request::SubmitCheckpoint {
+            path: source.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    source
+}
+
+async fn submit_checkpoint(stream: &mut BufReader<TcpStream>, directory: &Path, index: i64) {
+    let source = send_checkpoint(stream, directory, index).await;
+    assert!(matches!(
+        timeout(
+            Duration::from_secs(10),
+            rgo_protocol::read::<Response>(stream)
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        Some(Response::CheckpointAccepted {})
+    ));
+    assert!(!source.exists());
+}
+
+async fn wait_for_path(path: &Path) {
+    timeout(Duration::from_secs(5), async {
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+async fn wait_for_model(stream: &mut BufReader<TcpStream>, expected: &Path) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let Response::Model { path } = request(stream, Request::GetLatestModel {}).await else {
+                panic!("invalid model response")
+            };
+            if path.as_deref() == Some(expected) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn checkpoint_acceptance_exports_in_order_and_recovers_the_cadence() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let config = export_test_config(&base);
+    let (mut server, address) = start(&config).await;
+    let mut stream = connect(address).await;
+    submit_checkpoint(&mut stream, &base, -1).await;
+    let models = base.join("server/models");
+    assert!(models.join("0.onnx").exists()); // Export finishes before acceptance replies.
+    for index in [0, 1, 3] {
+        submit_checkpoint(&mut stream, &base, index).await;
+    }
+    let checkpoints = base.join("server/checkpoints");
+    wait_for_model(&mut stream, &models.join("4.onnx")).await;
+    assert_eq!(fs::read(models.join("0.onnx")).unwrap(), b"checkpoint -1");
+    assert_eq!(fs::read(models.join("4.onnx")).unwrap(), b"checkpoint 3");
+    for index in [-1, 0, 1] {
+        assert!(!checkpoints.join(format!("{index}.pt")).exists());
+    }
+    assert!(checkpoints.join("3.pt").exists());
+    submit_checkpoint(&mut stream, &base, 4).await;
+    // Acceptance prunes immediately even though this checkpoint is below the
+    // next export threshold.
+    assert!(!checkpoints.join("3.pt").exists());
+    assert!(checkpoints.join("4.pt").exists());
+    drop(stream);
+    stop(&mut server).await;
+    assert_eq!(
+        fs::read_to_string(base.join("exports")).unwrap(),
+        "0.onnx\n2.onnx\n4.onnx\n"
+    );
+
+    let (mut server, address) = start(&config).await;
+    let mut stream = connect(address).await;
+    wait_for_model(&mut stream, &models.join("4.onnx")).await;
+    assert!(!checkpoints.join("3.pt").exists());
+    assert!(checkpoints.join("4.pt").exists());
+    submit_checkpoint(&mut stream, &base, 5).await;
+    wait_for_model(&mut stream, &models.join("6.onnx")).await;
+    assert!(!checkpoints.join("3.pt").exists());
+    assert!(!checkpoints.join("4.pt").exists());
+    assert!(checkpoints.join("5.pt").exists());
+    // An old lost-ack retry must not schedule another export.
+    assert!(matches!(
+        request(
+            &mut stream,
+            Request::SubmitCheckpoint {
+                path: base.join("3.pt")
+            }
+        )
+        .await,
+        Response::CheckpointAccepted {}
+    ));
+    drop(stream);
+    stop(&mut server).await;
+    assert_eq!(
+        fs::read_to_string(base.join("exports")).unwrap(),
+        "0.onnx\n2.onnx\n4.onnx\n6.onnx\n"
+    );
+}
+
+#[tokio::test]
+async fn disabling_checkpoint_pruning_keeps_history_after_exports_and_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let config = export_test_config(&base);
+    let contents = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        format!("{contents}\n[checkpoints]\nprune_old_checkpoints = false\n"),
+    )
+    .unwrap();
+    let (mut server, address) = start(&config).await;
+    let mut stream = connect(address).await;
+    submit_checkpoint(&mut stream, &base, -1).await;
+    wait_for_model(&mut stream, &base.join("server/models/0.onnx")).await;
+    submit_checkpoint(&mut stream, &base, 1).await;
+    wait_for_model(&mut stream, &base.join("server/models/2.onnx")).await;
+    assert!(base.join("server/checkpoints/-1.pt").exists());
+    drop(stream);
+    stop(&mut server).await;
+
+    let (mut server, address) = start(&config).await;
+    let mut stream = connect(address).await;
+    wait_for_model(&mut stream, &base.join("server/models/2.onnx")).await;
+    assert!(base.join("server/checkpoints/-1.pt").exists());
+    assert!(base.join("server/checkpoints/1.pt").exists());
+    drop(stream);
+    stop(&mut server).await;
+}
+
+#[tokio::test]
+async fn checkpoint_cleanup_failure_stops_the_server_and_restart_finishes_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let config = export_test_config(&base);
+    let (mut server, address) = start(&config).await;
+    let mut stream = connect(address).await;
+    submit_checkpoint(&mut stream, &base, -1).await;
+    wait_for_model(&mut stream, &base.join("server/models/0.onnx")).await;
+    // An invalid older entry makes pruning fail during checkpoint acceptance.
+    let invalid = base.join("server/checkpoints/0.pt");
+    fs::create_dir(&invalid).unwrap();
+    let source = base.join("1.pt");
+    fs::write(&source, b"checkpoint 1").unwrap();
+    rgo_protocol::write(
+        stream.get_mut(),
+        &Request::SubmitCheckpoint { path: source },
+    )
+    .await
+    .unwrap();
+    assert!(
+        !timeout(Duration::from_secs(5), server.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert!(!base.join("server/models/2.onnx").exists());
+    assert!(base.join("server/checkpoints/1.pt").exists());
+    drop(stream);
+
+    fs::remove_dir(invalid).unwrap();
+    let (mut server, address) = start(&config).await;
+    let mut stream = connect(address).await;
+    wait_for_model(&mut stream, &base.join("server/models/2.onnx")).await;
+    assert!(!base.join("server/checkpoints/-1.pt").exists());
+    assert!(base.join("server/checkpoints/1.pt").exists());
+    drop(stream);
+    stop(&mut server).await;
+    assert_eq!(
+        fs::read_to_string(base.join("exports")).unwrap(),
+        "0.onnx\n2.onnx\n"
+    );
+}
+
+#[tokio::test]
+async fn export_failure_stops_the_server_and_restart_recovers_publication() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let config = export_test_config(&base);
+    fs::write(base.join("pause"), b"").unwrap();
+    fs::write(base.join("fail"), b"").unwrap();
+    let (mut server, address) = start(&config).await;
+    let mut stream = connect(address).await;
+    send_checkpoint(&mut stream, &base, -1).await;
+    wait_for_path(&base.join("started")).await;
+    let mut observer = connect(address).await;
+    assert!(matches!(
+        request(&mut observer, Request::GetLatestModel {}).await,
+        Response::Model { path: None }
+    ));
+    // Model the helper exiting after final publication but before success.
+    fs::write(base.join("release"), b"").unwrap();
+    assert!(
+        !timeout(Duration::from_secs(5), server.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    drop(stream);
+    drop(observer);
+    fs::remove_file(base.join("fail")).unwrap();
+    let models = base.join("server/models");
+    let (mut server, address) = start(&config).await;
+    let mut stream = connect(address).await;
+    wait_for_model(&mut stream, &models.join("0.onnx")).await;
+    drop(stream);
+    stop(&mut server).await;
+    assert_eq!(
+        fs::read_to_string(base.join("exports")).unwrap(),
+        "0.onnx\n"
+    );
+
+    // Model interruption before final publication. Reuse the accepted weights
+    // and export again without another trainer submission.
+    fs::remove_file(models.join("0.onnx")).unwrap();
+    let (mut server, address) = start(&config).await;
+    let mut stream = connect(address).await;
+    wait_for_model(&mut stream, &models.join("0.onnx")).await;
+    assert_eq!(fs::read(models.join("0.onnx")).unwrap(), b"checkpoint -1");
+    drop(stream);
+    stop(&mut server).await;
+}
+
+#[tokio::test]
+async fn shutdown_keeps_the_storage_lock_until_export_finishes() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let config = export_test_config(&base);
+    fs::write(base.join("pause"), b"").unwrap();
+    let (mut server, address) = start(&config).await;
+    let mut stream = connect(address).await;
+    send_checkpoint(&mut stream, &base, -1).await;
+    wait_for_path(&base.join("started")).await;
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-INT", &format!("-{}", server.id().unwrap())])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        timeout(
+            Duration::from_secs(5),
+            rgo_protocol::read::<Response>(&mut stream)
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .is_none()
+    );
+    let mut second = Command::new(env!("CARGO_BIN_EXE_rgo-server"))
+        .arg(&config)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    assert!(
+        !timeout(Duration::from_secs(5), second.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert!(server.try_wait().unwrap().is_none());
+    fs::write(base.join("release"), b"").unwrap();
+    assert!(
+        timeout(Duration::from_secs(5), server.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+}
+
+#[tokio::test]
+async fn model_polls_respond_while_export_holds_the_storage_queue() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let config = export_test_config(&base);
+    fs::write(base.join("pause"), b"").unwrap();
+    let (mut server, address) = start(&config).await;
+    let mut submitter = connect(address).await;
+    send_checkpoint(&mut submitter, &base, -1).await;
+    wait_for_path(&base.join("started")).await;
+    let mut observer = connect(address).await;
+    assert!(matches!(
+        request(&mut observer, Request::GetLatestModel {}).await,
+        Response::Model { path: None }
+    ));
+    let mut stats_connection = connect(address).await;
+    let stats =
+        tokio::spawn(
+            async move { request(&mut stats_connection, Request::GetReplayStats {}).await },
+        );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(!stats.is_finished());
+    fs::write(base.join("release"), b"").unwrap();
+    assert!(matches!(
+        timeout(
+            Duration::from_secs(5),
+            rgo_protocol::read::<Response>(&mut submitter)
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        Some(Response::CheckpointAccepted {})
+    ));
+    assert!(matches!(stats.await.unwrap(), Response::Stats { .. }));
+    wait_for_model(&mut observer, &base.join("server/models/0.onnx")).await;
+    drop(submitter);
+    drop(observer);
+    stop(&mut server).await;
+}
+
 #[tokio::test]
 async fn checkpoint_handoff_retries_and_recovers_after_restart() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("server");
     let config = temp.path().join("server.toml");
-    fs::write(&config, format!("listen = '127.0.0.1:0'\ndata_dir = {root:?}\nprune_old_shards = false\n[checkpoints]\nprune_old_checkpoints = false\n[replay]\ncapacity_records = 100\nwindow_records = 100\nsample_group_records = 20\nsample_groups_per_shard = 4\nrecords_per_shard = 10\n")).unwrap();
+    write_test_python(temp.path());
+    fs::write(&config, format!("listen = '127.0.0.1:0'\ndata_dir = {root:?}\nprune_old_shards = false\n[checkpoints]\nprune_old_checkpoints = false\n[replay]\ncapacity_records = 100\nwindow_records = 100\nsample_group_records = 20\nsample_groups_per_shard = 4\nrecords_per_shard = 10\n[model_export]\nevery_shards = 10\n")).unwrap();
     let (mut server, address) = start(&config).await;
     let mut stream = connect(address).await;
     assert!(matches!(
@@ -178,7 +576,7 @@ async fn local_acceptance_sampling_model_publication_and_restart() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("nested/server");
     let config = temp.path().join("server.toml");
-    fs::write(&config, format!("listen = '127.0.0.1:0'\ndata_dir = {:?}\n[replay]\ncapacity_records = 100\nwindow_records = 100\nsample_group_records = 20\nsample_groups_per_shard = 4\nrecords_per_shard = 3\n", root)).unwrap();
+    fs::write(&config, format!("listen = '127.0.0.1:0'\ndata_dir = {:?}\n[replay]\ncapacity_records = 100\nwindow_records = 100\nsample_group_records = 20\nsample_groups_per_shard = 4\nrecords_per_shard = 3\n[model_export]\nevery_shards = 10\n", root)).unwrap();
     let (mut server, address) = start(&config).await;
     for (protocol_version, client_id) in [
         (PROTOCOL_VERSION + 1, "local"),

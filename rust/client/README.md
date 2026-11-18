@@ -66,12 +66,12 @@ rust/target/release/rgo-client configs/client.toml stats
 
 It sends `GetReplayStats` to the server.
 
-The server discovers canonical published models on startup. Until server-side
-checkpoint export is implemented, a newly placed model requires a server
-restart to become available to clients. Restart the client
-afterward for prompt adoption; an already running client waits until its next
-model poll. The self-play worker
-validates the [model contract](../../README.md#model-contract) when loading it.
+The server discovers canonical published models on startup and publishes new
+exports from accepted checkpoints without restarting. Clients adopt them through
+their ordinary model polls.
+Manually placed model files still require a server restart for discovery.
+The self-play worker validates the
+[model contract](../../README.md#model-contract) when loading it.
 
 Indexed `GetTrainingShard` requests are defined by the shared protocol, but trainer
 coordination is not wired into this CLI yet. The server returns a stable shard

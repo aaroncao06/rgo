@@ -1,20 +1,21 @@
 # Local server
 
-`rgo-server` owns replay storage, recovery checkpoints, NPZ sampling, and
-published-model discovery.
-It accepts bounded JSON control requests over loopback TCP; artifact bytes stay
-in shared files. It performs no neural compute. Remote transfers, trainer
-coordination, and workload scheduling are not implemented yet.
+`rgo-server` owns replay storage, recovery checkpoints, NPZ sampling, and model
+publication. It accepts bounded JSON control requests over loopback TCP; artifact
+bytes stay in shared files. A Python helper handles configured ONNX exports.
+Remote transfers, trainer coordination, and workload scheduling are not
+implemented yet.
 Replay accepts the same 9x9, 13x13, and 19x19 boards as self-play and inference.
 
 Run from the repository root after building the workspace:
 
 ```sh
+uv sync --locked
 rust/target/release/rgo-server configs/server.toml
 ```
 
-The configuration requires `listen` (a loopback socket address), `data_dir`, and
-the five replay limits shown in [server.toml](../../configs/server.toml).
+The configuration requires `listen` (a loopback socket address), `data_dir`,
+the replay limits, and `[model_export]` shown in [server.toml](../../configs/server.toml).
 Under `[replay]`, `prune_old_chunks` defaults to `true`. Set it to `false` to
 keep accepted chunk files after they leave the active replay window. Old files
 remain excluded from sampling and do not reenter replay if the window grows.
@@ -32,16 +33,37 @@ shared published version and the model directory prepared at startup.
 
 Under `data_dir` (default example: `data/`), the server owns `replay/`, `models/`,
 `shards/`, and `checkpoints/`. A successful hello confirms the protocol version. Models use
-`<version>.onnx`. The producer writes and syncs a temporary model, atomically
-renames it to its final filename, and syncs the models directory.
+`<version>.onnx`. The Python helper writes and syncs a temporary model,
+atomically publishes its final filename without replacement, and syncs the
+models directory before the server updates its shared model snapshot.
 Startup recovers the highest numeric version from canonical final filenames,
 including completed exports interrupted before an in-memory update. Temporary files and
 other filenames are ignored. Only the highest selected model is checked for
-being a regular file; invalid older entries do not prevent startup. No separate
+being a regular file; startup syncs its directory before serving it. Invalid
+older entries do not prevent startup. No separate
 publication marker is stored.
-Server-side checkpoint export is not implemented yet; model producers must follow this
-publication contract and keep final models immutable. The self-play worker
-validates their ONNX contract when loading; the server does not load models.
+Final models remain immutable. The self-play worker validates their ONNX contract
+when loading; the Rust server does not load ONNX graphs.
+
+The required `[model_export]` section sets a positive `every_shards`; the example
+publishes after 10 additional trained shards. The server runs from the repository
+root and uses its `.venv` interpreter and `python/` source directory. Prepare the
+environment with `uv sync --locked`; interpreter and source paths are fixed
+project conventions. Model version is checkpoint index plus one: `-1.pt` exports to
+`0.onnx`, and checkpoint `9.pt` exports to `10.onnx`. These names let startup
+recover publication progress without a separate counter.
+
+The first available checkpoint is exported immediately if
+there is no published model. Later exports use the newest accepted checkpoint
+once its progress exceeds the published model by at least `every_shards`.
+The storage worker runs the helper synchronously before acknowledging checkpoint
+acceptance or processing another storage request. The checkpoint path stays
+available throughout export.
+Chunk acceptance and sampling wait during export, while greetings and model
+polls remain responsive on the async runtime. Startup checks the latest accepted
+checkpoint for an export interrupted before publication. `CheckpointAccepted`
+confirms durable acceptance and completion of any due export. Clients discover
+published models through their ordinary polls. Old ONNX files are not pruned yet.
 
 The [shared protocol](../protocol/src/client_server.rs) defines requests for chunk
 acceptance, checkpoint handoff and lookup, model lookup, indexed shard
@@ -67,7 +89,10 @@ an accepted index acknowledges the retry even if the producer filename is gone.
 `GetLatestCheckpoint` returns the highest accepted index's absolute path, or
 `null` when none exists. Checkpoints share the replay storage thread and failure
 policy. Under `[checkpoints]`, `prune_old_checkpoints` defaults to `true`;
-set it to `false` to retain history. After durable checkpoint acceptance, the
+set it to `false` to retain all checkpoint history. When enabled, accepting a
+newer checkpoint prunes older checkpoints before acknowledgment, regardless of
+whether an ONNX export is due. Startup finishes interrupted checkpoint cleanup.
+After durable checkpoint acceptance, the
 server deletes shards through that checkpoint's index and syncs the shards
 directory before acknowledging. Top-level `prune_old_shards` defaults to `true`;
 set it to `false` to keep those files for experiments. It is independent of
@@ -76,11 +101,13 @@ Startup also finishes interrupted cleanup. Requests
 for those checkpointed indices are rejected rather than sampled again; newer,
 prefetched shards remain available. Only the latest checkpoint is used for
 automatic recovery; retaining older checkpoints preserves experiment history,
-not their original replay shards unless shard pruning is disabled. Acceptance
-does not yet export ONNX models.
+not their original replay shards unless shard pruning is disabled. Accepted
+checkpoints are checked against the model publication cadence before replying.
 
-SIGINT/SIGTERM disconnects clients, completes queued storage operations, and
-releases the replay lock. Their replies may be lost, but completed changes
+SIGINT/SIGTERM disconnects clients, completes queued storage operations and
+eligible exports, then releases the replay lock. Helper failures stop the
+server; restart recovers any completed final model before trying another export.
+Replies may be lost, but completed changes
 remain on disk. The queue is not persisted or replayed on restart. Stop clients
 first to drain their games normally. A
 failed storage mutation stops the server; restart it before retrying. A lost
@@ -272,7 +299,7 @@ with np.load("shard.npz", allow_pickle=False) as shard:
         print(int(size), policy.shape[0])
 ```
 
-The trainer and its unpacking/minibatch loader are not implemented yet.
+The [Python trainer](../../python/README.md) unpacks these fields into minibatches.
 Canonical self-play and replay storage continue to use `.rgo` files.
 
 Filesystem and SQLite operations are synchronous on the server's storage

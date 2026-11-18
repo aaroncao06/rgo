@@ -8,6 +8,9 @@ prune_old_shards = false
 # Keep every accepted trainer checkpoint for experiment history.
 prune_old_checkpoints = false
 
+[model_export]
+every_shards = 10
+
 [replay]
 capacity_records = 5_000_000
 window_records = 250_000

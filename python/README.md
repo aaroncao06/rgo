@@ -53,5 +53,9 @@ PYTHONPATH=python uv run --locked python -m server.export data/checkpoints/-1.pt
 The output directory must exist. Export syncs a temporary file, publishes the
 final filename without overwriting an existing model, and syncs its directory
 on POSIX. ONNX Runtime is a development dependency used to test numerical
-agreement with PyTorch. Server-side invocation, publication cadence, and pruning
-are not wired up yet.
+agreement with PyTorch. The Rust server invokes this helper synchronously on
+its storage worker after accepting an eligible checkpoint and during recovery.
+Checkpoint acceptance replies after any due export finishes. It uses the project's
+`.venv` interpreter and `python/` source directory from the repository root;
+only publication cadence is configured under `[model_export]`. Old-model pruning
+remains deferred.

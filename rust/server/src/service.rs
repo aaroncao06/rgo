@@ -3,6 +3,7 @@
 use crate::{
     Error,
     checkpoints::{CheckpointConfig, CheckpointStore},
+    model_export::{self, ModelExportConfig},
     replay::{ReplayConfig, ReplayStore, storage::sync_directory},
 };
 use rand::{SeedableRng, rngs::SmallRng};
@@ -21,10 +22,11 @@ pub struct StorageState {
     replay: ReplayStore,
     checkpoints: CheckpointStore,
     models: PathBuf,
+    model_export: ModelExportConfig,
     shards: PathBuf,
     prune_old_shards: bool,
     // Shared model-version snapshot for connection tasks. Recovered from final
-    // filenames on startup; future server-side export will update it directly.
+    // filenames on startup; the storage worker updates it after model export.
     latest_model_version: watch::Sender<Option<ModelVersion>>,
     rng: SmallRng,
     // Failures in artifact operations outside ReplayStore also stop the server.
@@ -37,6 +39,7 @@ impl StorageState {
         replay_config: ReplayConfig,
         checkpoint_config: CheckpointConfig,
         prune_old_shards: bool,
+        model_export: ModelExportConfig,
     ) -> Result<Self, Error> {
         let root = rgo_fs::prepare_directory_with_sync(data_dir, sync_directory)?;
         for name in ["replay", "models", "shards", "checkpoints"] {
@@ -50,6 +53,7 @@ impl StorageState {
             replay,
             checkpoints,
             models,
+            model_export,
             latest_model_version: watch::Sender::new(latest_model_version),
             shards: root.join("shards"),
             prune_old_shards,
@@ -76,6 +80,32 @@ impl StorageState {
         &self.models
     }
 
+    /// Finish due model publication at startup or after checkpoint acceptance.
+    pub fn export_model_if_due(&mut self) -> Result<(), Error> {
+        let Some(index) = self.checkpoints.latest_index()? else {
+            return Ok(());
+        };
+        // -1.pt -> 0.onnx; filenames recover published training progress.
+        let version = u64::try_from(i128::from(index) + 1).expect("accepted checkpoint index");
+        if self.latest_model_version.borrow().is_some_and(|current| {
+            version <= current || version - current < self.model_export.every_shards
+        }) {
+            return Ok(());
+        }
+        let checkpoint = self
+            .checkpoints
+            .latest()?
+            .expect("latest checkpoint exists");
+        self.failed = true;
+        model_export::export_checkpoint(&checkpoint, &model_path(&self.models, version))?;
+        // The helper already synced and published the final filename.
+        self.latest_model_version.send_replace(Some(version));
+        self.failed = false;
+        Ok(())
+    }
+
+    /// Complete a storage request, including cleanup and any due model export,
+    /// before returning its successful response.
     pub fn handle(&mut self, request: Request) -> Result<Response, Error> {
         if self.failed() {
             return Err("storage operation failed; restart the server before retrying".into());
@@ -100,6 +130,7 @@ impl StorageState {
                 if self.prune_old_shards {
                     self.prune_checkpointed_shards()?;
                 }
+                self.export_model_if_due()?;
                 Ok(Response::CheckpointAccepted {})
             }
             Request::GetLatestCheckpoint {} => Ok(Response::Checkpoint {
@@ -186,6 +217,8 @@ fn scan_latest_model(models: &Path) -> io::Result<Option<ModelVersion>> {
     }
     if let Some(version) = latest_model_version {
         require_regular_model_file(&model_path(models, version))?;
+        // Recover publication interrupted before the helper's directory barrier.
+        sync_directory(models)?;
     }
     Ok(latest_model_version)
 }
@@ -206,6 +239,21 @@ mod tests {
     use crate::replay::ReplayError;
     use rgo_artifacts::chunk::{chunk_header, training_record_size};
     use sha2::{Digest, Sha256};
+
+    fn open_storage(
+        data_dir: &Path,
+        replay_config: ReplayConfig,
+        checkpoint_config: CheckpointConfig,
+        prune_old_shards: bool,
+    ) -> Result<StorageState, Error> {
+        StorageState::open(
+            data_dir,
+            replay_config,
+            checkpoint_config,
+            prune_old_shards,
+            ModelExportConfig { every_shards: 10 },
+        )
+    }
 
     fn replay_config() -> ReplayConfig {
         ReplayConfig {
@@ -242,7 +290,10 @@ mod tests {
         for prune_old_checkpoints in [false, true] {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("server");
-            let mut state = StorageState::open(
+            // An existing model keeps these cleanup tests below the export cadence.
+            fs::create_dir_all(root.join("models")).unwrap();
+            fs::write(root.join("models/0.onnx"), b"model").unwrap();
+            let mut state = open_storage(
                 &root,
                 replay_config(),
                 CheckpointConfig {
@@ -337,7 +388,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap().join("server");
         let mut state =
-            StorageState::open(&root, replay_config(), CheckpointConfig::default(), true).unwrap();
+            open_storage(&root, replay_config(), CheckpointConfig::default(), true).unwrap();
         add_test_chunk(&mut state, temp.path(), 1, 1);
         let paths: Vec<_> = (0..3).map(|index| shard_path(&mut state, index)).collect();
         let source = temp.path().join("1.pt");
@@ -347,14 +398,12 @@ mod tests {
         fs::remove_file(&paths[0]).unwrap();
         drop(state);
         let fault = faults::inject([(Operation::Sync, root.join("checkpoints"))]);
-        assert!(
-            StorageState::open(&root, replay_config(), CheckpointConfig::default(), true).is_err()
-        );
+        assert!(open_storage(&root, replay_config(), CheckpointConfig::default(), true).is_err());
         assert!(paths[1].exists());
         assert!(paths[2].exists());
         drop(fault);
         let mut state =
-            StorageState::open(&root, replay_config(), CheckpointConfig::default(), true).unwrap();
+            open_storage(&root, replay_config(), CheckpointConfig::default(), true).unwrap();
         assert!(!paths[0].exists());
         assert!(!paths[1].exists());
         assert_eq!(shard_path(&mut state, 2), paths[2]);
@@ -369,8 +418,11 @@ mod tests {
     fn shard_retention_survives_acceptance_and_restart_until_pruning_is_enabled() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("server");
+        // An existing model keeps these cleanup tests below the export cadence.
+        fs::create_dir_all(root.join("models")).unwrap();
+        fs::write(root.join("models/0.onnx"), b"model").unwrap();
         let mut state =
-            StorageState::open(&root, replay_config(), CheckpointConfig::default(), false).unwrap();
+            open_storage(&root, replay_config(), CheckpointConfig::default(), false).unwrap();
         add_test_chunk(&mut state, temp.path(), 1, 1);
         let covered = shard_path(&mut state, 0);
         let prefetched = shard_path(&mut state, 1);
@@ -390,13 +442,13 @@ mod tests {
         drop(state);
 
         let state =
-            StorageState::open(&root, replay_config(), CheckpointConfig::default(), false).unwrap();
+            open_storage(&root, replay_config(), CheckpointConfig::default(), false).unwrap();
         assert_eq!(fs::read(&covered).unwrap(), bytes);
         assert!(prefetched.exists());
         drop(state);
 
         let mut state =
-            StorageState::open(&root, replay_config(), CheckpointConfig::default(), true).unwrap();
+            open_storage(&root, replay_config(), CheckpointConfig::default(), true).unwrap();
         assert!(!covered.exists());
         assert_eq!(shard_path(&mut state, 1), prefetched);
     }
@@ -408,9 +460,11 @@ mod tests {
         for fail_sync in [false, true] {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("server");
+            // An existing model keeps these cleanup tests below the export cadence.
+            fs::create_dir_all(root.join("models")).unwrap();
+            fs::write(root.join("models/0.onnx"), b"model").unwrap();
             let mut state =
-                StorageState::open(&root, replay_config(), CheckpointConfig::default(), true)
-                    .unwrap();
+                open_storage(&root, replay_config(), CheckpointConfig::default(), true).unwrap();
             let covered = state.shards.join("0.npz");
             if fail_sync {
                 fs::write(&covered, b"shard").unwrap();
@@ -443,8 +497,7 @@ mod tests {
             }
             let fault = faults::inject([]);
             let mut state =
-                StorageState::open(&root, replay_config(), CheckpointConfig::default(), true)
-                    .unwrap();
+                open_storage(&root, replay_config(), CheckpointConfig::default(), true).unwrap();
             assert!(!covered.exists());
             assert!(faults::synced().contains(&state.shards));
             state
@@ -462,9 +515,11 @@ mod tests {
         for source_cleanup in [false, true] {
             let temp = tempfile::tempdir().unwrap();
             let root = fs::canonicalize(temp.path()).unwrap().join("server");
+            // An existing model keeps these cleanup tests below the export cadence.
+            fs::create_dir_all(root.join("models")).unwrap();
+            fs::write(root.join("models/0.onnx"), b"model").unwrap();
             let mut state =
-                StorageState::open(&root, replay_config(), CheckpointConfig::default(), true)
-                    .unwrap();
+                open_storage(&root, replay_config(), CheckpointConfig::default(), true).unwrap();
             let source = root.parent().unwrap().join("0.pt");
             fs::write(&source, b"checkpoint").unwrap();
             let shard = state.shards.join("0.npz");
@@ -493,8 +548,7 @@ mod tests {
             drop(state);
 
             let mut state =
-                StorageState::open(&root, replay_config(), CheckpointConfig::default(), true)
-                    .unwrap();
+                open_storage(&root, replay_config(), CheckpointConfig::default(), true).unwrap();
             assert!(!shard.exists());
             assert!(matches!(
                 state
@@ -518,8 +572,7 @@ mod tests {
             records_per_shard: 3,
             ..replay_config()
         };
-        let mut state =
-            StorageState::open(&root, config, CheckpointConfig::default(), true).unwrap();
+        let mut state = open_storage(&root, config, CheckpointConfig::default(), true).unwrap();
         for id in 0..3 {
             assert!(matches!(
                 state
@@ -543,8 +596,7 @@ mod tests {
             Response::TrainingShard { path: None }
         ));
         drop(state);
-        let mut state =
-            StorageState::open(&root, config, CheckpointConfig::default(), true).unwrap();
+        let mut state = open_storage(&root, config, CheckpointConfig::default(), true).unwrap();
         assert_eq!(shard_path(&mut state, 0), path);
         assert_eq!(fs::read(path).unwrap(), bytes);
         assert!(matches!(
@@ -559,7 +611,7 @@ mod tests {
     #[test]
     fn missing_shard_directory_requires_restart_before_sampling() {
         let temp = tempfile::tempdir().unwrap();
-        let mut state = StorageState::open(
+        let mut state = open_storage(
             temp.path(),
             replay_config(),
             CheckpointConfig::default(),
@@ -585,8 +637,7 @@ mod tests {
         let root = temp.path().join("server");
         let mut config = replay_config();
         config.window_records = 1;
-        let mut state =
-            StorageState::open(&root, config, CheckpointConfig::default(), true).unwrap();
+        let mut state = open_storage(&root, config, CheckpointConfig::default(), true).unwrap();
         add_test_chunk(&mut state, temp.path(), 1, 1);
 
         let path = shard_path(&mut state, 0);
@@ -607,8 +658,7 @@ mod tests {
         assert_eq!(state.replay.stats().unwrap().retained_chunks, 1);
         drop(state);
 
-        let mut state =
-            StorageState::open(&root, config, CheckpointConfig::default(), true).unwrap();
+        let mut state = open_storage(&root, config, CheckpointConfig::default(), true).unwrap();
         assert_eq!(fs::read(&path).unwrap(), bytes);
         // A checkpoint through shard 0 must replay later, uncheckpointed shards.
         assert_eq!(shard_path(&mut state, 1), next_path);
@@ -628,8 +678,7 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("server");
             let mut state =
-                StorageState::open(&root, replay_config(), CheckpointConfig::default(), true)
-                    .unwrap();
+                open_storage(&root, replay_config(), CheckpointConfig::default(), true).unwrap();
             add_test_chunk(&mut state, temp.path(), 1, 1);
             let path = state.shards.join("0.npz");
             if existing {
@@ -652,8 +701,7 @@ mod tests {
             drop(state);
 
             let mut state =
-                StorageState::open(&root, replay_config(), CheckpointConfig::default(), true)
-                    .unwrap();
+                open_storage(&root, replay_config(), CheckpointConfig::default(), true).unwrap();
             assert_eq!(shard_path(&mut state, 0), path);
             assert_eq!(fs::read(&path).unwrap(), bytes);
         }
@@ -664,7 +712,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("server");
         let state =
-            StorageState::open(&root, replay_config(), CheckpointConfig::default(), true).unwrap();
+            open_storage(&root, replay_config(), CheckpointConfig::default(), true).unwrap();
         let models = state.subscribe_latest_model_version();
         assert_eq!(*models.borrow(), None);
         fs::write(model_path(&state.models, 1), b"model").unwrap();
@@ -682,15 +730,35 @@ mod tests {
         }
         drop(state);
         let state =
-            StorageState::open(&root, replay_config(), CheckpointConfig::default(), true).unwrap();
+            open_storage(&root, replay_config(), CheckpointConfig::default(), true).unwrap();
         assert_eq!(*state.latest_model_version.borrow(), Some(10));
         assert!(!state.models.join("latest.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovered_models_finish_the_directory_barrier_before_serving() {
+        use crate::replay::tests::faults::{self, Operation};
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap().join("server");
+        let state =
+            open_storage(&root, replay_config(), CheckpointConfig::default(), true).unwrap();
+        let models = state.models.clone();
+        fs::write(model_path(&models, 1), b"published before interruption").unwrap();
+        drop(state);
+        let fault = faults::inject([(Operation::Sync, models.clone())]);
+        assert!(open_storage(&root, replay_config(), CheckpointConfig::default(), true).is_err());
+        assert!(model_path(&models, 1).exists());
+        drop(fault);
+        let state =
+            open_storage(&root, replay_config(), CheckpointConfig::default(), true).unwrap();
+        assert_eq!(*state.latest_model_version.borrow(), Some(1));
     }
 
     #[test]
     fn invalid_highest_final_model_fails_startup() {
         let temp = tempfile::tempdir().unwrap();
-        let state = StorageState::open(
+        let state = open_storage(
             temp.path(),
             replay_config(),
             CheckpointConfig::default(),
@@ -700,7 +768,7 @@ mod tests {
         fs::create_dir(model_path(&state.models, 1)).unwrap();
         drop(state);
         assert!(
-            StorageState::open(
+            open_storage(
                 temp.path(),
                 replay_config(),
                 CheckpointConfig::default(),
@@ -710,7 +778,7 @@ mod tests {
         );
         // An invalid older entry does not prevent using a newer final model.
         fs::write(model_path(&temp.path().join("models"), 2), b"model").unwrap();
-        let state = StorageState::open(
+        let state = open_storage(
             temp.path(),
             replay_config(),
             CheckpointConfig::default(),
@@ -724,7 +792,7 @@ mod tests {
     #[test]
     fn model_symlinks_are_rejected_on_restart() {
         let temp = tempfile::tempdir().unwrap();
-        let state = StorageState::open(
+        let state = open_storage(
             temp.path(),
             replay_config(),
             CheckpointConfig::default(),
@@ -736,7 +804,7 @@ mod tests {
         std::os::unix::fs::symlink(target, model_path(&state.models, 1)).unwrap();
         drop(state);
         assert!(
-            StorageState::open(
+            open_storage(
                 temp.path(),
                 replay_config(),
                 CheckpointConfig::default(),
@@ -745,7 +813,7 @@ mod tests {
             .is_err()
         );
         fs::write(model_path(&temp.path().join("models"), 2), b"model").unwrap();
-        let state = StorageState::open(
+        let state = open_storage(
             temp.path(),
             replay_config(),
             CheckpointConfig::default(),
@@ -770,11 +838,9 @@ mod tests {
             symlink(target, root.join(name)).unwrap();
         }
         let state =
-            StorageState::open(&alias, replay_config(), CheckpointConfig::default(), true).unwrap();
+            open_storage(&alias, replay_config(), CheckpointConfig::default(), true).unwrap();
         // Different directory names must still share the replay lock.
-        assert!(
-            StorageState::open(&root, replay_config(), CheckpointConfig::default(), true).is_err()
-        );
+        assert!(open_storage(&root, replay_config(), CheckpointConfig::default(), true).is_err());
         assert_eq!(
             fs::canonicalize(state.model_directory()).unwrap(),
             fs::canonicalize(temp.path().join("models-target")).unwrap()
@@ -782,7 +848,7 @@ mod tests {
         fs::write(model_path(&state.models, 1), b"model").unwrap();
         drop(state);
         let state =
-            StorageState::open(&alias, replay_config(), CheckpointConfig::default(), true).unwrap();
+            open_storage(&alias, replay_config(), CheckpointConfig::default(), true).unwrap();
         assert_eq!(*state.latest_model_version.borrow(), Some(1));
     }
 
@@ -800,9 +866,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let ancestor = fs::canonicalize(temp.path()).unwrap().join("execute-only");
         let root = ancestor.join("server");
-        drop(
-            StorageState::open(&root, replay_config(), CheckpointConfig::default(), true).unwrap(),
-        );
+        drop(open_storage(&root, replay_config(), CheckpointConfig::default(), true).unwrap());
         let _restore = Restore(
             ancestor.clone(),
             fs::metadata(&ancestor).unwrap().permissions(),
@@ -810,6 +874,6 @@ mod tests {
         fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o111)).unwrap();
         // Detect an unnecessary sync even if the test has elevated privileges.
         let _fault = faults::inject([(Operation::Sync, ancestor)]);
-        StorageState::open(&root, replay_config(), CheckpointConfig::default(), true).unwrap();
+        open_storage(&root, replay_config(), CheckpointConfig::default(), true).unwrap();
     }
 }
