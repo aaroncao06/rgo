@@ -1,7 +1,7 @@
 use crate::config::Config;
 use rgo_protocol::{
     PROTOCOL_VERSION,
-    client_server::{Request, Response},
+    client_server::{Request, Response, valid_run_name},
 };
 use std::{io, time::Duration};
 use tokio::{
@@ -12,24 +12,27 @@ use tokio::{
 
 pub struct Connection<'a> {
     config: &'a Config,
+    run_name: String,
     stream: Option<BufReader<TcpStream>>,
 }
 
 impl<'a> Connection<'a> {
     pub async fn open(config: &'a Config) -> io::Result<Self> {
-        let mut connection = Self {
+        let (stream, run_name) = retry(
+            config.request_timeout(),
+            config.retry_timeout(),
+            async || Self::connect(config).await,
+        )
+        .await?;
+        Ok(Self {
             config,
-            stream: None,
-        };
-        connection.stream = Some(
-            retry(
-                config.request_timeout(),
-                config.retry_timeout(),
-                async || connection.connect().await,
-            )
-            .await?,
-        );
-        Ok(connection)
+            run_name,
+            stream: Some(stream),
+        })
+    }
+
+    pub fn run_name(&self) -> &str {
+        &self.run_name
     }
 
     pub async fn request(&mut self, message: &Request) -> io::Result<Response> {
@@ -41,28 +44,30 @@ impl<'a> Connection<'a> {
         .await
     }
 
-    async fn connect(&mut self) -> io::Result<BufReader<TcpStream>> {
-        let stream = TcpStream::connect(self.config.server).await?;
+    async fn connect(config: &Config) -> io::Result<(BufReader<TcpStream>, String)> {
+        let stream = TcpStream::connect(config.server).await?;
         stream.set_nodelay(true)?;
         let mut stream = BufReader::new(stream);
         rgo_protocol::write(
             stream.get_mut(),
             &Request::Hello {
                 protocol_version: PROTOCOL_VERSION,
-                client_id: self.config.client_id.clone(),
+                client_id: config.client_id.clone(),
             },
         )
         .await?;
         match read_response(&mut stream).await? {
-            Response::Welcome { protocol_version } if protocol_version == PROTOCOL_VERSION => {}
-            Response::Error { message } => return Err(io::Error::other(message)),
-            response => {
-                return Err(io::Error::other(format!(
-                    "invalid server greeting: {response:?}"
-                )));
+            Response::Welcome {
+                protocol_version,
+                run_name,
+            } if protocol_version == PROTOCOL_VERSION && valid_run_name(&run_name) => {
+                Ok((stream, run_name))
             }
+            Response::Error { message } => Err(io::Error::other(message)),
+            response => Err(io::Error::other(format!(
+                "invalid server greeting: {response:?}"
+            ))),
         }
-        Ok(stream)
     }
 
     async fn exchange(&mut self, message: &Request) -> io::Result<Response> {
@@ -70,7 +75,16 @@ impl<'a> Connection<'a> {
         // timeout, or error drops it, including any partially consumed frame.
         let mut stream = match self.stream.take() {
             Some(stream) => stream,
-            None => self.connect().await?,
+            None => {
+                let (stream, run_name) = Self::connect(self.config).await?;
+                if run_name != self.run_name {
+                    return Err(io::Error::other(format!(
+                        "server switched runs from {:?} to {run_name:?}; restart the client to join",
+                        self.run_name
+                    )));
+                }
+                stream
+            }
         };
         rgo_protocol::write(stream.get_mut(), message).await?;
         let response = read_response(&mut stream).await?;
@@ -276,6 +290,7 @@ mod tests {
                     stream.get_mut(),
                     &Response::Welcome {
                         protocol_version: PROTOCOL_VERSION,
+                        run_name: "test-run".into(),
                     },
                 )
                 .await
@@ -321,6 +336,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initial_greeting_rejects_a_mixed_case_run_name() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = test_config(listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            assert!(matches!(
+                rgo_protocol::read::<Request>(&mut stream).await.unwrap(),
+                Some(Request::Hello { .. })
+            ));
+            rgo_protocol::write(
+                stream.get_mut(),
+                &Response::Welcome {
+                    protocol_version: PROTOCOL_VERSION,
+                    run_name: "Test-Run".into(),
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let error = Connection::open(&config)
+            .await
+            .err()
+            .expect("mixed-case run name was accepted");
+        assert!(error.to_string().contains("invalid server greeting"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn changed_run_on_reconnect_does_not_repeat_pending_submission() {
+        use tokio::{net::TcpListener, time::timeout};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = test_config(listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for run_name in ["test-run", "other-run"] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                assert!(matches!(
+                    rgo_protocol::read::<Request>(&mut stream).await.unwrap(),
+                    Some(Request::Hello { .. })
+                ));
+                rgo_protocol::write(
+                    stream.get_mut(),
+                    &Response::Welcome {
+                        protocol_version: PROTOCOL_VERSION,
+                        run_name: run_name.into(),
+                    },
+                )
+                .await
+                .unwrap();
+                let request = timeout(
+                    Duration::from_secs(3),
+                    rgo_protocol::read::<Request>(&mut stream),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                if run_name == "test-run" {
+                    assert!(matches!(request, Some(Request::SubmitChunk { .. })));
+                } else {
+                    assert!(request.is_none(), "request was resent to a different run");
+                }
+            }
+        });
+        let mut connection = Connection::open(&config).await.unwrap();
+        assert_eq!(connection.run_name(), "test-run");
+        let error = connection
+            .request(&Request::SubmitChunk {
+                path: std::env::temp_dir().join("pending.rgo"),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(
+            error
+                .to_string()
+                .contains("server switched runs from \"test-run\" to \"other-run\"")
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn shard_request_retries_after_a_lost_reply_and_preserves_not_ready_connection() {
         use tokio::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -339,6 +436,7 @@ mod tests {
                     stream.get_mut(),
                     &Response::Welcome {
                         protocol_version: PROTOCOL_VERSION,
+                        run_name: "test-run".into(),
                     },
                 )
                 .await
@@ -388,6 +486,7 @@ mod tests {
         Config {
             server,
             client_id: "test".into(),
+            data_dir: "unused".into(),
             selfplay_config: "unused.toml".into(),
             selfplay_binary: None,
             model_poll_interval_ms: 1,
@@ -413,6 +512,7 @@ mod tests {
                 stream.get_mut(),
                 &Response::Welcome {
                     protocol_version: PROTOCOL_VERSION,
+                    run_name: "test-run".into(),
                 },
             )
             .await

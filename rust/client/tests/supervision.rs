@@ -42,9 +42,7 @@ impl Server {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let root = fs::canonicalize(root).unwrap();
-        for name in ["models", "output", "shards"] {
-            fs::create_dir(root.join(name)).unwrap();
-        }
+        fs::create_dir_all(root.join("test-run/selfplay")).unwrap();
         let accepted = Arc::new(Mutex::new(Vec::new()));
         let log = accepted.clone();
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -63,6 +61,7 @@ impl Server {
                             ..
                         } => Response::Welcome {
                             protocol_version: PROTOCOL_VERSION,
+                            run_name: "test-run".into(),
                         },
                         Request::GetLatestModel {} => {
                             model_polls += 1;
@@ -124,12 +123,16 @@ async fn shutdown_interrupts_pending_recovery_without_starting_a_worker() {
     let temp = tempfile::tempdir().unwrap();
     let server = Server::start_with_delay(temp.path(), Duration::from_secs(2)).await;
     for id in 1..=3 {
-        fs::write(chunk_path(&temp.path().join("output"), id), b"pending").unwrap();
+        fs::write(
+            chunk_path(&temp.path().join("test-run/selfplay"), id),
+            b"pending",
+        )
+        .unwrap();
     }
     let mut client = start_client(
         temp.path(),
         server.address,
-        "touch \"$RGO_TEST_OUTPUT_DIR/worker-started\"; exit 0",
+        "touch \"$output_dir/worker-started\"; exit 0",
     );
     wait_for(&mut client, || !server.requests.lock().unwrap().is_empty()).await;
     signal(&client);
@@ -138,12 +141,17 @@ async fn shutdown_interrupts_pending_recovery_without_starting_a_worker() {
         .expect("shutdown must interrupt recovery rather than await its backlog")
         .unwrap();
     assert!(exit.success());
-    assert!(!temp.path().join("output/worker-started").exists());
+    assert!(
+        !temp
+            .path()
+            .join("test-run/selfplay/worker-started")
+            .exists()
+    );
     assert_eq!(server.requests.lock().unwrap().len(), 1);
     // The in-flight request may eventually succeed server-side. Until then,
     // all producer files remain available for the next client's recovery.
     for id in 1..=3 {
-        assert!(chunk_path(&temp.path().join("output"), id).exists());
+        assert!(chunk_path(&temp.path().join("test-run/selfplay"), id).exists());
     }
 }
 
@@ -165,20 +173,15 @@ fn start_client_with_budget(root: &Path, address: SocketAddr, script: &str, budg
 
 fn client_command(root: &Path, address: SocketAddr, script: &str, budget: u64) -> Command {
     let worker = root.join("worker.sh");
-    fs::write(&worker, format!("#!/bin/sh\n{script}\n")).unwrap();
+    fs::write(&worker, format!("#!/bin/sh\noutput_dir=\"$2\"\n{script}\n")).unwrap();
     fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
     let worker_config = root.join("worker.toml");
-    fs::write(
-        &worker_config,
-        format!("output_dir = {:?}\n", root.join("output")),
-    )
-    .unwrap();
+    fs::write(&worker_config, "").unwrap();
     let config = root.join("client.toml");
-    fs::write(&config, format!("server = '{address}'\nclient_id = 'test'\nselfplay_config = {worker_config:?}\nselfplay_binary = {:?}\nmodel_poll_interval_ms = 10\nrequest_timeout_secs = 2\nretry_timeout_secs = {budget}\n", worker)).unwrap();
+    fs::write(&config, format!("server = '{address}'\nclient_id = 'test'\ndata_dir = {root:?}\nselfplay_config = {worker_config:?}\nselfplay_binary = {:?}\nmodel_poll_interval_ms = 10\nrequest_timeout_secs = 2\nretry_timeout_secs = {budget}\n", worker)).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_rgo-client"));
     command
         .arg(config)
-        .env("RGO_TEST_OUTPUT_DIR", root.join("output"))
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             fs::File::create(root.join("client.log")).unwrap(),
@@ -192,7 +195,7 @@ async fn bare_relative_worker_binary_uses_client_working_directory() {
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
     let server = Server::start(&root).await;
-    let script = "out=\"$RGO_TEST_OUTPUT_DIR\"\necho '{\"type\":\"ready\",\"protocol_version\":1}'\necho started > \"$out/started\"\nwhile IFS= read -r command; do case \"$command\" in *finish*) echo '{\"type\":\"stopped\"}'; exit 0;; esac; done";
+    let script = "out=\"$output_dir\"\necho '{\"type\":\"ready\",\"protocol_version\":1}'\necho started > \"$out/started\"\nwhile IFS= read -r command; do case \"$command\" in *finish*) echo '{\"type\":\"stopped\"}'; exit 0;; esac; done";
     let mut command = client_command(&root, server.address, script, 1);
     let config = root.join("client.toml");
     let original = fs::read_to_string(&config).unwrap();
@@ -202,7 +205,10 @@ async fn bare_relative_worker_binary_uses_client_working_directory() {
     fs::write(config, relative).unwrap();
     command.current_dir(&root).env("PATH", "/usr/bin:/bin");
     let mut client = command.spawn().unwrap();
-    wait_for(&mut client, || root.join("output/started").exists()).await;
+    wait_for(&mut client, || {
+        root.join("test-run/selfplay/started").exists()
+    })
+    .await;
     signal(&client);
     assert!(status(&mut client, &root).await.success());
 }
@@ -216,6 +222,20 @@ async fn wait_for(client: &mut Child, condition: impl Fn() -> bool) {
     })
     .await
     .unwrap();
+}
+
+fn worker_received_model(log_path: &Path, expected_path: &Path) -> bool {
+    use rgo_protocol::selfplay::Command;
+
+    fs::read_to_string(log_path)
+        .unwrap_or_default()
+        .lines()
+        .any(|line| {
+            matches!(
+                serde_json::from_str::<Command>(line),
+                Ok(Command::ModelReady { path }) if path == expected_path
+            )
+        })
 }
 
 fn signal(client: &Child) {
@@ -240,10 +260,14 @@ async fn recovers_pending_chunks_forwards_models_and_accepts_final_chunks_before
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
     let server = Server::start(&root).await;
-    let pending = chunk_path(&root.join("output"), 1);
+    let pending = chunk_path(&root.join("test-run/selfplay"), 1);
     fs::write(&pending, b"pending").unwrap();
-    let live = chunk_path(&root.join("output"), 2);
-    let final_chunk = chunk_path(&root.join("output"), 3);
+    let other_run = root.join("other-run/selfplay");
+    fs::create_dir_all(&other_run).unwrap();
+    let other_pending = chunk_path(&other_run, 1);
+    fs::write(&other_pending, b"other-run pending").unwrap();
+    let live = chunk_path(&root.join("test-run/selfplay"), 2);
+    let final_chunk = chunk_path(&root.join("test-run/selfplay"), 3);
     let live_event = serde_json::to_string(&rgo_protocol::selfplay::Event::ChunkReady {
         path: live.clone(),
         bytes: 4,
@@ -258,7 +282,7 @@ async fn recovers_pending_chunks_forwards_models_and_accepts_final_chunks_before
     .unwrap();
     let script = format!(
         r#"
-out="$RGO_TEST_OUTPUT_DIR"
+out="$output_dir"
 echo '{{"type":"ready","protocol_version":1}}'
 while IFS= read -r command; do
   echo "$command" >> "$out/commands.log"
@@ -282,10 +306,10 @@ exit 2
         final_chunk.file_name().unwrap().to_str().unwrap()
     );
     let mut client = start_client(&root, server.address, &script);
+    let command_log = root.join("test-run/selfplay/commands.log");
+    let expected_path = root.join("models/43.onnx");
     wait_for(&mut client, || {
-        fs::read_to_string(root.join("output/commands.log"))
-            .unwrap_or_default()
-            .contains("43")
+        worker_received_model(&command_log, &expected_path)
             && server.accepted.lock().unwrap().len() == 2
     })
     .await;
@@ -295,12 +319,11 @@ exit 2
         "{}",
         fs::read_to_string(root.join("client.log")).unwrap()
     );
-    let commands: Vec<rgo_protocol::selfplay::Command> =
-        fs::read_to_string(root.join("output/commands.log"))
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
+    let commands: Vec<rgo_protocol::selfplay::Command> = fs::read_to_string(&command_log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
     for version in [42, 43] {
         assert!(commands.iter().any(|command| matches!(
             command,
@@ -321,15 +344,16 @@ exit 2
             .unwrap()
             .to_owned())
     );
+    assert_eq!(fs::read(other_pending).unwrap(), b"other-run pending");
 }
 
 #[tokio::test]
 async fn retry_budget_expiry_reaps_the_worker() {
     let temp = tempfile::tempdir().unwrap();
     let server = Server::start(temp.path()).await;
-    let script = "out=\"$RGO_TEST_OUTPUT_DIR\"\necho $$ > \"$out/pid\"\necho '{\"type\":\"ready\",\"protocol_version\":1}'\nwhile :; do :; done";
+    let script = "out=\"$output_dir\"\necho $$ > \"$out/pid\"\necho '{\"type\":\"ready\",\"protocol_version\":1}'\nwhile :; do :; done";
     let mut client = start_client(temp.path(), server.address, script);
-    let pid_file = temp.path().join("output/pid");
+    let pid_file = temp.path().join("test-run/selfplay/pid");
     wait_for(&mut client, || pid_file.exists()).await;
     server.task.abort();
     assert!(!status(&mut client, temp.path()).await.success());
@@ -365,9 +389,12 @@ async fn successful_child_exit_without_stopped_is_reported_instead_of_hanging() 
 async fn first_signal_after_stopped_remains_graceful() {
     let temp = tempfile::tempdir().unwrap();
     let server = Server::start(temp.path()).await;
-    let script = "out=\"$RGO_TEST_OUTPUT_DIR\"\necho '{\"type\":\"ready\",\"protocol_version\":1}'\necho '{\"type\":\"stopped\"}'\necho started > \"$out/started\"\nwhile :; do :; done";
+    let script = "out=\"$output_dir\"\necho '{\"type\":\"ready\",\"protocol_version\":1}'\necho '{\"type\":\"stopped\"}'\necho started > \"$out/started\"\nwhile :; do :; done";
     let mut client = start_client(temp.path(), server.address, script);
-    wait_for(&mut client, || temp.path().join("output/started").exists()).await;
+    wait_for(&mut client, || {
+        temp.path().join("test-run/selfplay/started").exists()
+    })
+    .await;
     sleep(Duration::from_millis(100)).await;
     signal(&client);
     wait_for(&mut client, || {
@@ -385,13 +412,15 @@ async fn first_signal_after_stopped_remains_graceful() {
 async fn second_shutdown_signal_kills_and_reaps_worker_before_releasing_output_lock() {
     let temp = tempfile::tempdir().unwrap();
     let server = Server::start(temp.path()).await;
-    let script = "out=\"$RGO_TEST_OUTPUT_DIR\"\necho $$ > \"$out/pid\"\necho '{\"type\":\"ready\",\"protocol_version\":1}'\nwhile IFS= read -r command; do case \"$command\" in *finish*) echo received > \"$out/finish-received\"; while :; do :; done;; esac; done";
+    let script = "out=\"$output_dir\"\necho $$ > \"$out/pid\"\necho '{\"type\":\"ready\",\"protocol_version\":1}'\nwhile IFS= read -r command; do case \"$command\" in *finish*) echo received > \"$out/finish-received\"; while :; do :; done;; esac; done";
     let mut client = start_client(temp.path(), server.address, script);
-    let pid_file = temp.path().join("output/pid");
+    let pid_file = temp.path().join("test-run/selfplay/pid");
     wait_for(&mut client, || pid_file.exists()).await;
     signal(&client);
     wait_for(&mut client, || {
-        temp.path().join("output/finish-received").exists()
+        temp.path()
+            .join("test-run/selfplay/finish-received")
+            .exists()
     })
     .await;
     sleep(Duration::from_millis(1200)).await;
@@ -415,7 +444,7 @@ async fn second_shutdown_signal_kills_and_reaps_worker_before_releasing_output_l
     let lock = fs::File::options()
         .read(true)
         .write(true)
-        .open(temp.path().join("output/.client.lock"))
+        .open(temp.path().join("test-run/selfplay/.client.lock"))
         .unwrap();
     lock.try_lock().unwrap();
 }
@@ -424,9 +453,9 @@ async fn second_shutdown_signal_kills_and_reaps_worker_before_releasing_output_l
 async fn refuses_recovery_while_previous_worker_owns_output() {
     let temp = tempfile::tempdir().unwrap();
     let server = Server::start(temp.path()).await;
-    let lock = fs::File::create(temp.path().join("output/.selfplay.lock")).unwrap();
+    let lock = fs::File::create(temp.path().join("test-run/selfplay/.selfplay.lock")).unwrap();
     lock.try_lock().unwrap();
-    let pending: PathBuf = chunk_path(&temp.path().join("output"), 1);
+    let pending: PathBuf = chunk_path(&temp.path().join("test-run/selfplay"), 1);
     fs::write(&pending, b"pending").unwrap();
     let mut client = start_client(temp.path(), server.address, "exit 9");
     assert!(!status(&mut client, temp.path()).await.success());
@@ -444,7 +473,7 @@ async fn lost_chunk_receipt_reconnects_without_restarting_the_worker() {
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
     let server = Server::start_with_options(&root, Duration::ZERO, true).await;
-    let chunk = chunk_path(&root.join("output"), 1);
+    let chunk = chunk_path(&root.join("test-run/selfplay"), 1);
     let event = serde_json::to_string(&rgo_protocol::selfplay::Event::ChunkReady {
         path: chunk.clone(),
         bytes: 4,
@@ -453,7 +482,7 @@ async fn lost_chunk_receipt_reconnects_without_restarting_the_worker() {
     .unwrap();
     let script = format!(
         r#"
-out="$RGO_TEST_OUTPUT_DIR"
+out="$output_dir"
 echo $$ >> "$out/pids"
 echo '{{"type":"ready","protocol_version":1}}'
 while IFS= read -r command; do
@@ -479,13 +508,10 @@ exit 2
             .contains("rgo-client: accepted")
     })
     .await;
+    let command_log = root.join("test-run/selfplay/commands.log");
     let expected_path = root.join("models-after-reconnect/43.onnx");
     wait_for(&mut client, || {
-        fs::read_to_string(root.join("output/commands.log"))
-        .unwrap_or_default().lines().any(|line| matches!(
-            serde_json::from_str::<rgo_protocol::selfplay::Command>(line),
-            Ok(rgo_protocol::selfplay::Command::ModelReady { path }) if path == expected_path
-        ))
+        worker_received_model(&command_log, &expected_path)
     })
     .await;
     assert_eq!(
@@ -495,7 +521,7 @@ exit 2
     assert_eq!(server.accepted.lock().unwrap().len(), 1);
     assert!(!chunk.exists());
     assert_eq!(
-        fs::read_to_string(root.join("output/pids"))
+        fs::read_to_string(root.join("test-run/selfplay/pids"))
             .unwrap()
             .lines()
             .count(),
@@ -510,10 +536,13 @@ exit 2
 async fn worker_failure_interrupts_connection_retries() {
     let temp = tempfile::tempdir().unwrap();
     let server = Server::start(temp.path()).await;
-    let script = "out=\"$RGO_TEST_OUTPUT_DIR\"\necho started > \"$out/started\"\necho '{\"type\":\"ready\",\"protocol_version\":1}'\nwhile [ ! -e \"$out/fail\" ]; do :; done\nexit 9";
+    let script = "out=\"$output_dir\"\necho started > \"$out/started\"\necho '{\"type\":\"ready\",\"protocol_version\":1}'\nwhile [ ! -e \"$out/fail\" ]; do :; done\nexit 9";
     let mut client = start_client_with_budget(temp.path(), server.address, script, 10);
     // First establish the session and launch the child before losing the server.
-    wait_for(&mut client, || temp.path().join("output/started").exists()).await;
+    wait_for(&mut client, || {
+        temp.path().join("test-run/selfplay/started").exists()
+    })
+    .await;
     server.task.abort();
     wait_for(&mut client, || {
         fs::read_to_string(temp.path().join("client.log"))
@@ -521,7 +550,7 @@ async fn worker_failure_interrupts_connection_retries() {
             .contains("retrying")
     })
     .await;
-    fs::write(temp.path().join("output/fail"), b"").unwrap();
+    fs::write(temp.path().join("test-run/selfplay/fail"), b"").unwrap();
     let exit = timeout(Duration::from_secs(1), client.wait())
         .await
         .unwrap()
@@ -538,9 +567,12 @@ async fn worker_failure_interrupts_connection_retries() {
 async fn second_shutdown_signal_interrupts_connection_retries_and_reaps_worker() {
     let temp = tempfile::tempdir().unwrap();
     let server = Server::start(temp.path()).await;
-    let script = "out=\"$RGO_TEST_OUTPUT_DIR\"\necho $$ > \"$out/pid\"\necho '{\"type\":\"ready\",\"protocol_version\":1}'\nwhile IFS= read -r command; do case \"$command\" in *finish*) echo finished > \"$out/finished\"; while :; do :; done;; esac; done";
+    let script = "out=\"$output_dir\"\necho $$ > \"$out/pid\"\necho '{\"type\":\"ready\",\"protocol_version\":1}'\nwhile IFS= read -r command; do case \"$command\" in *finish*) echo finished > \"$out/finished\"; while :; do :; done;; esac; done";
     let mut client = start_client_with_budget(temp.path(), server.address, script, 10);
-    wait_for(&mut client, || temp.path().join("output/pid").exists()).await;
+    wait_for(&mut client, || {
+        temp.path().join("test-run/selfplay/pid").exists()
+    })
+    .await;
     server.task.abort();
     wait_for(&mut client, || {
         fs::read_to_string(temp.path().join("client.log"))
@@ -549,7 +581,10 @@ async fn second_shutdown_signal_interrupts_connection_retries_and_reaps_worker()
     })
     .await;
     signal(&client);
-    wait_for(&mut client, || temp.path().join("output/finished").exists()).await;
+    wait_for(&mut client, || {
+        temp.path().join("test-run/selfplay/finished").exists()
+    })
+    .await;
     sleep(Duration::from_millis(1200)).await;
     assert!(client.try_wait().unwrap().is_none());
     signal(&client);
@@ -558,8 +593,8 @@ async fn second_shutdown_signal_interrupts_connection_retries_and_reaps_worker()
         .unwrap()
         .unwrap();
     assert!(!exit.success());
-    assert!(temp.path().join("output/finished").exists());
-    let pid = fs::read_to_string(temp.path().join("output/pid")).unwrap();
+    assert!(temp.path().join("test-run/selfplay/finished").exists());
+    let pid = fs::read_to_string(temp.path().join("test-run/selfplay/pid")).unwrap();
     assert!(
         !std::process::Command::new("kill")
             .args(["-0", pid.trim()])
@@ -586,7 +621,7 @@ async fn shutdown_interrupts_initial_connection_retries_without_starting_a_worke
     let mut client = start_client_with_budget(
         temp.path(),
         server.address,
-        "touch \"$RGO_TEST_OUTPUT_DIR/worker-started\"; exit 0",
+        "touch \"$output_dir/worker-started\"; exit 0",
         10,
     );
     wait_for(&mut client, || {
@@ -601,7 +636,12 @@ async fn shutdown_interrupts_initial_connection_retries_without_starting_a_worke
         .unwrap()
         .unwrap();
     assert!(exit.success());
-    assert!(!temp.path().join("output/worker-started").exists());
+    assert!(
+        !temp
+            .path()
+            .join("test-run/selfplay/worker-started")
+            .exists()
+    );
 }
 
 async fn rejecting_server() -> (SocketAddr, JoinHandle<()>) {
@@ -618,6 +658,7 @@ async fn rejecting_server() -> (SocketAddr, JoinHandle<()>) {
             stream.get_mut(),
             &Response::Welcome {
                 protocol_version: PROTOCOL_VERSION,
+                run_name: "test-run".into(),
             },
         )
         .await
@@ -650,14 +691,14 @@ async fn rejecting_server() -> (SocketAddr, JoinHandle<()>) {
 #[tokio::test]
 async fn recovery_reports_chunk_rejection_without_starting_a_worker() {
     let temp = tempfile::tempdir().unwrap();
-    fs::create_dir(temp.path().join("output")).unwrap();
-    let chunk = chunk_path(&temp.path().join("output"), 1);
+    fs::create_dir_all(temp.path().join("test-run/selfplay")).unwrap();
+    let chunk = chunk_path(&temp.path().join("test-run/selfplay"), 1);
     fs::write(&chunk, b"pending").unwrap();
     let (address, server) = rejecting_server().await;
     let mut client = start_client(
         temp.path(),
         address,
-        "touch \"$RGO_TEST_OUTPUT_DIR/worker-started\"; exit 0",
+        "touch \"$output_dir/worker-started\"; exit 0",
     );
     assert!(!status(&mut client, temp.path()).await.success());
     assert!(
@@ -666,7 +707,12 @@ async fn recovery_reports_chunk_rejection_without_starting_a_worker() {
             .contains("test server rejection")
     );
     assert!(chunk.exists());
-    assert!(!temp.path().join("output/worker-started").exists());
+    assert!(
+        !temp
+            .path()
+            .join("test-run/selfplay/worker-started")
+            .exists()
+    );
     server.await.unwrap();
 }
 

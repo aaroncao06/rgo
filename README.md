@@ -107,11 +107,13 @@ rust/target/release/rgo-server configs/server.toml
 rust/target/release/rgo-client configs/client.toml
 ```
 
-The server provisions `data/`; the client recovers pending chunks and starts
-self-play. The example writes producer chunks to `data/selfplay/local/`.
+The example configs share the `data/` storage root. The server config selects
+`run-a` and stores its files in `data/run-a/server/`. The client learns the run
+name from the server, then recovers pending chunks and starts self-play in
+`data/run-a/selfplay/`.
 The worker waits until a model is available. To add the first model, stop the
 client, durably publish a complete immutable ONNX model at a canonical path
-such as `data/models/42.onnx` (see [server usage](rust/server/README.md)), then
+such as `data/run-a/server/models/42.onnx` (see [server usage](rust/server/README.md)), then
 restart the server and client. The server discovers the highest version on
 startup; a client left running would wait until its next model poll.
 The client can query replay statistics:
@@ -124,14 +126,15 @@ Ctrl-C finishes the client's active games and accepts final chunks.
 Stop clients before stopping the server. See [client usage](rust/client/README.md)
 and [server configuration and usage](rust/server/README.md).
 
-## Run the self-play worker
+## Debug the self-play worker
 
-The worker takes a TOML configuration path and communicates through
-newline-delimited JSON on stdin and stdout. See
+For normal self-play, `rgo-client` launches and supervises the worker. To debug
+the worker directly, pass its TOML and a separate self-play directory. It
+communicates through newline-delimited JSON on stdin and stdout. See
 [configuration and the process protocol](configs/README.md).
 
 ```sh
-cargo run --release --manifest-path rust/Cargo.toml -p rgo-selfplay -- configs/self_play.toml
+cargo run --release --manifest-path rust/Cargo.toml -p rgo-selfplay -- configs/self_play.toml data/selfplay-debug
 ```
 
 The example starts eight self-play tasks on two worker threads and uses one

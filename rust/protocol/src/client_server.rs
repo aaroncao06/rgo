@@ -11,6 +11,11 @@ pub fn valid_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
+/// Run names use lowercase ASCII so distinct names remain distinct on disk.
+pub fn valid_run_name(name: &str) -> bool {
+    valid_name(name) && !name.bytes().any(|byte| byte.is_ascii_uppercase())
+}
+
 // client > server
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -40,6 +45,7 @@ pub enum Request {
 pub enum Response {
     Welcome {
         protocol_version: u32,
+        run_name: String,
     },
     Model {
         path: Option<PathBuf>,
@@ -68,6 +74,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn run_names_require_lowercase() {
+        assert!(valid_run_name("run-a_9"));
+        assert!(!valid_run_name("Run-a_9"));
+        assert!(valid_name("Run-a_9"));
+    }
+
+    #[test]
     fn checkpoint_messages_round_trip() {
         let request = Request::SubmitCheckpoint {
             path: "/trainer/7.pt".into(),
@@ -75,7 +88,7 @@ mod tests {
         let json = serde_json::to_string(&request).unwrap();
         assert!(matches!(
             serde_json::from_str::<Request>(&json).unwrap(),
-            Request::SubmitCheckpoint { path } if path == PathBuf::from("/trainer/7.pt")
+            Request::SubmitCheckpoint { path } if path == std::path::Path::new("/trainer/7.pt")
         ));
         let json = serde_json::to_string(&Request::GetLatestCheckpoint {}).unwrap();
         assert!(matches!(

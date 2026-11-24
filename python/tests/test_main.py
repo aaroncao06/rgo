@@ -5,15 +5,23 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from trainer.main import parse_device, receive_start
+from trainer.main import main, parse_device, receive_start
 
 
 class TrainerMainTest(unittest.TestCase):
+    def test_rejects_empty_trainer_directory(self):
+        stderr = io.StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit) as error:
+            main(["unused.toml", ""])
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn("trainer directory must not be empty", stderr.getvalue())
+
     def test_start_requires_an_explicit_server_checkpoint_result(self):
         self.assertIsNone(receive_start(io.StringIO('{"type":"start","checkpoint_path":null}\n')))
         with self.assertRaisesRegex(ValueError, "absolute path or null"):
@@ -30,13 +38,13 @@ class TrainerMainTest(unittest.TestCase):
     def test_dummy_trainer_process_trains_and_checkpoints_one_shard(self):
         root = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as directory:
-            checkpoint = Path(directory) / "0.pt"
+            trainer_dir = Path(directory) / "trainer"
+            checkpoint = trainer_dir / "checkpoints/0.pt"
             config = Path(directory) / "trainer.toml"
             config.write_text(
                 'model = "dummy"\n'
                 'device = "cpu"\n'
                 'learning_rate = 0.001\n'
-                f'checkpoint_dir = {json.dumps(str(Path(directory)))}\n'
                 'base_batch_size = 1\n'
                 'effective_batch_size = 1\n'
                 'checkpoint_rows = 1\n'
@@ -61,8 +69,9 @@ class TrainerMainTest(unittest.TestCase):
             environment["PYTHONPATH"] = os.pathsep.join(
                 filter(None, (str(root / "python"), environment.get("PYTHONPATH")))
             )
+            command = [sys.executable, "-m", "trainer.main", str(config), str(trainer_dir)]
             result = subprocess.run(
-                [sys.executable, "-m", "trainer.main", str(config)],
+                command,
                 input=(
                     '{"type":"start","checkpoint_path":null}\n'
                     + json.dumps({"type": "shard", "path": str(shard)}) + "\n"
@@ -84,11 +93,11 @@ class TrainerMainTest(unittest.TestCase):
             self.assertEqual(events[2]["index"], 0)
             self.assertEqual(events[3]["last_shard_index"], 0)
             self.assertEqual(events[4]["index"], 1)
-            self.assertTrue((Path(directory) / "-1.pt").is_file())
+            self.assertTrue(checkpoint.with_name("-1.pt").is_file())
             self.assertTrue(checkpoint.is_file())
 
             restarted = subprocess.run(
-                [sys.executable, "-m", "trainer.main", str(config)],
+                command,
                 input=(
                     json.dumps({"type": "start", "checkpoint_path": str(checkpoint)}) + "\n"
                     + '{"type":"finish"}\n'
@@ -108,7 +117,7 @@ class TrainerMainTest(unittest.TestCase):
             self.assertEqual(recovered[1]["index"], 1)
 
             fresh = subprocess.run(
-                [sys.executable, "-m", "trainer.main", str(config)],
+                command,
                 input='{"type":"start","checkpoint_path":null}\n{"type":"finish"}\n',
                 capture_output=True,
                 text=True,

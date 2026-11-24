@@ -15,7 +15,11 @@ rust/target/release/rgo-server configs/server.toml
 ```
 
 The configuration requires `listen` (a loopback socket address), `data_dir`,
-the replay limits, and `[model_export]` shown in [server.toml](../../configs/server.toml).
+`run_name`, the replay limits, and `[model_export]` shown in
+[server.toml](../../configs/server.toml). The server sends the active `run_name`
+in `Welcome`. Use a unique name for each independent training run and keep that
+name if you move the run. Names contain 1–64 lowercase ASCII letters, digits,
+`-`, or `_`.
 Under `[replay]`, `prune_old_chunks` defaults to `true`. Set it to `false` to
 keep accepted chunk files after they leave the active replay window. Old files
 remain excluded from sampling and do not reenter replay if the window grows.
@@ -31,8 +35,8 @@ eviction happen between requests. Greetings and model-version polls are answered
 directly by connection tasks and do not enter this queue. Model polls use the
 shared published version and the model directory prepared at startup.
 
-Under `data_dir` (default example: `data/`), the server owns `replay/`, `models/`,
-`shards/`, and `checkpoints/`. A successful hello confirms the protocol version. Models use
+Under `data_dir/<run_name>/server/` (`data/run-a/server/` in the example), the
+server owns `replay/`, `models/`, `shards/`, and `checkpoints/`. Models use
 `<version>.onnx`. The Python helper writes and syncs a temporary model,
 atomically publishes its final filename without replacement, and syncs the
 models directory before the server updates its shared model snapshot.

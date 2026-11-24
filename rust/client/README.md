@@ -17,16 +17,16 @@ In another terminal, from the same repository root:
 rust/target/release/rgo-client configs/client.toml
 ```
 
-The default command is `selfplay`. The client reads `output_dir` from the worker
-TOML, creates and canonicalizes it, and recovers completed pending chunks there.
-It then launches `rgo-selfplay` with that same TOML. The worker canonicalizes
-its output directory before publishing chunks. The directory must share a
+The default command is `selfplay`. The server confirms the protocol version
+and supplies its active run name in `Welcome`. The client creates
+`data_dir/<run_name>/selfplay/`, recovers pending chunks there, and passes that
+directory and the worker TOML to `rgo-selfplay`. Other runs' directories are
+preserved. The worker directory must share a
 filesystem with server replay storage. After the worker's `ready` event, it
 immediately polls for the latest published model path and repeats that same request
 at the configured interval. Each model notification supplies its complete file
 path; the worker derives its version from the canonical `<version>.onnx` basename.
-The greeting confirms the protocol version. Model polls use `GetLatestModel`;
-completed chunks use `SubmitChunk`.
+Model polls use `GetLatestModel`. Completed chunks use `SubmitChunk`.
 Completed chunk paths are submitted for acceptance one at a time. The server validates new IDs,
 durably registers their hard links, and removes the producer filenames. The client
 does not delete accepted files.
@@ -36,9 +36,10 @@ does not delete accepted files.
 [client.toml](../../configs/client.toml) requires:
 
 - `server`: loopback socket address matching the server listener.
+- `data_dir`: storage root. The example uses `data/`, shared with the server.
 - `client_id`: 1–64 ASCII letters, digits, `-`, or `_`, carried in the greeting.
-  The server currently only validates it. Concurrent workers must use separate
-  output directories; locks enforce directory ownership.
+  The server currently only validates it. Concurrent clients need distinct
+  work directories. Locks enforce ownership of each run's self-play directory.
 - `selfplay_config`: worker TOML path.
 - `model_poll_interval_ms`: positive polling interval; the example uses
   1,800,000 (30 minutes). The first poll is immediate after worker readiness.
@@ -99,7 +100,9 @@ including after an unexpected parent exit. Restart once that worker exits.
 Completed chunks remaining in the output directory are retried before launching a new worker;
 durable server receipts make retries safe even after replay eviction.
 Connection failures and timeouts discard the socket, wait 1, 2, 4, 8, 16,
-then 30 seconds between attempts, and reconnect with a new Hello. Model polls,
+then 30 seconds between attempts, and reconnect with a new Hello. If the server
+advertises a different run name, the client stops before resending the request.
+Restart the client to join that run. Model polls,
 chunk acceptance, checkpoint acceptance, shard requests, and stats requests can
 be repeated safely. A model poll after reconnection
 returns the server's current file path. Healthy workers stay alive during retries, with bounded

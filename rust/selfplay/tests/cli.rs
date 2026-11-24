@@ -7,14 +7,13 @@ fn help_and_usage_do_not_start_self_play() {
         .output()
         .unwrap();
     assert!(help.status.success());
-    assert!(String::from_utf8_lossy(&help.stdout).contains("<config.toml>"));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("<config.toml> <selfplay-dir>"));
     for args in [
         vec![],
-        vec!["one.toml", "two.toml"],
-        vec!["one.toml", "--model-dir"],
+        vec!["one.toml"],
+        vec!["one.toml", ""],
         vec!["one.toml", "--model-dir", "models", "--model-dir", "other"],
         vec!["one.toml", "--output-dir", "chunks"],
-        vec!["--managed", "one.toml"],
         vec!["--managed", "one.toml", "two.toml"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_rgo-selfplay"))
@@ -83,8 +82,7 @@ mod unix {
             }
             let config = include_str!("../../../configs/self_play.toml")
                 .replace("worker_threads = 2", "worker_threads = 1")
-                .replace("workers_per_thread = 4", "workers_per_thread = 1")
-                .replace("data/selfplay/local", output_dir);
+                .replace("workers_per_thread = 4", "workers_per_thread = 1");
             fs::write(
                 dir.join("config.toml"),
                 format!("{config}\n[self_play]\nsearch_budget_policy = [{{ probability = 1.0, budget = {{ max_nodes = 0, max_playouts = 0 }} }}]\n[self_play.rules]\nboard_dim = {board_dim}\n"),
@@ -94,6 +92,7 @@ mod unix {
             let output = fs::File::create(dir.join("stdout.log")).unwrap();
             let child = Command::new(env!("CARGO_BIN_EXE_rgo-selfplay"))
                 .arg("config.toml")
+                .arg(output_dir)
                 .current_dir(&dir)
                 .stdin(Stdio::piped())
                 .stdout(output)
@@ -201,6 +200,7 @@ mod unix {
         run.ready();
         let second = Command::new(env!("CARGO_BIN_EXE_rgo-selfplay"))
             .arg("config.toml")
+            .arg("output/chunks")
             .current_dir(&run.dir)
             .output()
             .unwrap();
@@ -213,8 +213,7 @@ mod unix {
 
     #[test]
     fn model_paths_and_canonical_output_dir_do_not_require_a_fixed_model_directory() {
-        // The model command supplies a complete path; the worker resolves the
-        // configured output directory before publishing chunks.
+        // The worker resolves the supplied output directory before publishing chunks.
         let mut run = TestProcess::start_with_output_dir(None, false, 9, "chosen/chunks");
         run.ready();
         let fixture =

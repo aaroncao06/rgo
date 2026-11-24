@@ -1,6 +1,9 @@
 # Local coordination and shared artifact storage.
 listen = "127.0.0.1:3434"
+# Storage root shared with the local client.
 data_dir = "data"
+# Keep this name unique across independent training runs.
+run_name = "run-a"
 # Keep checkpointed training shards for later experiments.
 prune_old_shards = false
 

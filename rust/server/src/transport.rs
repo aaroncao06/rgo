@@ -39,6 +39,7 @@ async fn forward_to_storage(
 
 async fn connection(
     stream: TcpStream,
+    run_name: String,
     jobs: mpsc::Sender<StorageJob>,
     models: watch::Receiver<Option<u64>>,
     model_dir: Arc<PathBuf>,
@@ -83,6 +84,7 @@ async fn connection(
         stream.get_mut(),
         &Response::Welcome {
             protocol_version: PROTOCOL_VERSION,
+            run_name,
         },
     )
     .await?;
@@ -109,7 +111,7 @@ fn storage_worker(
     ready: oneshot::Sender<(watch::Receiver<Option<u64>>, PathBuf)>,
 ) -> Result<(), Error> {
     let mut state = StorageState::open(
-        &config.data_dir,
+        &config.data_dir.join(&config.run_name).join("server"),
         config.replay,
         config.checkpoints,
         config.prune_old_shards,
@@ -158,6 +160,7 @@ pub async fn run(config: Config) -> Result<(), Error> {
     let (jobs, incoming) = mpsc::channel::<StorageJob>(16);
     let (ready, startup) = oneshot::channel();
     let (finished, done) = oneshot::channel();
+    let run_name = config.run_name.clone();
     thread::Builder::new()
         .name("server-storage".into())
         .spawn(move || {
@@ -184,6 +187,7 @@ pub async fn run(config: Config) -> Result<(), Error> {
                 if sessions.len() < 32 {
                     sessions.spawn(connection(
                         stream,
+                        run_name.clone(),
                         jobs.clone(),
                         models.clone(),
                         model_dir.clone(),
@@ -280,7 +284,13 @@ mod tests {
         .await
         .unwrap();
         let model_dir = Arc::new(PathBuf::from("/models"));
-        let session = tokio::spawn(connection(server, jobs.clone(), models, model_dir));
+        let session = tokio::spawn(connection(
+            server,
+            "test-run".into(),
+            jobs.clone(),
+            models,
+            model_dir,
+        ));
         let mut client = BufReader::new(client);
         rgo_protocol::write(
             client.get_mut(),
@@ -299,7 +309,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap(),
-            Some(Response::Welcome { .. })
+            Some(Response::Welcome { run_name, .. }) if run_name == "test-run"
         ));
 
         for version in [None, Some(42)] {

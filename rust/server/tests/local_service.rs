@@ -85,7 +85,7 @@ async fn connect(address: SocketAddr) -> BufReader<TcpStream> {
             }
         )
         .await,
-        Response::Welcome { .. }
+        Response::Welcome { run_name, .. } if run_name == "test-run"
     ));
     stream
 }
@@ -125,6 +125,7 @@ fn export_test_config(directory: &Path) -> PathBuf {
         format!(
             r#"listen = '127.0.0.1:0'
 data_dir = {:?}
+run_name = 'test-run'
 [model_export]
 every_shards = 2
 [replay]
@@ -134,7 +135,7 @@ sample_group_records = 20
 sample_groups_per_shard = 4
 records_per_shard = 10
 "#,
-            directory.join("server")
+            directory
         ),
     )
     .unwrap();
@@ -208,12 +209,12 @@ async fn checkpoint_acceptance_exports_in_order_and_recovers_the_cadence() {
     let (mut server, address) = start(&config).await;
     let mut stream = connect(address).await;
     submit_checkpoint(&mut stream, &base, -1).await;
-    let models = base.join("server/models");
+    let models = base.join("test-run/server/models");
     assert!(models.join("0.onnx").exists()); // Export finishes before acceptance replies.
     for index in [0, 1, 3] {
         submit_checkpoint(&mut stream, &base, index).await;
     }
-    let checkpoints = base.join("server/checkpoints");
+    let checkpoints = base.join("test-run/server/checkpoints");
     wait_for_model(&mut stream, &models.join("4.onnx")).await;
     assert_eq!(fs::read(models.join("0.onnx")).unwrap(), b"checkpoint -1");
     assert_eq!(fs::read(models.join("4.onnx")).unwrap(), b"checkpoint 3");
@@ -276,18 +277,18 @@ async fn disabling_checkpoint_pruning_keeps_history_after_exports_and_restart() 
     let (mut server, address) = start(&config).await;
     let mut stream = connect(address).await;
     submit_checkpoint(&mut stream, &base, -1).await;
-    wait_for_model(&mut stream, &base.join("server/models/0.onnx")).await;
+    wait_for_model(&mut stream, &base.join("test-run/server/models/0.onnx")).await;
     submit_checkpoint(&mut stream, &base, 1).await;
-    wait_for_model(&mut stream, &base.join("server/models/2.onnx")).await;
-    assert!(base.join("server/checkpoints/-1.pt").exists());
+    wait_for_model(&mut stream, &base.join("test-run/server/models/2.onnx")).await;
+    assert!(base.join("test-run/server/checkpoints/-1.pt").exists());
     drop(stream);
     stop(&mut server).await;
 
     let (mut server, address) = start(&config).await;
     let mut stream = connect(address).await;
-    wait_for_model(&mut stream, &base.join("server/models/2.onnx")).await;
-    assert!(base.join("server/checkpoints/-1.pt").exists());
-    assert!(base.join("server/checkpoints/1.pt").exists());
+    wait_for_model(&mut stream, &base.join("test-run/server/models/2.onnx")).await;
+    assert!(base.join("test-run/server/checkpoints/-1.pt").exists());
+    assert!(base.join("test-run/server/checkpoints/1.pt").exists());
     drop(stream);
     stop(&mut server).await;
 }
@@ -300,9 +301,9 @@ async fn checkpoint_cleanup_failure_stops_the_server_and_restart_finishes_cleanu
     let (mut server, address) = start(&config).await;
     let mut stream = connect(address).await;
     submit_checkpoint(&mut stream, &base, -1).await;
-    wait_for_model(&mut stream, &base.join("server/models/0.onnx")).await;
+    wait_for_model(&mut stream, &base.join("test-run/server/models/0.onnx")).await;
     // An invalid older entry makes pruning fail during checkpoint acceptance.
-    let invalid = base.join("server/checkpoints/0.pt");
+    let invalid = base.join("test-run/server/checkpoints/0.pt");
     fs::create_dir(&invalid).unwrap();
     let source = base.join("1.pt");
     fs::write(&source, b"checkpoint 1").unwrap();
@@ -319,16 +320,16 @@ async fn checkpoint_cleanup_failure_stops_the_server_and_restart_finishes_cleanu
             .unwrap()
             .success()
     );
-    assert!(!base.join("server/models/2.onnx").exists());
-    assert!(base.join("server/checkpoints/1.pt").exists());
+    assert!(!base.join("test-run/server/models/2.onnx").exists());
+    assert!(base.join("test-run/server/checkpoints/1.pt").exists());
     drop(stream);
 
     fs::remove_dir(invalid).unwrap();
     let (mut server, address) = start(&config).await;
     let mut stream = connect(address).await;
-    wait_for_model(&mut stream, &base.join("server/models/2.onnx")).await;
-    assert!(!base.join("server/checkpoints/-1.pt").exists());
-    assert!(base.join("server/checkpoints/1.pt").exists());
+    wait_for_model(&mut stream, &base.join("test-run/server/models/2.onnx")).await;
+    assert!(!base.join("test-run/server/checkpoints/-1.pt").exists());
+    assert!(base.join("test-run/server/checkpoints/1.pt").exists());
     drop(stream);
     stop(&mut server).await;
     assert_eq!(
@@ -365,7 +366,7 @@ async fn export_failure_stops_the_server_and_restart_recovers_publication() {
     drop(stream);
     drop(observer);
     fs::remove_file(base.join("fail")).unwrap();
-    let models = base.join("server/models");
+    let models = base.join("test-run/server/models");
     let (mut server, address) = start(&config).await;
     let mut stream = connect(address).await;
     wait_for_model(&mut stream, &models.join("0.onnx")).await;
@@ -473,7 +474,7 @@ async fn model_polls_respond_while_export_holds_the_storage_queue() {
         Some(Response::CheckpointAccepted {})
     ));
     assert!(matches!(stats.await.unwrap(), Response::Stats { .. }));
-    wait_for_model(&mut observer, &base.join("server/models/0.onnx")).await;
+    wait_for_model(&mut observer, &base.join("test-run/server/models/0.onnx")).await;
     drop(submitter);
     drop(observer);
     stop(&mut server).await;
@@ -482,10 +483,11 @@ async fn model_polls_respond_while_export_holds_the_storage_queue() {
 #[tokio::test]
 async fn checkpoint_handoff_retries_and_recovers_after_restart() {
     let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("server");
+    let data_dir = temp.path();
+    let root = data_dir.join("test-run/server");
     let config = temp.path().join("server.toml");
     write_test_python(temp.path());
-    fs::write(&config, format!("listen = '127.0.0.1:0'\ndata_dir = {root:?}\nprune_old_shards = false\n[checkpoints]\nprune_old_checkpoints = false\n[replay]\ncapacity_records = 100\nwindow_records = 100\nsample_group_records = 20\nsample_groups_per_shard = 4\nrecords_per_shard = 10\n[model_export]\nevery_shards = 10\n")).unwrap();
+    fs::write(&config, format!("listen = '127.0.0.1:0'\ndata_dir = {data_dir:?}\nrun_name = 'test-run'\nprune_old_shards = false\n[checkpoints]\nprune_old_checkpoints = false\n[replay]\ncapacity_records = 100\nwindow_records = 100\nsample_group_records = 20\nsample_groups_per_shard = 4\nrecords_per_shard = 10\n[model_export]\nevery_shards = 10\n")).unwrap();
     let (mut server, address) = start(&config).await;
     let mut stream = connect(address).await;
     assert!(matches!(
@@ -574,9 +576,10 @@ async fn checkpoint_handoff_retries_and_recovers_after_restart() {
 #[tokio::test]
 async fn local_acceptance_sampling_model_publication_and_restart() {
     let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("nested/server");
+    let data_dir = temp.path().join("nested");
+    let root = data_dir.join("test-run/server");
     let config = temp.path().join("server.toml");
-    fs::write(&config, format!("listen = '127.0.0.1:0'\ndata_dir = {:?}\n[replay]\ncapacity_records = 100\nwindow_records = 100\nsample_group_records = 20\nsample_groups_per_shard = 4\nrecords_per_shard = 3\n[model_export]\nevery_shards = 10\n", root)).unwrap();
+    fs::write(&config, format!("listen = '127.0.0.1:0'\ndata_dir = {data_dir:?}\nrun_name = 'test-run'\n[replay]\ncapacity_records = 100\nwindow_records = 100\nsample_group_records = 20\nsample_groups_per_shard = 4\nrecords_per_shard = 3\n[model_export]\nevery_shards = 10\n")).unwrap();
     let (mut server, address) = start(&config).await;
     for (protocol_version, client_id) in [
         (PROTOCOL_VERSION + 1, "local"),
@@ -627,8 +630,8 @@ async fn local_acceptance_sampling_model_publication_and_restart() {
     }
     bytes.extend(Sha256::digest(&bytes));
     assert!(!root.join("intake").exists());
-    let output = temp.path().join("client-output");
-    fs::create_dir(&output).unwrap();
+    let output = data_dir.join("test-run/selfplay");
+    fs::create_dir_all(&output).unwrap();
     let source = chunk_path(&fs::canonicalize(output).unwrap(), 42);
     fs::write(&source, &bytes).unwrap();
     assert!(matches!(

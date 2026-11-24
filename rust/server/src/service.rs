@@ -35,13 +35,13 @@ pub struct StorageState {
 
 impl StorageState {
     pub fn open(
-        data_dir: &Path,
+        server_dir: &Path,
         replay_config: ReplayConfig,
         checkpoint_config: CheckpointConfig,
         prune_old_shards: bool,
         model_export: ModelExportConfig,
     ) -> Result<Self, Error> {
-        let root = rgo_fs::prepare_directory_with_sync(data_dir, sync_directory)?;
+        let root = rgo_fs::prepare_directory_with_sync(server_dir, sync_directory)?;
         for name in ["replay", "models", "shards", "checkpoints"] {
             rgo_fs::prepare_directory_with_sync(&root.join(name), sync_directory)?;
         }

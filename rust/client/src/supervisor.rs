@@ -108,15 +108,16 @@ pub async fn run(config: &Config) -> io::Result<()> {
         signal = signals.recv() => { signal?; return Ok(()); }
         connection = Connection::open(config) => connection?,
     };
-    // Own the output directory before recovery or worker launch, so another
+    // Own the self-play directory before recovery or worker launch, so another
     // client cannot submit its files at the same time.
-    let output_dir = config.prepare_output_dir()?;
+    let selfplay_dir =
+        rgo_fs::prepare_directory(&config.data_dir.join(connection.run_name()).join("selfplay"))?;
     let _client_lock = File::options()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(output_dir.join(".client.lock"))?;
+        .open(selfplay_dir.join(".client.lock"))?;
     _client_lock.try_lock().map_err(|error| {
         io::Error::other(format!(
             "client output directory is already supervised: {error}"
@@ -128,15 +129,15 @@ pub async fn run(config: &Config) -> io::Result<()> {
         .write(true)
         .create(true)
         .truncate(false)
-        .open(output_dir.join(".selfplay.lock"))?;
+        .open(selfplay_dir.join(".selfplay.lock"))?;
     recovery_worker_lock.try_lock().map_err(|error| {
         io::Error::other(format!(
             "previous worker is still using output directory: {error}"
         ))
     })?;
-    // Finish accepting chunks left by an earlier run before starting a writer.
+    // Recover pending chunks for the selected run before starting a writer.
     let mut pending = Vec::new();
-    for entry in fs::read_dir(&output_dir)? {
+    for entry in fs::read_dir(&selfplay_dir)? {
         let entry = entry?;
         if chunk_id_from_filename(&entry.file_name()).is_some() {
             pending.push(entry.path());
@@ -158,8 +159,7 @@ pub async fn run(config: &Config) -> io::Result<()> {
         signal = signals.recv() => { signal?; return Ok(()); }
         result = recovery => result?,
     }
-    // Start the worker only after recovery has completed. It reads the same
-    // output path from its TOML and canonicalizes it before publishing chunks.
+    // Start the worker with the self-play directory used for recovery.
     // Configured relative binary paths use the client's working directory.
     let binary = match &config.selfplay_binary {
         Some(path) if path.is_absolute() => path.clone(),
@@ -173,6 +173,7 @@ pub async fn run(config: &Config) -> io::Result<()> {
     drop(recovery_worker_lock);
     let mut child = process::Command::new(binary)
         .arg(&config.selfplay_config)
+        .arg(&selfplay_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())

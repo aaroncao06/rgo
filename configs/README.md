@@ -1,34 +1,34 @@
 # Process configurations
 
-[`server.toml`](server.toml) configures the loopback listener, server data
-directory, and replay limits. [`client.toml`](client.toml) configures worker
-launching, model polling, and request/retry deadlines.
+[`server.toml`](server.toml) configures the loopback listener, active run name,
+storage root, and replay limits. [`client.toml`](client.toml) configures the
+storage root, worker launching, model polling, and request/retry deadlines. For
+a local run, both configs can use the same `data_dir`.
 See [client usage](../rust/client/README.md) and [server usage](../rust/server/README.md).
 All relative paths refer to the process working directory.
 
 ## Self-play worker configuration
 
 [`self_play.toml`](self_play.toml) is a runnable CPU configuration for the
-`rgo-selfplay` worker. From the repository root:
+`rgo-selfplay` worker launched by `rgo-client`. To debug the worker directly,
+run it from the repository root with a separate self-play directory:
 
 ```sh
-cargo run --release --manifest-path rust/Cargo.toml -p rgo-selfplay -- configs/self_play.toml
+cargo run --release --manifest-path rust/Cargo.toml -p rgo-selfplay -- configs/self_play.toml data/selfplay-debug
 ```
 
-The executable takes a configuration path. The client reads `output_dir` from
-that configuration for recovery and locking; the worker reads the same value,
-creates the directory, and resolves it to an absolute path before writing
-chunks. The client sends complete model paths over stdin. Relative paths refer
-to each process's working directory, not the configuration file. Use one worker
+The worker takes `<config.toml> <selfplay-dir>`. The client
+learns the run name from the server, recovers pending chunks from
+`data_dir/<run_name>/selfplay/`, and passes that directory to the worker. The
+worker resolves it to an absolute path before writing chunks. Use one worker
 process per output directory.
 The worker holds `.selfplay.lock` through shutdown because its writer uses a
 shared temporary filename.
 
-The executable is designed to be launched by a supervising process. It uses
-local stdin/stdout pipes; the parent publishes models, consumes chunks, and
-handles server communication. The local supervisor is implemented in
-`rgo-client`; trainer client integration and remote transfers are not
-implemented yet. [`trainer.toml`](trainer.toml) configures the temporary CPU
+`rgo-client` supervises the worker over stdin and stdout. It forwards model
+paths to the worker and submits completed chunk paths to the server.
+Trainer client integration and remote transfers are planned.
+[`trainer.toml`](trainer.toml) configures the temporary CPU
 trainer used to test the pipe and checkpoint flow; see
 [trainer usage](../python/README.md).
 
@@ -39,7 +39,6 @@ The top-level operational settings are required:
 - `worker_threads`: positive number of self-play worker threads.
 - `workers_per_thread`: positive number of game tasks per worker thread. The
   example's `2 * 4` configuration runs eight tasks.
-- `output_dir`: directory for published `chunk-<32-hex-digit-id>.rgo` files.
 - `chunk`: publication mode, described below.
 - `inference`: executor configurations and cache settings.
 
@@ -182,7 +181,7 @@ record fields are read directly from their packed bytes.
 Send one JSON command per line on stdin:
 
 ```json
-{"type":"model_ready","path":"data/models/42.onnx"}
+{"type":"model_ready","path":"data/run-a/server/models/42.onnx"}
 {"type":"finish"}
 ```
 
@@ -206,7 +205,7 @@ Stdout contains newline-delimited JSON events. An illustrative sequence for a
 
 ```json
 {"type":"ready","protocol_version":1}
-{"type":"chunk_ready","path":"/absolute/path/to/data/selfplay/local/chunk-00000000000000000000000000000001.rgo","bytes":47056,"records":200}
+{"type":"chunk_ready","path":"/absolute/path/to/data/run-a/selfplay/chunk-00000000000000000000000000000001.rgo","bytes":47056,"records":200}
 {"type":"stopped"}
 ```
 

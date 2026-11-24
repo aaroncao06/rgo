@@ -32,13 +32,14 @@ def parse_device(value: str) -> torch.device:
     return device
 
 
-def build_trainer(config: dict, resume_path: Optional[Path]) -> TrainingCoordinator:
+def build_trainer(
+    config: dict, trainer_dir: Path, resume_path: Optional[Path]
+) -> TrainingCoordinator:
     """Construct the temporary dummy trainer from local process settings."""
     fields = {
         "model",
         "device",
         "learning_rate",
-        "checkpoint_dir",
         "base_batch_size",
         "effective_batch_size",
         "checkpoint_rows",
@@ -60,10 +61,7 @@ def build_trainer(config: dict, resume_path: Optional[Path]) -> TrainingCoordina
     size = config["effective_batch_size"]
     if size & (size - 1):
         raise ValueError("effective_batch_size must be a power of two")
-    if not isinstance(config["checkpoint_dir"], str) or not config["checkpoint_dir"]:
-        raise ValueError("checkpoint_dir must be a nonempty string")
-
-    checkpoint_dir = Path(config["checkpoint_dir"]).absolute()
+    checkpoint_dir = trainer_dir.absolute() / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     model = DummyModel().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=rate)
@@ -101,10 +99,14 @@ def receive_start(input: TextIO) -> Optional[Path]:
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description="Run an RGO trainer pipe worker")
     parser.add_argument("config", type=Path, help="trainer TOML configuration")
+    parser.add_argument("trainer_dir", help="trainer work directory")
     args = parser.parse_args(argv)
+    if not args.trainer_dir:
+        parser.error("trainer directory must not be empty")
     with args.config.open("rb") as file:
         config = tomllib.load(file)
-    run(build_trainer(config, receive_start(sys.stdin)), sys.stdin, sys.stdout)
+    coordinator = build_trainer(config, Path(args.trainer_dir), receive_start(sys.stdin))
+    run(coordinator, sys.stdin, sys.stdout)
 
 
 if __name__ == "__main__":

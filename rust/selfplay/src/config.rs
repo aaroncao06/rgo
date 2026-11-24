@@ -1,10 +1,6 @@
 //! Process configuration, separate from per-game and search algorithm parameters.
 
-use std::{
-    error::Error,
-    fmt, fs, io,
-    path::{Path, PathBuf},
-};
+use std::{error::Error, fmt, fs, io, path::Path};
 
 use serde::Deserialize;
 
@@ -18,7 +14,6 @@ use crate::{inference::runtime::ModelRuntimeConfig, search::params::SearchParams
 pub(super) struct SelfPlayConfig {
     pub(super) worker_threads: usize,
     pub(super) workers_per_thread: usize,
-    pub(super) output_dir: PathBuf,
     pub(super) chunk: ChunkMode,
     pub(super) inference: ModelRuntimeConfig,
     #[serde(default)]
@@ -75,9 +70,6 @@ impl SelfPlayConfig {
             .is_none()
         {
             return Err("self-play worker count overflows usize");
-        }
-        if self.output_dir.as_os_str().is_empty() {
-            return Err("output_dir must not be empty");
         }
         if let ChunkMode::FixedRecords(records) = self.chunk {
             if records == 0 || u32::try_from(records).is_err() {

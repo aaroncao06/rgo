@@ -1,4 +1,5 @@
-//! Self-play worker process supervised by the client over local pipes.
+//! Self-play worker launched and supervised by `rgo-client` over local pipes.
+//! Run it directly to debug the worker and its pipe protocol.
 
 use rgo_engine::{game, inference, search};
 use rgo_protocol::ShutdownSignals;
@@ -19,7 +20,8 @@ mod orchestrator;
 mod params;
 mod worker;
 
-const USAGE: &str = "Usage: rgo-selfplay <config.toml> (client-supervised worker)";
+const USAGE: &str = "Usage: rgo-selfplay <config.toml> <selfplay-dir>\n\
+    Normally launched by rgo-client. Run directly to debug the worker.";
 
 fn main() {
     let mut args = env::args_os().skip(1);
@@ -32,14 +34,18 @@ fn main() {
         return;
     }
 
-    if args.next().is_some() {
+    let Some(selfplay_dir) = args.next() else {
+        eprintln!("{USAGE}");
+        process::exit(2);
+    };
+    if selfplay_dir.is_empty() || args.next().is_some() {
         eprintln!("{USAGE}");
         process::exit(2);
     }
     let config = SelfPlayConfig::load(Path::new(&path)).unwrap_or_else(|error| fatal(error));
     let runtime = build_runtime()
         .unwrap_or_else(|error| fatal(format!("could not start Tokio runtime: {error}")));
-    if let Err(error) = runtime.block_on(run(config)) {
+    if let Err(error) = runtime.block_on(run(config, Path::new(&selfplay_dir))) {
         // The orchestrator returns promptly on failure and may leave worker
         // threads active. Exit before dropping the runtime or waiting for them.
         fatal(error);
@@ -60,11 +66,11 @@ fn fatal(error: impl std::fmt::Display) -> ! {
     process::exit(1);
 }
 
-async fn run(mut config: SelfPlayConfig) -> Result<(), String> {
-    config.output_dir = rgo_fs::prepare_directory(&config.output_dir).map_err(|error| {
+async fn run(config: SelfPlayConfig, selfplay_dir: &Path) -> Result<(), String> {
+    let selfplay_dir = rgo_fs::prepare_directory(selfplay_dir).map_err(|error| {
         format!(
             "could not prepare output directory {}: {error}",
-            config.output_dir.display()
+            selfplay_dir.display()
         )
     })?;
     // The child owns this lock through its entire drain, even if its parent dies.
@@ -73,7 +79,7 @@ async fn run(mut config: SelfPlayConfig) -> Result<(), String> {
         .write(true)
         .create(true)
         .truncate(false)
-        .open(config.output_dir.join(".selfplay.lock"))
+        .open(selfplay_dir.join(".selfplay.lock"))
         .map_err(|error| error.to_string())?;
     _output_lock
         .try_lock()
@@ -82,9 +88,9 @@ async fn run(mut config: SelfPlayConfig) -> Result<(), String> {
         eprintln!(
             "Starting {} self-play workers; receiving model paths; writing chunks to {}.",
             config.worker_threads * config.workers_per_thread,
-            config.output_dir.display(),
+            selfplay_dir.display(),
         );
-        control::run_client_session(config, finish_tx, finish_rx).await
+        control::run_client_session(config, selfplay_dir, finish_tx, finish_rx).await
     })
     .await?;
     eprintln!("Self-play stopped; training chunks drained.");

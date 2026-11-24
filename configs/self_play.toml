@@ -3,7 +3,6 @@
 # The client supplies complete model paths over the worker control pipe.
 worker_threads = 2
 workers_per_thread = 4
-output_dir = "data/selfplay/local"
 
 # Per-game mode publishes for each game, caps chunks at 1024, and carries tails.
 # Use { mode = "fixed_records", records = 1024 } to batch across games.

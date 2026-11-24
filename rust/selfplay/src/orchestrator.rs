@@ -55,7 +55,11 @@ pub(super) struct SelfPlayOrchestrator {
 }
 
 impl SelfPlayOrchestrator {
-    pub(super) fn new(config: SelfPlayConfig, events: EventPublisher) -> Self {
+    pub(super) fn new(
+        config: SelfPlayConfig,
+        selfplay_dir: PathBuf,
+        events: EventPublisher,
+    ) -> Self {
         let SelfPlayConfig {
             search: search_params,
             self_play: self_play_params,
@@ -63,7 +67,6 @@ impl SelfPlayOrchestrator {
             worker_threads,
             workers_per_thread,
             chunk: chunk_mode,
-            output_dir,
         } = config;
         let worker_count = worker_threads
             .checked_mul(workers_per_thread)
@@ -103,7 +106,7 @@ impl SelfPlayOrchestrator {
         Self {
             runtime_config,
             worker_groups,
-            writer: ChunkWriter::new(chunk_mode, output_dir, completed_games_rx, events),
+            writer: ChunkWriter::new(chunk_mode, selfplay_dir, completed_games_rx, events),
             pause_tx,
             paused_rx,
             resume_txs,
@@ -618,8 +621,8 @@ mod tests {
                 worker_threads,
                 workers_per_thread,
                 chunk: mode,
-                output_dir,
             },
+            output_dir,
             events,
         )
     }

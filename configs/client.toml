@@ -1,6 +1,7 @@
 server = "127.0.0.1:3434"
-# Name carried in Hello; currently validated only. Use separate worker output
-# directories for concurrent clients.
+# Storage root shared with the local server. The server supplies the run name.
+data_dir = "data"
+# Name carried in Hello; currently validated only.
 client_id = "local"
 selfplay_config = "configs/self_play.toml"
 # Omitted selfplay_binary uses rgo-selfplay alongside the client executable.

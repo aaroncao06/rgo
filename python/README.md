@@ -21,33 +21,31 @@ it to newline-delimited JSON streams: it reports `ready`, requests the next
 shard index, accepts either an absolute local path or
 `finish`, and reports checkpoint completion. Requesting the next index implies
 that the previous shard finished training. Checkpoints are immutable
-`<last-shard-index>.pt` files in the configured directory. The client
-can retry any completed files left there after interrupted acceptance before
-starting a new trainer process.
+`<last-shard-index>.pt` files under `checkpoints/` in the supplied trainer
+directory.
 
-`PYTHONPATH=python uv run --locked python -m trainer.main configs/trainer.toml` runs the
-client-supervised trainer pipe worker. Its first stdin message is `start` with
-the absolute path returned by the server's `GetLatestCheckpoint` request. Only
-when the server has neither an accepted checkpoint nor a published model may
-that path be `null`. The trainer then saves an initial `-1.pt` and reports
-`checkpoint_ready`. The client submits
-it and waits for server acceptance and initial ONNX publication before handling
-the next shard request. Later `checkpoint_ready` events use the same serial
-client handling: submit and await acceptance before delivering another shard.
-If an accepted `-1.pt` is resumed after an interrupted export, the client still
-waits for initial ONNX publication before delivering shard 0. The TOML
-specifies a model, device, learning rate, checkpoint directory, and batch sizes.
-`build_trainer`
-currently constructs the temporary `DummyModel` and Adam optimizer; there is
-no importable factory name in the TOML. The real ViT model and Rust client
-launcher are still to be implemented.
+The trainer pipe worker takes its TOML and a work directory:
+
+```sh
+PYTHONPATH=python uv run --locked python -m trainer.main configs/trainer.toml data/run-a/trainer
+```
+
+Its first stdin message is `start` with an absolute `checkpoint_path` or
+`null`. A `null` path starts a fresh run. The trainer saves an initial `-1.pt`
+and reports `checkpoint_ready` before requesting shard 0. The TOML specifies
+the model, device, learning rate, and batch sizes. The current worker builds
+the temporary `DummyModel` and Adam optimizer.
+
+Rust client supervision is planned. The client will recover pending
+checkpoints, obtain the resume path from the server, and wait for checkpoint
+acceptance and any due ONNX export before delivering the next shard.
 
 `server.export` converts a checkpoint using the same temporary `DummyModel`
 architecture into a float32 ONNX model with dynamic batch and board dimensions
 and the engine's `rgo.io_version = "0"` metadata:
 
 ```sh
-PYTHONPATH=python uv run --locked python -m server.export data/checkpoints/-1.pt data/models/0.onnx
+PYTHONPATH=python uv run --locked python -m server.export data/run-a/server/checkpoints/-1.pt data/run-a/server/models/0.onnx
 ```
 
 The output directory must exist. Export syncs a temporary file, publishes the

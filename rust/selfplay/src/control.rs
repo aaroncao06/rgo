@@ -2,6 +2,7 @@
 
 use std::{
     io::{self, BufRead, Read, Write},
+    path::PathBuf,
     thread,
 };
 
@@ -140,12 +141,13 @@ async fn apply_commands(
 /// Start dedicated pipe I/O threads and supervise the self-play pipeline.
 pub(super) async fn run_client_session(
     config: SelfPlayConfig,
+    selfplay_dir: PathBuf,
     finish_tx: watch::Sender<bool>,
     finish_rx: watch::Receiver<bool>,
 ) -> Result<(), String> {
     let events = EventPublisher::start()
         .map_err(|error| format!("could not start event writer: {error}"))?;
-    let result = supervise_self_play(config, finish_tx, finish_rx, &events).await;
+    let result = supervise_self_play(config, selfplay_dir, finish_tx, finish_rx, &events).await;
     if let Err(message) = &result {
         let _ = events
             .emit(Event::Error {
@@ -158,11 +160,12 @@ pub(super) async fn run_client_session(
 
 async fn supervise_self_play(
     config: SelfPlayConfig,
+    selfplay_dir: PathBuf,
     finish_tx: watch::Sender<bool>,
     finish_rx: watch::Receiver<bool>,
     events: &EventPublisher,
 ) -> Result<(), String> {
-    let orchestrator = SelfPlayOrchestrator::new(config, events.clone());
+    let orchestrator = SelfPlayOrchestrator::new(config, selfplay_dir, events.clone());
     let (commands_tx, commands_rx) = mpsc::channel(1);
     thread::Builder::new()
         .name("selfplay-commands".into())
