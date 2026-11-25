@@ -21,12 +21,21 @@ The default command is `selfplay`. The server confirms the protocol version
 and supplies its active run name in `Welcome`. The client creates
 `data_dir/<run_name>/selfplay/`, recovers pending chunks there, and passes that
 directory and the worker TOML to `rgo-selfplay`. Other runs' directories are
-preserved. The worker directory must share a
-filesystem with server replay storage. After the worker's `ready` event, it
-immediately polls for the latest published model path and repeats that same request
-at the configured interval. Each model notification supplies its complete file
-path; the worker derives its version from the canonical `<version>.onnx` basename.
-Model polls use `GetLatestModel`. Completed chunks use `SubmitChunk`.
+preserved. The worker directory must share a filesystem with server storage.
+After the worker's `ready` event, the client polls for the latest published
+model with `GetLatestModel` and repeats that request at the configured interval.
+It hard-links the complete model into the run's `selfplay/models/` directory and
+syncs the cache directory before removing older links and sending the new local
+path to the worker. If the server's path disappeared before the link was made,
+the client polls again using the connection retry backoff. The worker must report
+`model_loaded` before the client fetches another model. The current file is kept
+and reused at restart when the server advertises the same version.
+
+Hard links share the model bytes on disk. Keep `selfplay/models/` and
+`server/models/` as separate directories. If a symlink makes them resolve to
+the same directory, client cleanup can remove server publications.
+
+Completed chunks use `SubmitChunk`.
 Completed chunk paths are submitted for acceptance one at a time. The server validates new IDs,
 durably registers their hard links, and removes the producer filenames. The client
 does not delete accepted files.
@@ -46,8 +55,9 @@ does not delete accepted files.
 - `request_timeout_secs`: positive connection/request deadline; the example
   uses 300 seconds (5 minutes). This includes queue wait and server processing.
   Model-version polls bypass the storage queue after the greeting completes.
-- `retry_timeout_secs`: positive total budget for connection setup or a retryable
-  request; the example uses 600 seconds (10 minutes). It includes attempts and
+- `retry_timeout_secs`: positive total budget for connection setup, a retryable
+  request, or model acquisition. The example uses 600 seconds (10 minutes).
+  It includes attempts and
   backoff waits. Each attempt is capped by the request deadline or the remaining
   budget, whichever is shorter; success starts a fresh budget for the next operation.
 
@@ -84,9 +94,9 @@ trainer integration remains deferred.
 
 ## Shutdown and recovery
 
-Ctrl-C, or SIGTERM on Unix, sends `finish` to the worker and continues accepting
-final chunks until its `stopped` event and successful process exit. A second
-signal kills and reaps the worker. Worker failures, explicit
+Ctrl-C, or SIGTERM on Unix, stops model polling, sends `finish` to the worker,
+and continues accepting final chunks until its `stopped` event and successful
+process exit. A second signal kills and reaps the worker. Worker failures, explicit
 server rejections, invalid protocol messages, and exhausted retry budgets also
 stop the child and return a nonzero status. The worker is never automatically
 restarted. Stop self-play clients before the server.
@@ -109,6 +119,10 @@ returns the server's current file path. Healthy workers stay alive during retrie
 queues applying backpressure while acceptance is unavailable. Signals and worker
 failure still interrupt supervision. The normal retry budget also applies to
 server operations during shutdown; expiry is a fatal error that reaps the worker.
+Model cache operations run on the blocking pool. Shutdown can drain the worker
+while a filesystem operation completes, and the directory stays locked until
+that operation returns. If the worker has already exited, a second signal
+can still force the client to exit while it waits for the cache operation.
 After that, restart the server if needed and run the client again. Active games
 can be lost on forced exit; completed,
 published chunks remain recoverable.
@@ -119,6 +133,6 @@ retry. On Unix, directory creation syncs newly created parent entries; existing
 directories are assumed to be provisioned.
 
 Shared messages and framing live in [rgo-protocol](../protocol/src/lib.rs).
-Server requests are newline-delimited JSON with a 64 KiB frame limit. Worker
-commands retain their 4,096-byte limit. The loopback interface is intended for
+Server requests and worker commands are newline-delimited JSON with a shared
+64 KiB frame limit, including the newline. The loopback interface is intended for
 trusted local processes and has no authentication.

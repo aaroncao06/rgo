@@ -7,17 +7,15 @@ use std::{
 };
 
 use rgo_artifacts::model_version_from_filename;
-use rgo_protocol::selfplay::Command;
 pub(super) use rgo_protocol::selfplay::Event;
+use rgo_protocol::{MAX_FRAME_BYTES, selfplay::Command};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
 use super::{
     config::SelfPlayConfig,
-    orchestrator::{ModelFile, SelfPlayOrchestrator},
+    orchestrator::{ModelFile, SelfPlayOrchestrator, SelfPlayRunError},
 };
-
-const MAX_COMMAND_BYTES: u64 = 4096;
 
 struct PendingEvent {
     event: Event,
@@ -80,12 +78,12 @@ fn read_commands(mut input: impl BufRead, commands: mpsc::Sender<Result<Command,
         let mut line = Vec::new();
         let command = match input
             .by_ref()
-            .take(MAX_COMMAND_BYTES + 1)
+            .take((MAX_FRAME_BYTES + 1) as u64)
             .read_until(b'\n', &mut line)
         {
             Ok(0) => Ok(Command::Finish {}), // A disconnected supervisor stops new games.
-            Ok(_) if line.len() as u64 > MAX_COMMAND_BYTES => {
-                Err("control command exceeds 4096 bytes".into())
+            Ok(_) if line.len() > MAX_FRAME_BYTES => {
+                Err(format!("control command exceeds {MAX_FRAME_BYTES} bytes"))
             }
             Ok(_) => serde_json::from_slice(&line)
                 .map_err(|error| format!("invalid control command: {error}")),
@@ -190,7 +188,12 @@ async fn supervise_self_play(
                 command_result.map_err(|error| format!("control task failed: {error}"))??;
             }
             result = &mut pipeline => {
-                result.map_err(|error| format!("self-play failed: {error:?}"))?;
+                result.map_err(|error| match error {
+                    SelfPlayRunError::ModelLoadedEvent(error) => {
+                        format!("could not write model_loaded event: {error}")
+                    }
+                    error => format!("self-play failed: {error:?}"),
+                })?;
                 break;
             }
         }

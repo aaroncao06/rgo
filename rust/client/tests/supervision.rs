@@ -8,7 +8,7 @@ use rgo_protocol::{
 use std::{
     fs,
     net::SocketAddr,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
@@ -18,6 +18,7 @@ use tokio::{
     io::BufReader,
     net::TcpListener,
     process::{Child, Command},
+    sync::Notify,
     task::JoinHandle,
     time::{sleep, timeout},
 };
@@ -26,6 +27,7 @@ struct Server {
     address: SocketAddr,
     accepted: Arc<Mutex<Vec<String>>>,
     requests: Arc<Mutex<Vec<PathBuf>>>,
+    model_polled: Arc<Notify>,
     task: JoinHandle<()>,
 }
 
@@ -35,26 +37,39 @@ impl Server {
     }
 
     async fn start_with_delay(root: &Path, delay: Duration) -> Self {
-        Self::start_with_options(root, delay, false).await
+        Self::start_with_options(root, delay, Duration::ZERO, false).await
     }
 
-    async fn start_with_options(root: &Path, delay: Duration, lose_first_receipt: bool) -> Self {
+    async fn start_with_options(
+        root: &Path,
+        chunk_delay: Duration,
+        model_delay: Duration,
+        lose_first_receipt: bool,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let root = fs::canonicalize(root).unwrap();
         fs::create_dir_all(root.join("test-run/selfplay")).unwrap();
+        let has_models = root.join("models").is_dir();
         let accepted = Arc::new(Mutex::new(Vec::new()));
         let log = accepted.clone();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let request_log = requests.clone();
+        let model_polled = Arc::new(Notify::new());
+        let poll_notification = model_polled.clone();
         let task = tokio::spawn(async move {
             let mut model_polls = 0;
             let mut lose_receipt = lose_first_receipt;
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut stream = BufReader::new(stream);
-                while let Some(request) = rgo_protocol::read::<Request>(&mut stream).await.unwrap()
-                {
+                loop {
+                    let request = match rgo_protocol::read::<Request>(&mut stream).await {
+                        Ok(Some(request)) => request,
+                        Ok(None) => break,
+                        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => break,
+                        Err(error) => panic!("could not read client request: {error}"),
+                    };
                     let response = match request {
                         Request::Hello {
                             protocol_version: PROTOCOL_VERSION,
@@ -63,8 +78,13 @@ impl Server {
                             protocol_version: PROTOCOL_VERSION,
                             run_name: "test-run".into(),
                         },
+                        Request::GetLatestModel {} if !has_models => Response::Model { path: None },
                         Request::GetLatestModel {} => {
                             model_polls += 1;
+                            if !model_delay.is_zero() {
+                                sleep(model_delay).await;
+                            }
+                            poll_notification.notify_one();
                             let version = if lose_first_receipt {
                                 if lose_receipt { 42 } else { 43 }
                             } else if model_polls == 1 {
@@ -83,7 +103,7 @@ impl Server {
                         }
                         Request::SubmitChunk { path } => {
                             request_log.lock().unwrap().push(path.clone());
-                            sleep(delay).await;
+                            sleep(chunk_delay).await;
                             let name = path.file_name().unwrap().to_str().unwrap().to_owned();
                             let already_accepted = log.lock().unwrap().contains(&name);
                             if !already_accepted {
@@ -113,6 +133,7 @@ impl Server {
             address,
             accepted,
             requests,
+            model_polled,
             task,
         }
     }
@@ -173,7 +194,20 @@ fn start_client_with_budget(root: &Path, address: SocketAddr, script: &str, budg
 
 fn client_command(root: &Path, address: SocketAddr, script: &str, budget: u64) -> Command {
     let worker = root.join("worker.sh");
-    fs::write(&worker, format!("#!/bin/sh\noutput_dir=\"$2\"\n{script}\n")).unwrap();
+    fs::write(
+        &worker,
+        format!(
+            r#"#!/bin/sh
+output_dir="$2"
+model_loaded() {{
+  filename=${{1##*/}}
+  printf '{{"type":"model_loaded","version":%s}}\n' "${{filename%%.onnx*}}"
+}}
+{script}
+"#
+        ),
+    )
+    .unwrap();
     fs::set_permissions(&worker, fs::Permissions::from_mode(0o700)).unwrap();
     let worker_config = root.join("worker.toml");
     fs::write(&worker_config, "").unwrap();
@@ -238,6 +272,18 @@ fn worker_received_model(log_path: &Path, expected_path: &Path) -> bool {
         })
 }
 
+fn publish_model_fixtures(root: &Path) {
+    for name in [
+        "models/42.onnx",
+        "models/43.onnx",
+        "models-after-reconnect/43.onnx",
+    ] {
+        let path = root.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"model fixture").unwrap();
+    }
+}
+
 fn signal(client: &Child) {
     assert!(
         std::process::Command::new("kill")
@@ -259,6 +305,7 @@ async fn status(client: &mut Child, root: &Path) -> std::process::ExitStatus {
 async fn recovers_pending_chunks_forwards_models_and_accepts_final_chunks_before_exit() {
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
+    publish_model_fixtures(&root);
     let server = Server::start(&root).await;
     let pending = chunk_path(&root.join("test-run/selfplay"), 1);
     fs::write(&pending, b"pending").unwrap();
@@ -288,6 +335,7 @@ while IFS= read -r command; do
   echo "$command" >> "$out/commands.log"
   case "$command" in
     *model_ready*)
+      model_loaded "$command"
       if [ ! -e "$out/made" ]; then
         echo live > "$out/{}"
         touch "$out/made"
@@ -307,7 +355,7 @@ exit 2
     );
     let mut client = start_client(&root, server.address, &script);
     let command_log = root.join("test-run/selfplay/commands.log");
-    let expected_path = root.join("models/43.onnx");
+    let expected_path = root.join("test-run/selfplay/models/43.onnx");
     wait_for(&mut client, || {
         worker_received_model(&command_log, &expected_path)
             && server.accepted.lock().unwrap().len() == 2
@@ -328,7 +376,7 @@ exit 2
         assert!(commands.iter().any(|command| matches!(
             command,
             rgo_protocol::selfplay::Command::ModelReady { path }
-                if path == &root.join(format!("models/{version}.onnx"))
+                if path == &root.join(format!("test-run/selfplay/models/{version}.onnx"))
         )));
     }
     assert!(matches!(
@@ -345,6 +393,124 @@ exit 2
             .to_owned())
     );
     assert_eq!(fs::read(other_pending).unwrap(), b"other-run pending");
+}
+
+#[tokio::test]
+async fn model_links_survive_pruning_and_are_reused_on_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    publish_model_fixtures(&root);
+    let server = Server::start(&root).await;
+    // The first poll advertises a version already pruned from server storage.
+    fs::remove_file(root.join("models/42.onnx")).unwrap();
+    let source = root.join("models/43.onnx");
+    let selfplay_dir = root.join("test-run/selfplay");
+    let models = selfplay_dir.join("models");
+    fs::create_dir(&models).unwrap();
+    let previous = models.join("41.onnx");
+    fs::write(&previous, b"previous model").unwrap();
+    let current = models.join("43.onnx");
+    let command_log = selfplay_dir.join("model-command");
+    let script = r#"
+echo '{"type":"ready","protocol_version":1}'
+while IFS= read -r command; do
+  case "$command" in
+    *model_ready*)
+      printf '%s\n' "$command" > "$output_dir/model-command"
+      attempts=0
+      while [ ! -e "$output_dir/load-model" ]; do
+        attempts=$((attempts + 1))
+        [ "$attempts" -lt 500 ] || exit 7
+        sleep 0.01
+      done
+      [ -f "$output_dir/models/43.onnx" ] || exit 8
+      model_loaded "$command";;
+    *finish*) echo '{"type":"stopped"}'; exit 0;;
+  esac
+done
+exit 2
+"#;
+    let mut client = start_client_with_budget(&root, server.address, script, 5);
+    wait_for(&mut client, || {
+        worker_received_model(&command_log, &current)
+    })
+    .await;
+    assert!(
+        !previous.exists(),
+        "prune before announcing the replacement"
+    );
+    assert_eq!(
+        fs::metadata(&source).unwrap().ino(),
+        fs::metadata(&current).unwrap().ino()
+    );
+    fs::remove_file(source).unwrap();
+    // Consume the earlier poll notification while the worker is still waiting.
+    server.model_polled.notified().await;
+    fs::write(selfplay_dir.join("load-model"), b"").unwrap();
+    timeout(Duration::from_secs(5), server.model_polled.notified())
+        .await
+        .unwrap();
+    signal(&client);
+    assert!(status(&mut client, &root).await.success());
+    assert!(current.is_file());
+
+    // Reuse the complete local file when the same version is advertised.
+    fs::remove_file(&command_log).unwrap();
+    let mut client = start_client(&root, server.address, script);
+    wait_for(&mut client, || {
+        worker_received_model(&command_log, &current)
+    })
+    .await;
+    signal(&client);
+    assert!(status(&mut client, &root).await.success());
+    assert!(current.is_file());
+}
+
+#[tokio::test]
+async fn shutdown_interrupts_model_acquisition_and_submits_final_chunk() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    // Advertise a model path whose server-side link has already been removed.
+    fs::create_dir(root.join("models")).unwrap();
+    // Separate the acquisition deadline from the retry sleep's deadline.
+    let server =
+        Server::start_with_options(&root, Duration::ZERO, Duration::from_millis(150), false).await;
+    let chunk = chunk_path(&root.join("test-run/selfplay"), 1);
+    let event = serde_json::to_string(&rgo_protocol::selfplay::Event::ChunkReady {
+        path: chunk.clone(),
+        bytes: 5,
+        records: 1,
+    })
+    .unwrap();
+    let script = format!(
+        r#"
+echo '{{"type":"ready","protocol_version":1}}'
+while IFS= read -r command; do
+  case "$command" in
+    *finish*)
+      printf final > "$output_dir/{}"
+      printf '%s\n' '{event}'
+      echo '{{"type":"stopped"}}'
+      exit 0;;
+  esac
+done
+exit 2
+"#,
+        chunk.file_name().unwrap().to_str().unwrap(),
+    );
+    let mut client = start_client(&root, server.address, &script);
+    timeout(Duration::from_secs(5), server.model_polled.notified())
+        .await
+        .unwrap();
+    // Let the client receive the reply and reach its one-second retry sleep.
+    sleep(Duration::from_millis(50)).await;
+    signal(&client);
+    assert!(
+        status(&mut client, &root).await.success(),
+        "{}",
+        fs::read_to_string(root.join("client.log")).unwrap()
+    );
+    assert_eq!(*server.requests.lock().unwrap(), [chunk]);
 }
 
 #[tokio::test]
@@ -472,7 +638,8 @@ async fn refuses_recovery_while_previous_worker_owns_output() {
 async fn lost_chunk_receipt_reconnects_without_restarting_the_worker() {
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
-    let server = Server::start_with_options(&root, Duration::ZERO, true).await;
+    publish_model_fixtures(&root);
+    let server = Server::start_with_options(&root, Duration::ZERO, Duration::ZERO, true).await;
     let chunk = chunk_path(&root.join("test-run/selfplay"), 1);
     let event = serde_json::to_string(&rgo_protocol::selfplay::Event::ChunkReady {
         path: chunk.clone(),
@@ -489,6 +656,7 @@ while IFS= read -r command; do
   echo "$command" >> "$out/commands.log"
   case "$command" in
     *model_ready*)
+      model_loaded "$command"
       if [ ! -e "$out/made" ]; then
         touch "$out/made"
         echo live > "$out/{}"
@@ -509,11 +677,17 @@ exit 2
     })
     .await;
     let command_log = root.join("test-run/selfplay/commands.log");
-    let expected_path = root.join("models-after-reconnect/43.onnx");
+    let expected_path = root.join("test-run/selfplay/models/43.onnx");
     wait_for(&mut client, || {
         worker_received_model(&command_log, &expected_path)
     })
     .await;
+    assert_eq!(
+        fs::metadata(&expected_path).unwrap().ino(),
+        fs::metadata(root.join("models-after-reconnect/43.onnx"))
+            .unwrap()
+            .ino()
+    );
     assert_eq!(
         *server.requests.lock().unwrap(),
         [chunk.clone(), chunk.clone()]

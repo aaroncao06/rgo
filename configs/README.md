@@ -181,7 +181,7 @@ record fields are read directly from their packed bytes.
 Send one JSON command per line on stdin:
 
 ```json
-{"type":"model_ready","path":"data/run-a/server/models/42.onnx"}
+{"type":"model_ready","path":"data/run-a/selfplay/models/42.onnx"}
 {"type":"finish"}
 ```
 
@@ -197,7 +197,7 @@ through coordinated model handoff. The model must meet the
 
 `finish` stops new games, drains active games, and flushes pending chunks.
 Closing stdin requests the same graceful finish, including when no model has
-been announced. Commands are limited to 4,096 bytes including the newline;
+been announced. Commands are limited to 64 KiB including the newline;
 malformed JSON, unknown command types, and unknown fields are errors.
 
 Stdout contains newline-delimited JSON events. An illustrative sequence for a
@@ -205,11 +205,13 @@ Stdout contains newline-delimited JSON events. An illustrative sequence for a
 
 ```json
 {"type":"ready","protocol_version":1}
+{"type":"model_loaded","version":42}
 {"type":"chunk_ready","path":"/absolute/path/to/data/run-a/selfplay/chunk-00000000000000000000000000000001.rgo","bytes":47056,"records":200}
 {"type":"stopped"}
 ```
 
-`ready` means the control interface is ready, not that a model has loaded.
+`ready` means the control interface is ready. `model_loaded` follows successful
+initialization of all inference executors for the reported version.
 `chunk_ready` reports a fully published chunk, its byte size, and actual record
 count. Relative event paths are relative to the worker's working directory.
 `stopped` follows all final chunk events after a successful drain.

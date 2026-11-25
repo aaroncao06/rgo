@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use super::{
     chunk_writer::{ChunkWriter, ChunkWriterError},
     config::SelfPlayConfig,
-    control::EventPublisher,
+    control::{Event, EventPublisher},
     game_records::CompletedGame,
     worker::{SelfPlayError, WorkerModelControl},
 };
@@ -36,6 +36,7 @@ pub(super) enum SelfPlayRunError {
     WriterStopped,
     Task(tokio::task::JoinError),
     ModelLoad(ModelLoadError),
+    ModelLoadedEvent(std::io::Error),
     ModelSourceClosed,
     FinishSourceClosed,
     LatestModelCleared,
@@ -49,6 +50,7 @@ pub(super) struct SelfPlayOrchestrator {
     runtime_config: ModelRuntimeConfig,
     worker_groups: Vec<WorkerGroup>,
     writer: ChunkWriter,
+    events: EventPublisher,
     pause_tx: watch::Sender<bool>,
     paused_rx: mpsc::Receiver<()>,
     resume_txs: Vec<mpsc::Sender<ModelHandle>>,
@@ -106,7 +108,8 @@ impl SelfPlayOrchestrator {
         Self {
             runtime_config,
             worker_groups,
-            writer: ChunkWriter::new(chunk_mode, selfplay_dir, completed_games_rx, events),
+            writer: ChunkWriter::new(chunk_mode, selfplay_dir, completed_games_rx, events.clone()),
+            events,
             pause_tx,
             paused_rx,
             resume_txs,
@@ -182,6 +185,7 @@ async fn wait_for_first_model(
 /// model handoffs and the final drain.
 struct RunningPipeline {
     runtime_config: ModelRuntimeConfig,
+    events: EventPublisher,
     pause_tx: watch::Sender<bool>,
     latest_model_rx: watch::Receiver<Option<ModelFile>>,
     finish_games_rx: watch::Receiver<bool>,
@@ -206,6 +210,7 @@ impl RunningPipeline {
             runtime_config,
             worker_groups,
             writer,
+            events,
             pause_tx,
             paused_rx,
             resume_txs,
@@ -235,6 +240,7 @@ impl RunningPipeline {
 
         Ok(Self {
             runtime_config,
+            events,
             pause_tx,
             latest_model_rx,
             finish_games_rx,
@@ -346,6 +352,12 @@ impl RunningPipeline {
             .ok_or(SelfPlayRunError::LatestModelCleared)?;
         let new_model = load_model(model_file.version, &model_file.path, &self.runtime_config)
             .map_err(SelfPlayRunError::ModelLoad)?;
+        self.events
+            .emit(Event::ModelLoaded {
+                version: model_file.version,
+            })
+            .await
+            .map_err(SelfPlayRunError::ModelLoadedEvent)?;
         let _ = self.pause_tx.send(false);
         for resume_tx in &self.resume_txs {
             if !resume_tx.is_closed() {
@@ -686,17 +698,23 @@ mod tests {
     }
 
     struct BlockingFlush {
+        event: Vec<u8>,
         reached: Option<oneshot::Sender<()>>,
         release: std::sync::mpsc::Receiver<()>,
     }
 
     impl std::io::Write for BlockingFlush {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.event.extend_from_slice(bytes);
             Ok(bytes.len())
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
-            if let Some(reached) = self.reached.take() {
+            let event: Event = serde_json::from_slice(&self.event).unwrap();
+            self.event.clear();
+            if matches!(event, Event::ChunkReady { .. })
+                && let Some(reached) = self.reached.take()
+            {
                 let _ = reached.send(());
                 let _ = self.release.recv();
             }
@@ -716,6 +734,7 @@ mod tests {
                 1,
                 1,
                 EventPublisher::with_output(BlockingFlush {
+                    event: Vec::new(),
                     reached: Some(reached_tx),
                     release: release_rx,
                 }),

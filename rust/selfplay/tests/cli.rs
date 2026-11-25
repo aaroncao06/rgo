@@ -28,6 +28,7 @@ fn help_and_usage_do_not_start_self_play() {
 #[cfg(unix)]
 mod unix {
     use super::*;
+    use rgo_protocol::MAX_FRAME_BYTES;
     use sha2::{Digest, Sha256};
     use std::{
         fs,
@@ -219,7 +220,9 @@ mod unix {
         let fixture =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../engine/tests/data/v0.onnx");
         fs::copy(fixture, run.dir.join("42.onnx")).unwrap();
-        run.send(r#"{"type":"model_ready","path":"42.onnx"}"#);
+        let command = r#"{"type":"model_ready","path":"42.onnx"}"#;
+        // Include the newline added by send in the shared limit.
+        run.send(&format!("{command:width$}", width = MAX_FRAME_BYTES - 1));
         run.until(|run| {
             run.events()
                 .iter()
@@ -274,6 +277,14 @@ mod unix {
         assert!(run.finish().success(), "{}", run.log());
         let events = run.events();
         assert_eq!(events.last().unwrap()["type"], "stopped");
+        let loaded: Vec<_> = events
+            .iter()
+            .filter(|event| event["type"] == "model_loaded")
+            .collect();
+        assert_eq!(
+            loaded,
+            [&serde_json::json!({"type": "model_loaded", "version": 42})]
+        );
         let chunks: Vec<_> = events
             .iter()
             .filter(|event| event["type"] == "chunk_ready")
@@ -350,7 +361,7 @@ mod unix {
                 r#"{"type":"model_ready","path":"models/not-a-model.onnx"}"#.into(),
                 "invalid canonical model filename",
             ),
-            ("x".repeat(4097), "control command exceeds 4096 bytes"),
+            ("x".repeat(MAX_FRAME_BYTES), "control command exceeds"),
         ] {
             let mut run = TestProcess::worker(None);
             run.ready();

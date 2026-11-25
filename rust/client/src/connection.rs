@@ -103,13 +103,20 @@ async fn read_response(stream: &mut BufReader<TcpStream>) -> io::Result<Response
     }
 }
 
+/// Start at one second, then double each delay up to 30 seconds.
+pub(crate) fn next_retry_delay(previous: Duration) -> Duration {
+    previous
+        .saturating_mul(2)
+        .clamp(Duration::from_secs(1), Duration::from_secs(30))
+}
+
 async fn retry<T>(
     attempt_timeout: Duration,
     budget: Duration,
     mut attempt: impl AsyncFnMut() -> io::Result<T>,
 ) -> io::Result<T> {
     let deadline = Instant::now() + budget;
-    let mut delay = Duration::from_secs(1);
+    let mut delay = Duration::ZERO;
     loop {
         let attempt_deadline = deadline.min(Instant::now() + attempt_timeout);
         let error = match timeout_at(attempt_deadline, attempt()).await {
@@ -139,6 +146,7 @@ async fn retry<T>(
                 format!("server retry budget expired: {error}"),
             ));
         }
+        delay = next_retry_delay(delay);
         eprintln!(
             "rgo-client: {error}; retrying in {} seconds",
             delay.as_secs()
@@ -149,7 +157,6 @@ async fn retry<T>(
                 format!("server retry budget expired: {error}"),
             ));
         }
-        delay = (delay * 2).min(Duration::from_secs(30));
     }
 }
 

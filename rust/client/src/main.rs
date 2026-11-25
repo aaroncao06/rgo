@@ -1,5 +1,6 @@
 mod config;
 mod connection;
+mod model_cache;
 mod supervisor;
 
 use rgo_protocol::client_server::{Request, Response};

@@ -1,7 +1,11 @@
 //! Child ownership, durable chunk notifications, model updates, and shutdown.
 
-use crate::{config::Config, connection::Connection};
-use rgo_artifacts::chunk_id_from_filename;
+use crate::{
+    config::Config,
+    connection::{Connection, next_retry_delay},
+    model_cache::ModelCache,
+};
+use rgo_artifacts::{ModelVersion, chunk_id_from_filename, model_version_from_filename};
 use rgo_protocol::{
     PROTOCOL_VERSION, ShutdownSignals,
     client_server::{Request, Response},
@@ -10,7 +14,10 @@ use rgo_protocol::{
 use std::{
     fs::{self, File},
     io,
+    path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
+    time::Duration,
 };
 use tokio::{
     io::{AsyncWrite, BufReader},
@@ -21,7 +28,7 @@ use tokio::{
 };
 
 /// Submit one completed local chunk and wait for the server's acceptance receipt.
-async fn submit_chunk(connection: &mut Connection<'_>, path: &std::path::Path) -> io::Result<()> {
+async fn submit_chunk(connection: &mut Connection<'_>, path: &Path) -> io::Result<()> {
     match connection
         .request(&Request::SubmitChunk { path: path.into() })
         .await?
@@ -37,16 +44,49 @@ async fn submit_chunk(connection: &mut Connection<'_>, path: &std::path::Path) -
     }
 }
 
+/// Poll again if a newer publication removed the advertised server name.
+async fn acquire_latest_model(
+    connection: &mut Connection<'_>,
+    models: &Arc<ModelCache>,
+    loaded: Option<ModelVersion>,
+) -> io::Result<Option<(ModelVersion, PathBuf)>> {
+    let mut delay = Duration::ZERO;
+    loop {
+        let source = match connection.request(&Request::GetLatestModel {}).await? {
+            Response::Model { path: Some(path) } => path,
+            Response::Model { path: None } => return Ok(None),
+            Response::Error { message } => return Err(io::Error::other(message)),
+            _ => return Err(io::Error::other("invalid model response")),
+        };
+        let version = source
+            .file_name()
+            .filter(|_| source.is_absolute())
+            .and_then(model_version_from_filename)
+            .ok_or_else(|| io::Error::other(format!("invalid model path: {}", source.display())))?;
+        if loaded.is_some_and(|current| version <= current) {
+            return Ok(None);
+        }
+        if let Some(path) = models.acquire(source, version).await? {
+            return Ok(Some((version, path)));
+        }
+        delay = next_retry_delay(delay);
+        time::sleep(delay).await;
+    }
+}
+
 /// Handle worker events and model polls on one server connection.
 /// A request finishes or exhausts its retries before this loop handles another.
 async fn run_supervision_loop(
     mut connection: Connection<'_>,
     mut events: mpsc::Receiver<io::Result<Event>>,
     commands: mpsc::Sender<Command>,
-    finishing: watch::Receiver<bool>,
+    mut finishing: watch::Receiver<bool>,
+    models: &Arc<ModelCache>,
     config: &Config,
 ) -> io::Result<()> {
     let mut ready = false;
+    let mut pending = None;
+    let mut loaded = None;
     let mut poll = time::interval(config.poll_interval());
     poll.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     loop {
@@ -55,23 +95,35 @@ async fn run_supervision_loop(
                 Event::Ready { protocol_version } if !ready && protocol_version == PROTOCOL_VERSION => {
                     ready = true;
                 }
+                Event::ModelLoaded { version } if pending == Some(version) => {
+                    loaded = pending.take();
+                }
                 Event::ChunkReady { path, .. } if ready => submit_chunk(&mut connection, &path).await?,
                 Event::Stopped if ready => return Ok(()),
                 Event::Error { message } => return Err(io::Error::other(format!("self-play failed: {message}"))),
                 event => return Err(io::Error::other(format!("unexpected worker event: {event:?}"))),
             },
-            _ = poll.tick(), if ready && !*finishing.borrow() => {
-                let path = match connection.request(&Request::GetLatestModel {}).await? {
-                    Response::Model { path } => path,
-                    Response::Error { message } => return Err(io::Error::other(message)),
-                    _ => return Err(io::Error::other("invalid model response")),
+            // Poll when the worker is ready, no load is pending, and shutdown hasn't begun.
+            _ = poll.tick(), if ready && pending.is_none() && !*finishing.borrow() => {
+                // Look up and cache the latest model, stopping the wait on shutdown or timeout.
+                let deadline = time::Instant::now() + config.retry_timeout();
+                let model = tokio::select! {
+                    biased;
+                    changed = finishing.changed() => {
+                        changed.map_err(|_| io::Error::other("supervisor stopped"))?;
+                        continue;
+                    }
+                    _ = time::sleep_until(deadline) => return Err(io::Error::new(
+                        io::ErrorKind::TimedOut, "model acquisition retry budget expired"
+                    )),
+                    result = acquire_latest_model(&mut connection, models, loaded) => result?,
                 };
-                // Shutdown may have begun while the model request was in flight.
-                if let Some(path) = path && !*finishing.borrow()
-                    && commands.send(Command::ModelReady { path }).await.is_err()
-                    && !*finishing.borrow()
-                {
-                    return Err(io::Error::other("worker command writer closed"));
+                // Queue the cached path and mark its version pending until ModelLoaded.
+                if let Some((version, path)) = model {
+                    commands
+                        .try_send(Command::ModelReady { path })
+                        .map_err(io::Error::other)?;
+                    pending = Some(version);
                 }
             }
         }
@@ -112,13 +164,13 @@ pub async fn run(config: &Config) -> io::Result<()> {
     // client cannot submit its files at the same time.
     let selfplay_dir =
         rgo_fs::prepare_directory(&config.data_dir.join(connection.run_name()).join("selfplay"))?;
-    let _client_lock = File::options()
+    let client_lock = File::options()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(selfplay_dir.join(".client.lock"))?;
-    _client_lock.try_lock().map_err(|error| {
+    client_lock.try_lock().map_err(|error| {
         io::Error::other(format!(
             "client output directory is already supervised: {error}"
         ))
@@ -159,6 +211,8 @@ pub async fn run(config: &Config) -> io::Result<()> {
         signal = signals.recv() => { signal?; return Ok(()); }
         result = recovery => result?,
     }
+    let model_dir = rgo_fs::prepare_directory(&selfplay_dir.join("models"))?;
+    let (models, cache_closed) = ModelCache::new(model_dir, client_lock);
     // Start the worker with the self-play directory used for recovery.
     // Configured relative binary paths use the client's working directory.
     let binary = match &config.selfplay_binary {
@@ -216,7 +270,14 @@ pub async fn run(config: &Config) -> io::Result<()> {
     let result = {
         let session = async {
             tokio::try_join!(
-                run_supervision_loop(connection, events_rx, commands_tx, finish_rx, config),
+                run_supervision_loop(
+                    connection,
+                    events_rx,
+                    commands_tx,
+                    finish_rx,
+                    &models,
+                    config
+                ),
                 async {
                     let status = child.wait().await?;
                     if status.success() {
@@ -251,5 +312,16 @@ pub async fn run(config: &Config) -> io::Result<()> {
     if child.try_wait()?.is_none() {
         child.kill().await?;
     }
-    result
+    result?;
+
+    // A running cache operation can outlive the worker and still hold the lock.
+    drop(models);
+    tokio::select! {
+        biased;
+        _ = cache_closed => Ok(()),
+        signal = signals.recv() => {
+            signal?;
+            Err(io::Error::other("second shutdown signal; forcing client exit"))
+        }
+    }
 }

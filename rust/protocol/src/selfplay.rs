@@ -18,6 +18,9 @@ pub enum Event {
     Ready {
         protocol_version: u32,
     },
+    ModelLoaded {
+        version: u64,
+    },
     ChunkReady {
         path: PathBuf,
         // No production consumer yet; retained for possible client logging or
