@@ -53,7 +53,6 @@ final filename without overwriting an existing model, and syncs its directory
 on POSIX. ONNX Runtime is a development dependency used to test numerical
 agreement with PyTorch. The Rust server invokes this helper synchronously on
 its storage worker after accepting an eligible checkpoint and during recovery.
-Checkpoint acceptance replies after any due export finishes. It uses the project's
-`.venv` interpreter and `python/` source directory from the repository root;
-only publication cadence is configured under `[model_export]`. Old-model pruning
-remains deferred.
+Checkpoint acceptance replies after any due export and server model cleanup.
+The server uses the project's `.venv` interpreter and `python/` source directory
+from the repository root. Configure publication cadence under `[model_export]`.

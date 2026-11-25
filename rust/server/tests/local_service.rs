@@ -210,13 +210,18 @@ async fn checkpoint_acceptance_exports_in_order_and_recovers_the_cadence() {
     let mut stream = connect(address).await;
     submit_checkpoint(&mut stream, &base, -1).await;
     let models = base.join("test-run/server/models");
-    assert!(models.join("0.onnx").exists()); // Export finishes before acceptance replies.
+    let cached_model = base.join("test-run/selfplay/models/0.onnx");
+    fs::create_dir_all(cached_model.parent().unwrap()).unwrap();
+    // Export finishes before acceptance replies, so the client can pin version 0.
+    fs::hard_link(models.join("0.onnx"), &cached_model).unwrap();
     for index in [0, 1, 3] {
         submit_checkpoint(&mut stream, &base, index).await;
     }
     let checkpoints = base.join("test-run/server/checkpoints");
     wait_for_model(&mut stream, &models.join("4.onnx")).await;
-    assert_eq!(fs::read(models.join("0.onnx")).unwrap(), b"checkpoint -1");
+    assert!(!models.join("0.onnx").exists());
+    assert!(!models.join("2.onnx").exists());
+    assert_eq!(fs::read(&cached_model).unwrap(), b"checkpoint -1");
     assert_eq!(fs::read(models.join("4.onnx")).unwrap(), b"checkpoint 3");
     for index in [-1, 0, 1] {
         assert!(!checkpoints.join(format!("{index}.pt")).exists());
@@ -241,6 +246,7 @@ async fn checkpoint_acceptance_exports_in_order_and_recovers_the_cadence() {
     assert!(checkpoints.join("4.pt").exists());
     submit_checkpoint(&mut stream, &base, 5).await;
     wait_for_model(&mut stream, &models.join("6.onnx")).await;
+    assert!(!models.join("4.onnx").exists());
     assert!(!checkpoints.join("3.pt").exists());
     assert!(!checkpoints.join("4.pt").exists());
     assert!(checkpoints.join("5.pt").exists());
@@ -280,6 +286,7 @@ async fn disabling_checkpoint_pruning_keeps_history_after_exports_and_restart() 
     wait_for_model(&mut stream, &base.join("test-run/server/models/0.onnx")).await;
     submit_checkpoint(&mut stream, &base, 1).await;
     wait_for_model(&mut stream, &base.join("test-run/server/models/2.onnx")).await;
+    assert!(!base.join("test-run/server/models/0.onnx").exists());
     assert!(base.join("test-run/server/checkpoints/-1.pt").exists());
     drop(stream);
     stop(&mut server).await;
@@ -343,16 +350,18 @@ async fn export_failure_stops_the_server_and_restart_recovers_publication() {
     let temp = tempfile::tempdir().unwrap();
     let base = fs::canonicalize(temp.path()).unwrap();
     let config = export_test_config(&base);
-    fs::write(base.join("pause"), b"").unwrap();
-    fs::write(base.join("fail"), b"").unwrap();
     let (mut server, address) = start(&config).await;
     let mut stream = connect(address).await;
-    send_checkpoint(&mut stream, &base, -1).await;
+    submit_checkpoint(&mut stream, &base, -1).await;
+    let models = base.join("test-run/server/models");
+    fs::write(base.join("pause"), b"").unwrap();
+    fs::write(base.join("fail"), b"").unwrap();
+    send_checkpoint(&mut stream, &base, 1).await;
     wait_for_path(&base.join("started")).await;
     let mut observer = connect(address).await;
     assert!(matches!(
         request(&mut observer, Request::GetLatestModel {}).await,
-        Response::Model { path: None }
+        Response::Model { path: Some(path) } if path == models.join("0.onnx")
     ));
     // Model the helper exiting after final publication but before success.
     fs::write(base.join("release"), b"").unwrap();
@@ -363,27 +372,28 @@ async fn export_failure_stops_the_server_and_restart_recovers_publication() {
             .unwrap()
             .success()
     );
+    assert!(models.join("0.onnx").exists());
     drop(stream);
     drop(observer);
     fs::remove_file(base.join("fail")).unwrap();
-    let models = base.join("test-run/server/models");
     let (mut server, address) = start(&config).await;
     let mut stream = connect(address).await;
-    wait_for_model(&mut stream, &models.join("0.onnx")).await;
+    wait_for_model(&mut stream, &models.join("2.onnx")).await;
+    assert!(!models.join("0.onnx").exists());
     drop(stream);
     stop(&mut server).await;
     assert_eq!(
         fs::read_to_string(base.join("exports")).unwrap(),
-        "0.onnx\n"
+        "0.onnx\n2.onnx\n"
     );
 
     // Model interruption before final publication. Reuse the accepted weights
     // and export again without another trainer submission.
-    fs::remove_file(models.join("0.onnx")).unwrap();
+    fs::remove_file(models.join("2.onnx")).unwrap();
     let (mut server, address) = start(&config).await;
     let mut stream = connect(address).await;
-    wait_for_model(&mut stream, &models.join("0.onnx")).await;
-    assert_eq!(fs::read(models.join("0.onnx")).unwrap(), b"checkpoint -1");
+    wait_for_model(&mut stream, &models.join("2.onnx")).await;
+    assert_eq!(fs::read(models.join("2.onnx")).unwrap(), b"checkpoint 1");
     drop(stream);
     stop(&mut server).await;
 }

@@ -1,4 +1,4 @@
-//! Directory creation and synchronization.
+//! Shared filesystem operations.
 
 use std::{
     fs, io,
@@ -16,6 +16,18 @@ pub fn sync_directory(path: &Path) -> io::Result<()> {
     {
         let _ = path;
         Ok(())
+    }
+}
+
+/// Remove a file, deferring deletion if Windows reports a sharing violation.
+/// The caller can retry it during the next cleanup pass.
+pub fn remove_file_unless_busy(path: &Path) -> io::Result<()> {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    match fs::remove_file(path) {
+        Err(error) if cfg!(windows) && error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
+            Ok(())
+        }
+        result => result,
     }
 }
 

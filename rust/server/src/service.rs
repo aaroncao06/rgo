@@ -49,6 +49,9 @@ impl StorageState {
         let checkpoints = CheckpointStore::open(root.join("checkpoints"), checkpoint_config)?;
         let models = root.join("models");
         let latest_model_version = scan_latest_model(&models)?;
+        if let Some(version) = latest_model_version {
+            prune_older_models(&models, version)?;
+        }
         let mut state = Self {
             replay,
             checkpoints,
@@ -98,8 +101,9 @@ impl StorageState {
             .expect("latest checkpoint exists");
         self.failed = true;
         model_export::export_checkpoint(&checkpoint, &model_path(&self.models, version))?;
-        // The helper already synced and published the final filename.
+        // Advertise the durable replacement before removing any previous path.
         self.latest_model_version.send_replace(Some(version));
+        prune_older_models(&self.models, version)?;
         self.failed = false;
         Ok(())
     }
@@ -221,6 +225,18 @@ fn scan_latest_model(models: &Path) -> io::Result<Option<ModelVersion>> {
         sync_directory(models)?;
     }
     Ok(latest_model_version)
+}
+
+fn prune_older_models(models: &Path, latest: ModelVersion) -> io::Result<()> {
+    for entry in fs::read_dir(models)? {
+        let entry = entry?;
+        if model_version_from_filename(&entry.file_name()).is_some_and(|version| version < latest)
+            && entry.file_type()?.is_file()
+        {
+            rgo_fs::remove_file_unless_busy(&entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 fn require_regular_model_file(path: &Path) -> io::Result<()> {
@@ -732,6 +748,17 @@ mod tests {
         let state =
             open_storage(&root, replay_config(), CheckpointConfig::default(), true).unwrap();
         assert_eq!(*state.latest_model_version.borrow(), Some(10));
+        assert!(!model_path(&state.models, 1).exists());
+        assert!(!model_path(&state.models, 9).exists());
+        for name in [
+            "10.onnx",
+            "10.onnx.tmp",
+            "100.onnx.tmp",
+            "notes.onnx",
+            "0100.onnx",
+        ] {
+            assert!(state.models.join(name).is_file(), "{name}");
+        }
         assert!(!state.models.join("latest.json").exists());
     }
 
@@ -744,15 +771,18 @@ mod tests {
         let state =
             open_storage(&root, replay_config(), CheckpointConfig::default(), true).unwrap();
         let models = state.models.clone();
+        fs::write(model_path(&models, 0), b"previous model").unwrap();
         fs::write(model_path(&models, 1), b"published before interruption").unwrap();
         drop(state);
         let fault = faults::inject([(Operation::Sync, models.clone())]);
         assert!(open_storage(&root, replay_config(), CheckpointConfig::default(), true).is_err());
         assert!(model_path(&models, 1).exists());
+        assert!(model_path(&models, 0).exists());
         drop(fault);
         let state =
             open_storage(&root, replay_config(), CheckpointConfig::default(), true).unwrap();
         assert_eq!(*state.latest_model_version.borrow(), Some(1));
+        assert!(!model_path(&models, 0).exists());
     }
 
     #[test]
@@ -786,6 +816,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(*state.latest_model_version.borrow(), Some(2));
+        assert!(model_path(&state.models, 1).is_dir());
     }
 
     #[cfg(unix)]

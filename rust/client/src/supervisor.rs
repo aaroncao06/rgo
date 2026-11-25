@@ -3,7 +3,7 @@
 use crate::{
     config::Config,
     connection::{Connection, next_retry_delay},
-    model_cache::ModelCache,
+    model_cache::{ModelAcquisition, ModelCache},
 };
 use rgo_artifacts::{ModelVersion, chunk_id_from_filename, model_version_from_filename};
 use rgo_protocol::{
@@ -47,30 +47,47 @@ async fn submit_chunk(connection: &mut Connection<'_>, path: &Path) -> io::Resul
 /// Poll again if a newer publication removed the advertised server name.
 async fn acquire_latest_model(
     connection: &mut Connection<'_>,
-    models: &Arc<ModelCache>,
     loaded: Option<ModelVersion>,
+    mut acquire: impl AsyncFnMut(PathBuf, ModelVersion) -> io::Result<ModelAcquisition>,
 ) -> io::Result<Option<(ModelVersion, PathBuf)>> {
     let mut delay = Duration::ZERO;
+    let mut denied_link = None;
     loop {
         let source = match connection.request(&Request::GetLatestModel {}).await? {
-            Response::Model { path: Some(path) } => path,
-            Response::Model { path: None } => return Ok(None),
+            Response::Model { path } => path,
             Response::Error { message } => return Err(io::Error::other(message)),
             _ => return Err(io::Error::other("invalid model response")),
+        };
+        let Some(source) = source else {
+            return match denied_link {
+                Some((_, error)) => Err(error),
+                None => Ok(None),
+            };
         };
         let version = source
             .file_name()
             .filter(|_| source.is_absolute())
             .and_then(model_version_from_filename)
             .ok_or_else(|| io::Error::other(format!("invalid model path: {}", source.display())))?;
+        if let Some((denied_version, error)) = denied_link.take()
+            && version <= denied_version
+        {
+            return Err(error);
+        }
         if loaded.is_some_and(|current| version <= current) {
             return Ok(None);
         }
-        if let Some(path) = models.acquire(source, version).await? {
-            return Ok(Some((version, path)));
+        match acquire(source, version).await? {
+            ModelAcquisition::Cached(path) => return Ok(Some((version, path))),
+            ModelAcquisition::SourceMissing => {
+                delay = next_retry_delay(delay);
+                time::sleep(delay).await;
+            }
+            ModelAcquisition::LinkAccessDenied(error) => {
+                // Check for a replacement before treating the denial as a pruning race.
+                denied_link = Some((version, error));
+            }
         }
-        delay = next_retry_delay(delay);
-        time::sleep(delay).await;
     }
 }
 
@@ -116,7 +133,9 @@ async fn run_supervision_loop(
                     _ = time::sleep_until(deadline) => return Err(io::Error::new(
                         io::ErrorKind::TimedOut, "model acquisition retry budget expired"
                     )),
-                    result = acquire_latest_model(&mut connection, models, loaded) => result?,
+                    result = acquire_latest_model(&mut connection, loaded, async |source, version| {
+                        models.acquire(source, version).await
+                    }) => result?,
                 };
                 // Queue the cached path and mark its version pending until ModelLoaded.
                 if let Some((version, path)) = model {
@@ -322,6 +341,83 @@ pub async fn run(config: &Config) -> io::Result<()> {
         signal = signals.recv() => {
             signal?;
             Err(io::Error::other("second shutdown signal; forcing client exit"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rgo_artifacts::model_path;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn denied_model_link_is_retried_only_if_the_version_advanced() {
+        for replacement in [Some(43), Some(42), Some(41), None] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = model_path(directory.path(), 42);
+            let newer_source = replacement.map(|version| model_path(directory.path(), version));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let config = Config {
+                server: listener.local_addr().unwrap(),
+                client_id: "test".into(),
+                data_dir: directory.path().into(),
+                selfplay_config: "unused.toml".into(),
+                selfplay_binary: None,
+                model_poll_interval_ms: 10,
+                request_timeout_secs: 2,
+                retry_timeout_secs: 2,
+            };
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let hello = rgo_protocol::read::<Request>(&mut stream).await.unwrap();
+                assert!(matches!(hello, Some(Request::Hello { .. })));
+                rgo_protocol::write(
+                    stream.get_mut(),
+                    &Response::Welcome {
+                        protocol_version: PROTOCOL_VERSION,
+                        run_name: "test".into(),
+                    },
+                )
+                .await
+                .unwrap();
+                for path in [Some(source), newer_source] {
+                    let request = rgo_protocol::read::<Request>(&mut stream).await.unwrap();
+                    assert!(matches!(request, Some(Request::GetLatestModel {})));
+                    rgo_protocol::write(stream.get_mut(), &Response::Model { path })
+                        .await
+                        .unwrap();
+                }
+            });
+
+            let mut connection = Connection::open(&config).await.unwrap();
+            let mut attempts = Vec::new();
+            let result = acquire_latest_model(&mut connection, None, async |path, version| {
+                attempts.push(version);
+                if version == 42 {
+                    Ok(ModelAcquisition::LinkAccessDenied(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "original hard-link error",
+                    )))
+                } else {
+                    Ok(ModelAcquisition::Cached(path))
+                }
+            })
+            .await;
+            if replacement == Some(43) {
+                assert_eq!(attempts, [42, 43]);
+                assert_eq!(
+                    result.unwrap(),
+                    Some((43, model_path(directory.path(), 43)))
+                );
+            } else {
+                assert_eq!(attempts, [42]);
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                assert_eq!(error.to_string(), "original hard-link error");
+            }
+            server.await.unwrap();
         }
     }
 }

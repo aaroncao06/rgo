@@ -41,11 +41,11 @@ server owns `replay/`, `models/`, `shards/`, and `checkpoints/`. Models use
 atomically publishes its final filename without replacement, and syncs the
 models directory before the server updates its shared model snapshot.
 Startup recovers the highest numeric version from canonical final filenames,
-including completed exports interrupted before an in-memory update. Temporary files and
-other filenames are ignored. Only the highest selected model is checked for
-being a regular file; startup syncs its directory before serving it. Invalid
-older entries do not prevent startup. No separate
-publication marker is stored.
+including completed exports interrupted before an in-memory update. It validates
+that model and syncs its directory before pruning older regular model files.
+During a run, the server advertises the new model before pruning older versions.
+Temporary files and other filenames are ignored. On Windows, a sharing violation
+defers that file's removal until the next publication or startup.
 Final models remain immutable. The self-play worker validates their ONNX contract
 when loading; the Rust server does not load ONNX graphs.
 
@@ -66,8 +66,9 @@ available throughout export.
 Chunk acceptance and sampling wait during export, while greetings and model
 polls remain responsive on the async runtime. Startup checks the latest accepted
 checkpoint for an export interrupted before publication. `CheckpointAccepted`
-confirms durable acceptance and completion of any due export. Clients discover
-published models through their ordinary polls. Old ONNX files are not pruned yet.
+confirms durable acceptance and completion of any due export and model cleanup.
+Clients discover published models through their ordinary polls and use their own
+hard links to keep models available during handoff.
 
 The [shared protocol](../protocol/src/client_server.rs) defines requests for chunk
 acceptance, checkpoint handoff and lookup, model lookup, indexed shard

@@ -1,7 +1,7 @@
 //! Client-owned links to immutable models within the selected run.
 
 use rgo_artifacts::{ModelVersion, model_path, model_version_from_filename};
-use rgo_fs::sync_directory;
+use rgo_fs::{remove_file_unless_busy, sync_directory};
 use std::{
     fs::{self, File},
     io::{self, ErrorKind},
@@ -9,6 +9,12 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::oneshot;
+
+pub enum ModelAcquisition {
+    Cached(PathBuf),
+    SourceMissing,
+    LinkAccessDenied(io::Error),
+}
 
 pub struct ModelCache {
     directory: PathBuf,
@@ -33,7 +39,7 @@ impl ModelCache {
         self: &Arc<Self>,
         source: PathBuf,
         version: ModelVersion,
-    ) -> io::Result<Option<PathBuf>> {
+    ) -> io::Result<ModelAcquisition> {
         self.run_blocking(move |directory| acquire(directory, &source, version))
             .await
     }
@@ -49,8 +55,8 @@ impl ModelCache {
 
 /// Reuse or acquire the version before giving the worker its local path.
 /// Published models are regular, self-contained `.onnx` files with embedded weights.
-/// A missing source may have been pruned since the server returned its path.
-fn acquire(directory: &Path, source: &Path, version: ModelVersion) -> io::Result<Option<PathBuf>> {
+fn acquire(directory: &Path, source: &Path, version: ModelVersion) -> io::Result<ModelAcquisition> {
+    const ERROR_ACCESS_DENIED: i32 = 5;
     let local = model_path(directory, version);
     match fs::symlink_metadata(&local) {
         Ok(metadata) if metadata.is_file() => {}
@@ -62,29 +68,30 @@ fn acquire(directory: &Path, source: &Path, version: ModelVersion) -> io::Result
         }
         Err(error) if error.kind() == ErrorKind::NotFound => match fs::hard_link(source, &local) {
             Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Ok(ModelAcquisition::SourceMissing);
+            }
+            // Windows can deny a new hard link while the source is being deleted.
+            Err(error) if cfg!(windows) && error.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
+                return Ok(ModelAcquisition::LinkAccessDenied(error));
+            }
             Err(error) => return Err(error),
         },
         Err(error) => return Err(error),
     }
     // Make the replacement durable before removing older links.
     sync_directory(directory)?;
-    prune_older(directory, version)?;
-    Ok(Some(local))
+    prune_older_model_links(directory, version)?;
+    Ok(ModelAcquisition::Cached(local))
 }
 
-fn prune_older(directory: &Path, current: ModelVersion) -> io::Result<()> {
-    const ERROR_SHARING_VIOLATION: i32 = 32;
+fn prune_older_model_links(directory: &Path, acquired_version: ModelVersion) -> io::Result<()> {
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
-        if model_version_from_filename(&entry.file_name()).is_some_and(|version| version < current)
+        if model_version_from_filename(&entry.file_name())
+            .is_some_and(|version| version < acquired_version)
         {
-            match fs::remove_file(entry.path()) {
-                // A subsequent acquisition sweeps older links again.
-                Err(error)
-                    if cfg!(windows) && error.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {}
-                result => result?,
-            }
+            remove_file_unless_busy(&entry.path())?;
         }
     }
     Ok(())
@@ -161,12 +168,12 @@ fn retries_a_busy_model_link_on_the_next_sweep() {
         .share_mode(0)
         .open(&busy)
         .unwrap();
-    prune_older(directory, 3).unwrap();
+    prune_older_model_links(directory, 3).unwrap();
     assert!(!other.exists());
     drop(handle);
     assert!(busy.is_file());
 
-    prune_older(directory, 3).unwrap();
+    prune_older_model_links(directory, 3).unwrap();
     assert!(!busy.exists());
     assert!(current.is_file());
 }
