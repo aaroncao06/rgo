@@ -31,8 +31,8 @@ The planned responsibilities are:
   transfers. The server assigns work to the client; the client manages execution
   on its hardware.
 - **Compute workers:** self-play consumes ONNX models and produces training
-  chunks; a Python trainer consumes sampled shards and produces resumable
-  checkpoints and exported models. Both use local files and lifecycle controls.
+  chunks. A Python trainer consumes sampled shards and produces resumable
+  checkpoints. Both use local files and lifecycle controls.
   Clients provide shared paths locally or stage downloaded artifacts remotely.
 
 Initially, one client would train a model at a time while other clients generate
@@ -99,8 +99,8 @@ only in tests.
 
 ## Run the local pipeline
 
-After building, start the server and client from the repository root in
-separate terminals:
+After building, run `uv sync --locked` from the repository root to prepare
+the server's Python environment. Start the server and client in separate terminals:
 
 ```sh
 rust/target/release/rgo-server configs/server.toml
@@ -110,12 +110,9 @@ rust/target/release/rgo-client configs/client.toml
 The example configs share the `data/` storage root. The server config selects
 `run-a` and stores its files in `data/run-a/server/`. The client learns the run
 name from the server, then recovers pending chunks and starts self-play in
-`data/run-a/selfplay/`.
-The worker waits until a model is available. To add the first model, stop the
-client, durably publish a complete immutable ONNX model at a canonical path
-such as `data/run-a/server/models/42.onnx` (see [server usage](rust/server/README.md)), then
-restart the server and client. The server discovers the highest version on
-startup; a client left running would wait until its next model poll.
+`data/run-a/selfplay/`. On a fresh run, the server initializes a dummy-model
+checkpoint and publishes its ONNX model before announcing readiness. The
+client picks it up on its first poll. See [server usage](rust/server/README.md).
 The client can query replay statistics:
 
 ```sh

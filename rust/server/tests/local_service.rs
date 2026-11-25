@@ -11,20 +11,21 @@ use rgo_protocol::{
 use sha2::{Digest, Sha256};
 use std::{
     fs,
+    io::ErrorKind,
     net::SocketAddr,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
     net::TcpStream,
     process::{Child, Command},
     time::timeout,
 };
 
-async fn start(config: &Path) -> (Child, SocketAddr) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rgo-server"))
+fn spawn_server(config: &Path) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_rgo-server"))
         .arg(config)
         .process_group(0)
         .current_dir(config.parent().unwrap())
@@ -32,7 +33,11 @@ async fn start(config: &Path) -> (Child, SocketAddr) {
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
-        .unwrap();
+        .unwrap()
+}
+
+async fn start(config: &Path) -> (Child, SocketAddr) {
+    let mut child = spawn_server(config);
     let mut line = String::new();
     timeout(
         Duration::from_secs(10),
@@ -99,6 +104,11 @@ fn write_test_python(directory: &Path) {
         r#"#!/bin/sh
 set -eu
 base=$(cd "$(dirname "$0")/../.." && pwd)
+if [ "$2" = server.initialize ]; then
+    set -C
+    printf 'checkpoint -1' > "$3/-1.pt"
+    exit 0
+fi
 basename "$4" >> "$base/exports"
 if [ -f "$base/pause" ]; then
     touch "$base/started"
@@ -109,6 +119,7 @@ if [ -f "$base/pause" ]; then
         sleep 0.01
     done
 fi
+if [ -f "$base/fail-before-publication" ]; then exit 7; fi
 cp "$3" "$4"
 if [ -f "$base/fail" ]; then exit 7; fi
 "#,
@@ -191,7 +202,7 @@ async fn wait_for_model(stream: &mut BufReader<TcpStream>, expected: &Path) {
             let Response::Model { path } = request(stream, Request::GetLatestModel {}).await else {
                 panic!("invalid model response")
             };
-            if path.as_deref() == Some(expected) {
+            if path == expected {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -208,11 +219,18 @@ async fn checkpoint_acceptance_exports_in_order_and_recovers_the_cadence() {
     let config = export_test_config(&base);
     let (mut server, address) = start(&config).await;
     let mut stream = connect(address).await;
-    submit_checkpoint(&mut stream, &base, -1).await;
-    let models = base.join("test-run/server/models");
+    let server_dir = base.join("test-run/server");
+    let models = server_dir.join("models");
+    assert!(matches!(
+        request(&mut stream, Request::GetLatestCheckpoint {}).await,
+        Response::Checkpoint { path: Some(path) } if path == server_dir.join("checkpoints/-1.pt")
+    ));
+    assert!(matches!(
+        request(&mut stream, Request::GetLatestModel {}).await,
+        Response::Model { path } if path == models.join("0.onnx")
+    ));
     let cached_model = base.join("test-run/selfplay/models/0.onnx");
     fs::create_dir_all(cached_model.parent().unwrap()).unwrap();
-    // Export finishes before acceptance replies, so the client can pin version 0.
     fs::hard_link(models.join("0.onnx"), &cached_model).unwrap();
     for index in [0, 1, 3] {
         submit_checkpoint(&mut stream, &base, index).await;
@@ -282,7 +300,6 @@ async fn disabling_checkpoint_pruning_keeps_history_after_exports_and_restart() 
     .unwrap();
     let (mut server, address) = start(&config).await;
     let mut stream = connect(address).await;
-    submit_checkpoint(&mut stream, &base, -1).await;
     wait_for_model(&mut stream, &base.join("test-run/server/models/0.onnx")).await;
     submit_checkpoint(&mut stream, &base, 1).await;
     wait_for_model(&mut stream, &base.join("test-run/server/models/2.onnx")).await;
@@ -307,7 +324,6 @@ async fn checkpoint_cleanup_failure_stops_the_server_and_restart_finishes_cleanu
     let config = export_test_config(&base);
     let (mut server, address) = start(&config).await;
     let mut stream = connect(address).await;
-    submit_checkpoint(&mut stream, &base, -1).await;
     wait_for_model(&mut stream, &base.join("test-run/server/models/0.onnx")).await;
     // An invalid older entry makes pruning fail during checkpoint acceptance.
     let invalid = base.join("test-run/server/checkpoints/0.pt");
@@ -346,13 +362,99 @@ async fn checkpoint_cleanup_failure_stops_the_server_and_restart_finishes_cleanu
 }
 
 #[tokio::test]
+async fn startup_reuses_initial_checkpoint_after_interrupted_export() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let config = export_test_config(&base);
+    let fail = base.join("fail-before-publication");
+    fs::write(&fail, b"").unwrap();
+    let mut server = spawn_server(&config);
+    let mut stdout = BufReader::new(server.stdout.take().unwrap());
+    assert!(
+        !timeout(Duration::from_secs(5), server.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(stdout.read_line(&mut String::new()).await.unwrap(), 0);
+    let root = base.join("test-run/server");
+    let checkpoint = root.join("checkpoints/-1.pt");
+    let model = root.join("models/0.onnx");
+    assert_eq!(fs::read(&checkpoint).unwrap(), b"checkpoint -1");
+    assert!(!model.exists());
+
+    fs::remove_file(fail).unwrap();
+    let (mut server, address) = start(&config).await;
+    let mut stream = connect(address).await;
+    assert!(matches!(
+        request(&mut stream, Request::GetLatestModel {}).await,
+        Response::Model { path } if path == model
+    ));
+    assert_eq!(fs::read(model).unwrap(), fs::read(checkpoint).unwrap());
+    stop(&mut server).await;
+}
+
+#[tokio::test]
+async fn shutdown_during_initial_export_finishes_without_announcing_readiness() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let config = export_test_config(&base);
+    let address = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let contents = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        contents.replacen(
+            "listen = '127.0.0.1:0'",
+            &format!("listen = '{address}'"),
+            1,
+        ),
+    )
+    .unwrap();
+    fs::write(base.join("pause"), b"").unwrap();
+    let mut server = spawn_server(&config);
+    let mut stdout = BufReader::new(server.stdout.take().unwrap());
+    wait_for_path(&base.join("started")).await;
+    let mut client = TcpStream::connect(address).await.unwrap();
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-TERM", &server.id().unwrap().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    // The server closes its listener when it observes shutdown. Keep export
+    // paused until the pending connection is closed by that branch.
+    let closed = timeout(Duration::from_secs(5), client.read_u8())
+        .await
+        .expect("server should close its listener during startup shutdown")
+        .unwrap_err();
+    assert!(matches!(
+        closed.kind(),
+        ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset
+    ));
+    fs::write(base.join("release"), b"").unwrap();
+    assert!(
+        timeout(Duration::from_secs(5), server.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(stdout.read_line(&mut String::new()).await.unwrap(), 0);
+    assert!(base.join("test-run/server/models/0.onnx").is_file());
+}
+
+#[tokio::test]
 async fn export_failure_stops_the_server_and_restart_recovers_publication() {
     let temp = tempfile::tempdir().unwrap();
     let base = fs::canonicalize(temp.path()).unwrap();
     let config = export_test_config(&base);
     let (mut server, address) = start(&config).await;
     let mut stream = connect(address).await;
-    submit_checkpoint(&mut stream, &base, -1).await;
     let models = base.join("test-run/server/models");
     fs::write(base.join("pause"), b"").unwrap();
     fs::write(base.join("fail"), b"").unwrap();
@@ -361,7 +463,7 @@ async fn export_failure_stops_the_server_and_restart_recovers_publication() {
     let mut observer = connect(address).await;
     assert!(matches!(
         request(&mut observer, Request::GetLatestModel {}).await,
-        Response::Model { path: Some(path) } if path == models.join("0.onnx")
+        Response::Model { path } if path == models.join("0.onnx")
     ));
     // Model the helper exiting after final publication but before success.
     fs::write(base.join("release"), b"").unwrap();
@@ -403,10 +505,10 @@ async fn shutdown_keeps_the_storage_lock_until_export_finishes() {
     let temp = tempfile::tempdir().unwrap();
     let base = fs::canonicalize(temp.path()).unwrap();
     let config = export_test_config(&base);
-    fs::write(base.join("pause"), b"").unwrap();
     let (mut server, address) = start(&config).await;
+    fs::write(base.join("pause"), b"").unwrap();
     let mut stream = connect(address).await;
-    send_checkpoint(&mut stream, &base, -1).await;
+    send_checkpoint(&mut stream, &base, 1).await;
     wait_for_path(&base.join("started")).await;
     assert!(
         std::process::Command::new("kill")
@@ -455,15 +557,15 @@ async fn model_polls_respond_while_export_holds_the_storage_queue() {
     let temp = tempfile::tempdir().unwrap();
     let base = fs::canonicalize(temp.path()).unwrap();
     let config = export_test_config(&base);
-    fs::write(base.join("pause"), b"").unwrap();
     let (mut server, address) = start(&config).await;
+    fs::write(base.join("pause"), b"").unwrap();
     let mut submitter = connect(address).await;
-    send_checkpoint(&mut submitter, &base, -1).await;
+    send_checkpoint(&mut submitter, &base, 1).await;
     wait_for_path(&base.join("started")).await;
     let mut observer = connect(address).await;
     assert!(matches!(
         request(&mut observer, Request::GetLatestModel {}).await,
-        Response::Model { path: None }
+        Response::Model { path } if path == base.join("test-run/server/models/0.onnx")
     ));
     let mut stats_connection = connect(address).await;
     let stats =
@@ -484,7 +586,7 @@ async fn model_polls_respond_while_export_holds_the_storage_queue() {
         Some(Response::CheckpointAccepted {})
     ));
     assert!(matches!(stats.await.unwrap(), Response::Stats { .. }));
-    wait_for_model(&mut observer, &base.join("test-run/server/models/0.onnx")).await;
+    wait_for_model(&mut observer, &base.join("test-run/server/models/2.onnx")).await;
     drop(submitter);
     drop(observer);
     stop(&mut server).await;
@@ -500,18 +602,38 @@ async fn checkpoint_handoff_retries_and_recovers_after_restart() {
     fs::write(&config, format!("listen = '127.0.0.1:0'\ndata_dir = {data_dir:?}\nrun_name = 'test-run'\nprune_old_shards = false\n[checkpoints]\nprune_old_checkpoints = false\n[replay]\ncapacity_records = 100\nwindow_records = 100\nsample_group_records = 20\nsample_groups_per_shard = 4\nrecords_per_shard = 10\n[model_export]\nevery_shards = 10\n")).unwrap();
     let (mut server, address) = start(&config).await;
     let mut stream = connect(address).await;
+    let directory = fs::canonicalize(root.join("checkpoints")).unwrap();
     assert!(matches!(
         request(&mut stream, Request::GetLatestCheckpoint {}).await,
-        Response::Checkpoint { path: None }
+        Response::Checkpoint { path: Some(path) } if path == directory.join("-1.pt")
     ));
-    let directory = fs::canonicalize(root.join("checkpoints")).unwrap();
+    let initial = temp.path().join("-1.pt");
+    fs::write(&initial, b"unexpected trainer checkpoint").unwrap();
+    assert!(matches!(
+        request(&mut stream, Request::SubmitCheckpoint { path: initial.clone() }).await,
+        Response::Error { message } if message.contains("nonnegative index")
+    ));
+    assert_eq!(fs::read(initial).unwrap(), b"unexpected trainer checkpoint");
+    assert_eq!(fs::read(directory.join("-1.pt")).unwrap(), b"checkpoint -1");
     let shards = fs::canonicalize(root.join("shards")).unwrap();
     fs::write(shards.join("0.npz"), b"covered shard").unwrap();
     fs::write(shards.join("1.npz"), b"prefetched shard").unwrap();
-    for index in [-1, 0] {
-        let source = temp.path().join(format!("{index}.pt"));
-        // Validation rejection must leave the connection and server usable.
-        fs::write(&source, b"").unwrap();
+    let source = temp.path().join("0.pt");
+    // Validation rejection must leave the connection and server usable.
+    fs::write(&source, b"").unwrap();
+    assert!(matches!(
+        request(
+            &mut stream,
+            Request::SubmitCheckpoint {
+                path: source.clone()
+            }
+        )
+        .await,
+        Response::Error { .. }
+    ));
+    fs::write(&source, b"checkpoint").unwrap();
+    for _ in 0..2 {
+        // The repeat models a lost acceptance reply: the source is gone.
         assert!(matches!(
             request(
                 &mut stream,
@@ -520,30 +642,16 @@ async fn checkpoint_handoff_retries_and_recovers_after_restart() {
                 }
             )
             .await,
-            Response::Error { .. }
+            Response::CheckpointAccepted {}
         ));
-        fs::write(&source, b"checkpoint").unwrap();
-        for _ in 0..2 {
-            // The repeat models a lost acceptance reply: the source is gone.
-            assert!(matches!(
-                request(
-                    &mut stream,
-                    Request::SubmitCheckpoint {
-                        path: source.clone()
-                    }
-                )
-                .await,
-                Response::CheckpointAccepted {}
-            ));
-            assert!(!source.exists());
-            assert!(shards.join("0.npz").exists());
-            assert!(shards.join("1.npz").exists());
-        }
-        assert!(matches!(
-            request(&mut stream, Request::GetLatestCheckpoint {}).await,
-            Response::Checkpoint { path: Some(path) } if path == directory.join(format!("{index}.pt"))
-        ));
+        assert!(!source.exists());
+        assert!(shards.join("0.npz").exists());
+        assert!(shards.join("1.npz").exists());
     }
+    assert!(matches!(
+        request(&mut stream, Request::GetLatestCheckpoint {}).await,
+        Response::Checkpoint { path: Some(path) } if path == directory.join("0.pt")
+    ));
     assert!(matches!(
         request(&mut stream, Request::GetTrainingShard { index: 0 }).await,
         Response::Error { .. }
@@ -589,6 +697,8 @@ async fn local_acceptance_sampling_model_publication_and_restart() {
     let data_dir = temp.path().join("nested");
     let root = data_dir.join("test-run/server");
     let config = temp.path().join("server.toml");
+    fs::create_dir_all(root.join("models")).unwrap();
+    fs::write(root.join("models/1.onnx"), b"model").unwrap();
     fs::write(&config, format!("listen = '127.0.0.1:0'\ndata_dir = {data_dir:?}\nrun_name = 'test-run'\n[replay]\ncapacity_records = 100\nwindow_records = 100\nsample_group_records = 20\nsample_groups_per_shard = 4\nrecords_per_shard = 3\n[model_export]\nevery_shards = 10\n")).unwrap();
     let (mut server, address) = start(&config).await;
     for (protocol_version, client_id) in [
@@ -682,7 +792,6 @@ async fn local_acceptance_sampling_model_publication_and_restart() {
         rows += npyz::NpyFile::new(entry).unwrap().shape()[0];
     }
     assert_eq!(rows, 3);
-    fs::write(root.join("models/1.onnx"), b"model").unwrap();
     fs::write(root.join("models/2.onnx.tmp"), b"next model").unwrap();
     let model_dir = fs::canonicalize(root.join("models")).unwrap();
     drop(stream);
@@ -699,7 +808,7 @@ async fn local_acceptance_sampling_model_publication_and_restart() {
     let mut stream = connect(address).await;
     assert!(matches!(
         request(&mut stream, Request::GetLatestModel {}).await,
-        Response::Model { path: Some(path) } if path == model_dir.join("2.onnx")
+        Response::Model { path } if path == model_dir.join("2.onnx")
     ));
     assert!(matches!(
         request(&mut stream, Request::GetReplayStats {}).await,

@@ -1,6 +1,6 @@
 //! Durable handoff of immutable, indexed trainer checkpoints.
 
-use crate::replay::storage::sync_directory;
+use crate::{Error, replay::storage::sync_directory};
 use serde::Deserialize;
 use std::{
     ffi::OsStr,
@@ -75,6 +75,20 @@ impl CheckpointStore {
         Ok(self.latest_index)
     }
 
+    /// Initialize an empty store with a durably published `-1.pt`.
+    pub fn initialize_if_empty(
+        &mut self,
+        initialize: impl FnOnce(&Path) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        if self.latest_index()?.is_none() {
+            self.failed = true;
+            initialize(&self.directory)?;
+            self.latest_index = Some(-1);
+            self.failed = false;
+        }
+        Ok(())
+    }
+
     /// Hard-link a published local checkpoint, then remove its producer name.
     pub fn accept(&mut self, source: &Path) -> io::Result<()> {
         self.ensure_usable()?;
@@ -87,12 +101,14 @@ impl CheckpointStore {
         let filename = source.file_name().ok_or_else(|| {
             io::Error::new(ErrorKind::InvalidInput, "checkpoint path has no filename")
         })?;
-        let index = checkpoint_index(filename).ok_or_else(|| {
-            io::Error::new(
-                ErrorKind::InvalidInput,
-                "invalid canonical checkpoint filename",
-            )
-        })?;
+        let index = checkpoint_index(filename)
+            .filter(|&index| index >= 0)
+            .ok_or_else(|| {
+                io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "trainer checkpoint must use a canonical filename with a nonnegative index",
+                )
+            })?;
         let source_dir = source.parent().unwrap();
         if fs::canonicalize(source_dir)? == fs::canonicalize(&self.directory)? {
             return Err(io::Error::new(
@@ -212,9 +228,12 @@ mod tests {
         .unwrap();
         assert_eq!(store.latest().unwrap(), None);
 
-        let initial = source(temp.path(), -1, b"initial");
-        store.accept(&initial).unwrap();
-        assert!(!initial.exists());
+        store
+            .initialize_if_empty(|directory| {
+                fs::write(directory.join("-1.pt"), b"initial")?;
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(fs::read(directory.join("-1.pt")).unwrap(), b"initial");
 
         let zero = source(temp.path(), 0, b"checkpoint zero");
@@ -275,6 +294,13 @@ mod tests {
         )
         .unwrap();
         assert!(store.accept(Path::new("0.pt")).is_err());
+        let initial = source(temp.path(), -1, b"initial");
+        assert_eq!(
+            store.accept(&initial).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+        assert!(initial.exists());
+        assert_eq!(store.latest().unwrap(), None);
         let invalid = source(temp.path(), 0, b"checkpoint");
         let malformed = invalid.with_file_name("00.pt");
         fs::rename(&invalid, &malformed).unwrap();

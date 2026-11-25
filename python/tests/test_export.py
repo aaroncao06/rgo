@@ -27,7 +27,7 @@ class ExportTest(unittest.TestCase):
             for index in [-1, 7]:
                 with torch.no_grad():
                     model.value.bias.add_(0.5)
-                checkpoint = save_checkpoint(root, model, optimizer, index)
+                checkpoint = save_checkpoint(root, model, None if index == -1 else optimizer, index)
                 output = root / f"{index + 1}.onnx"
                 if index == -1:
                     # Exercise the subprocess interface the server will call.
@@ -73,10 +73,9 @@ class ExportTest(unittest.TestCase):
 
     def test_failed_export_leaves_no_final_or_temporary_file(self):
         model = DummyModel()
-        optimizer = torch.optim.Adam(model.parameters())
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            checkpoint = save_checkpoint(root, model, optimizer, -1)
+            checkpoint = save_checkpoint(root, model, None, -1)
 
             def fail_after_partial_write(_model, _inputs, file, **_kwargs):
                 file.write(b"partial export")
@@ -103,10 +102,9 @@ class ExportTest(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix", "directory fsync is POSIX-only")
     def test_directory_sync_failure_reports_failure_but_keeps_the_final_model(self):
         model = DummyModel()
-        optimizer = torch.optim.Adam(model.parameters())
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            checkpoint = save_checkpoint(root, model, optimizer, -1)
+            checkpoint = save_checkpoint(root, model, None, -1)
             output = root / "0.onnx"
             with patch("server.export.os.fsync", side_effect=[None, OSError("sync failed")]):
                 with self.assertRaises(OSError):

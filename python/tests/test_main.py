@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from server.initialize import main as initialize_checkpoint
 from trainer.main import main, parse_device, receive_start
 
 
@@ -23,8 +24,9 @@ class TrainerMainTest(unittest.TestCase):
         self.assertIn("trainer directory must not be empty", stderr.getvalue())
 
     def test_start_requires_an_explicit_server_checkpoint_result(self):
-        self.assertIsNone(receive_start(io.StringIO('{"type":"start","checkpoint_path":null}\n')))
-        with self.assertRaisesRegex(ValueError, "absolute path or null"):
+        with self.assertRaisesRegex(ValueError, "absolute path"):
+            receive_start(io.StringIO('{"type":"start","checkpoint_path":null}\n'))
+        with self.assertRaisesRegex(ValueError, "absolute path"):
             receive_start(io.StringIO('{"type":"start","checkpoint_path":"local.pt"}\n'))
         with self.assertRaisesRegex(ValueError, "expected start command"):
             receive_start(io.StringIO('{"type":"shard","path":"/shard.npz"}\n'))
@@ -40,6 +42,10 @@ class TrainerMainTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             trainer_dir = Path(directory) / "trainer"
             checkpoint = trainer_dir / "checkpoints/0.pt"
+            server_checkpoints = Path(directory) / "server/checkpoints"
+            server_checkpoints.mkdir(parents=True)
+            initialize_checkpoint([str(server_checkpoints)])
+            initial_checkpoint = server_checkpoints / "-1.pt"
             config = Path(directory) / "trainer.toml"
             config.write_text(
                 'model = "dummy"\n'
@@ -73,7 +79,7 @@ class TrainerMainTest(unittest.TestCase):
             result = subprocess.run(
                 command,
                 input=(
-                    '{"type":"start","checkpoint_path":null}\n'
+                    json.dumps({"type": "start", "checkpoint_path": str(initial_checkpoint)}) + "\n"
                     + json.dumps({"type": "shard", "path": str(shard)}) + "\n"
                     + '{"type":"finish"}\n'
                 ),
@@ -87,13 +93,12 @@ class TrainerMainTest(unittest.TestCase):
             events = [json.loads(line) for line in result.stdout.splitlines()]
             self.assertEqual(
                 [event["type"] for event in events],
-                ["ready", "checkpoint_ready", "shard_request", "checkpoint_ready", "shard_request", "stopped"],
+                ["ready", "shard_request", "checkpoint_ready", "shard_request", "stopped"],
             )
-            self.assertEqual(events[1]["last_shard_index"], -1)
-            self.assertEqual(events[2]["index"], 0)
-            self.assertEqual(events[3]["last_shard_index"], 0)
-            self.assertEqual(events[4]["index"], 1)
-            self.assertTrue(checkpoint.with_name("-1.pt").is_file())
+            self.assertEqual(events[1]["index"], 0)
+            self.assertEqual(events[2]["last_shard_index"], 0)
+            self.assertEqual(events[3]["index"], 1)
+            self.assertFalse(checkpoint.with_name("-1.pt").exists())
             self.assertTrue(checkpoint.is_file())
 
             restarted = subprocess.run(
@@ -115,19 +120,6 @@ class TrainerMainTest(unittest.TestCase):
                 ["ready", "shard_request", "stopped"],
             )
             self.assertEqual(recovered[1]["index"], 1)
-
-            fresh = subprocess.run(
-                command,
-                input='{"type":"start","checkpoint_path":null}\n{"type":"finish"}\n',
-                capture_output=True,
-                text=True,
-                cwd=root,
-                env=environment,
-                timeout=30,
-            )
-            self.assertNotEqual(fresh.returncode, 0)
-            self.assertIn("FileExistsError", fresh.stderr)
-            self.assertEqual(fresh.stdout, "")
 
 
 if __name__ == "__main__":

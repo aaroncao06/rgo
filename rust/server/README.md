@@ -26,8 +26,10 @@ remain excluded from sampling and do not reenter replay if the window grows.
 Turning pruning back on removes those old files at startup. Keeping them uses
 disk space without a configured upper bound.
 Paths are relative to the working directory. Storage-directory symlinks are
-supported. On startup the server provisions the storage tree and emits a JSON
-`ready` line containing its listening address.
+supported. On startup the server provisions the storage tree, prepares the
+model, and emits a JSON `ready` line containing its listening address.
+If the server observes shutdown during startup, it lets storage finish without
+announcing readiness.
 Port zero selects an available port. Storage operations run serially on a
 dedicated thread with a 16-request queue; at most 32 control connections are
 open at once. Sampling holds this thread for the whole shard, so intake and
@@ -57,8 +59,12 @@ project conventions. Model version is checkpoint index plus one: `-1.pt` exports
 `0.onnx`, and checkpoint `9.pt` exports to `10.onnx`. These names let startup
 recover publication progress without a separate counter.
 
-The first available checkpoint is exported immediately if
-there is no published model. Later exports use the newest accepted checkpoint
+When both the checkpoint and model stores are empty, the server initializes
+random `DummyModel` weights and saves `checkpoints/-1.pt`. It exports
+`models/0.onnx` before serving clients. If startup is interrupted after the
+checkpoint is published, restart exports that checkpoint. An existing ONNX-only
+run can serve self-play as before. A trainer needs a recovery checkpoint.
+Later exports use the newest accepted checkpoint
 once its progress exceeds the published model by at least `every_shards`.
 The storage worker runs the helper synchronously before acknowledging checkpoint
 acceptance or processing another storage request. The checkpoint path stays
@@ -88,8 +94,8 @@ even if replay has since shrunk; requests do not wait for new data on the server
 
 `SubmitCheckpoint { path }` transfers an immutable local checkpoint into
 `checkpoints/<index>.pt` by hard-linking it and removing the producer filename
-before acknowledging acceptance. Index `-1` is the initial checkpoint.
-One trainer submits immutable checkpoint indices in increasing order; repeating
+before acknowledging acceptance. The server reserves index `-1` for initialization.
+The trainer submits nonnegative indices in increasing order. Repeating
 an accepted index acknowledges the retry even if the producer filename is gone.
 `GetLatestCheckpoint` returns the highest accepted index's absolute path, or
 `null` when none exists. Checkpoints share the replay storage thread and failure

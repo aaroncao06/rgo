@@ -5,7 +5,7 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import Optional, TextIO
+from typing import TextIO
 
 import torch
 
@@ -33,7 +33,7 @@ def parse_device(value: str) -> torch.device:
 
 
 def build_trainer(
-    config: dict, trainer_dir: Path, resume_path: Optional[Path]
+    config: dict, trainer_dir: Path, resume_path: Path
 ) -> TrainingCoordinator:
     """Construct the temporary dummy trainer from local process settings."""
     fields = {
@@ -76,7 +76,7 @@ def build_trainer(
     )
 
 
-def receive_start(input: TextIO) -> Optional[Path]:
+def receive_start(input: TextIO) -> Path:
     """Read the server-selected checkpoint forwarded by the supervising client."""
     line = input.readline()
     if not line:
@@ -89,10 +89,8 @@ def receive_start(input: TextIO) -> Optional[Path]:
     ):
         raise ValueError("expected start command with checkpoint_path")
     value = message["checkpoint_path"]
-    if value is None:
-        return None
     if not isinstance(value, str) or not Path(value).is_absolute():
-        raise ValueError("checkpoint_path must be an absolute path or null")
+        raise ValueError("checkpoint_path must be an absolute path")
     return Path(value)
 
 

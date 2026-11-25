@@ -48,7 +48,7 @@ pub enum Response {
         run_name: String,
     },
     Model {
-        path: Option<PathBuf>,
+        path: PathBuf,
     },
     ChunkAccepted {},
     CheckpointAccepted {},
@@ -78,6 +78,17 @@ mod tests {
         assert!(valid_run_name("run-a_9"));
         assert!(!valid_run_name("Run-a_9"));
         assert!(valid_name("Run-a_9"));
+    }
+
+    #[tokio::test]
+    async fn model_response_requires_a_path() {
+        for mut frame in [
+            b"{\"type\":\"model\"}\n".as_slice(),
+            b"{\"type\":\"model\",\"path\":null}\n".as_slice(),
+        ] {
+            let error = crate::read::<Response>(&mut frame).await.unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
     }
 
     #[test]

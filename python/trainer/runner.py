@@ -35,16 +35,13 @@ def run(coordinator: TrainingCoordinator, input: TextIO, output: TextIO) -> None
                 "protocol_version": PROTOCOL_VERSION,
             },
         )
-        if coordinator.created_initial_checkpoint:
-            _send_checkpoint(output, coordinator)
         while True:
             _send(output, {"type": "shard_request", "index": coordinator.next_index})
             response = _receive(input)
             if response == {"type": "finish"}:
-                previous = coordinator.last_checkpointed_index
-                coordinator.checkpoint()
-                if coordinator.last_checkpointed_index != previous:
-                    _send_checkpoint(output, coordinator)
+                checkpoint = coordinator.checkpoint()
+                if checkpoint is not None:
+                    _send_checkpoint(output, checkpoint, coordinator.last_checkpointed_index)
                 _send(output, {"type": "stopped"})
                 return
             if (
@@ -55,21 +52,20 @@ def run(coordinator: TrainingCoordinator, input: TextIO, output: TextIO) -> None
             ):
                 raise ValueError("expected shard response with an absolute path or finish")
 
-            previous = coordinator.last_checkpointed_index
-            coordinator.train_next(Path(response["path"]))
-            if coordinator.last_checkpointed_index != previous:
-                _send_checkpoint(output, coordinator)
+            checkpoint = coordinator.train_next(Path(response["path"]))
+            if checkpoint is not None:
+                _send_checkpoint(output, checkpoint, coordinator.last_checkpointed_index)
     except Exception as error:
         _send(output, {"type": "error", "message": str(error)})
         raise
 
 
-def _send_checkpoint(output: TextIO, coordinator: TrainingCoordinator) -> None:
+def _send_checkpoint(output: TextIO, path: Path, last_shard_index: int) -> None:
     _send(
         output,
         {
             "type": "checkpoint_ready",
-            "path": str(coordinator.checkpoint_path),
-            "last_shard_index": coordinator.last_checkpointed_index,
+            "path": str(path),
+            "last_shard_index": last_shard_index,
         },
     )

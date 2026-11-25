@@ -1,4 +1,4 @@
-//! Blocking checkpoint-to-ONNX conversion on the storage worker.
+//! Python model initialization and ONNX conversion on the storage worker.
 
 use crate::Error;
 use serde::Deserialize;
@@ -13,8 +13,16 @@ pub struct ModelExportConfig {
     pub every_shards: u64,
 }
 
+pub fn initialize_checkpoint(directory: &Path) -> Result<(), Error> {
+    run_helper("server.initialize", &[directory])
+}
+
 /// The storage worker keeps the input in place until this helper finishes.
 pub fn export_checkpoint(checkpoint: &Path, output: &Path) -> Result<(), Error> {
+    run_helper("server.export", &[checkpoint, output])
+}
+
+fn run_helper(module: &str, paths: &[&Path]) -> Result<(), Error> {
     let python = if cfg!(windows) {
         ".venv/Scripts/python.exe"
     } else {
@@ -22,9 +30,8 @@ pub fn export_checkpoint(checkpoint: &Path, output: &Path) -> Result<(), Error> 
     };
     let mut command = Command::new(python);
     command
-        .args(["-m", "server.export"])
-        .arg(checkpoint)
-        .arg(output)
+        .args(["-m", module])
+        .args(paths)
         .env("PYTHONPATH", "python")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -41,9 +48,11 @@ pub fn export_checkpoint(checkpoint: &Path, output: &Path) -> Result<(), Error> 
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         command.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
-    let status = command.status()?;
+    let status = command
+        .status()
+        .map_err(|error| format!("could not run {module} with {python}: {error}"))?;
     if !status.success() {
-        return Err(format!("model export {} failed: {status}", output.display()).into());
+        return Err(format!("{module} failed for {paths:?}: {status}").into());
     }
     Ok(())
 }

@@ -4,10 +4,12 @@
 loopback TCP. The processes share a filesystem. Remote transfers, scheduling,
 and Python trainer supervision are later steps.
 
-Build the workspace so the client, server, and worker executables exist:
+From the repository root, build the workspace and prepare the server's Python
+environment before launching it:
 
 ```sh
 cargo build --release --manifest-path rust/Cargo.toml --workspace
+uv sync --locked
 rust/target/release/rgo-server configs/server.toml
 ```
 
@@ -24,6 +26,8 @@ directory and the worker TOML to `rgo-selfplay`. Other runs' directories are
 preserved. The worker directory must share a filesystem with server storage.
 After the worker's `ready` event, the client polls for the latest published
 model with `GetLatestModel` and repeats that request at the configured interval.
+The server prepares a model before serving clients, so each successful poll
+returns a path.
 It hard-links the complete model into the run's `selfplay/models/` directory and
 syncs the cache directory before removing older links and sending the new local
 path to the worker. If the server's path disappeared before the link was made,

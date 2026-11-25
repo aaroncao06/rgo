@@ -30,17 +30,20 @@ The trainer pipe worker takes its TOML and a work directory:
 PYTHONPATH=python uv run --locked python -m trainer.main configs/trainer.toml data/run-a/trainer
 ```
 
-Its first stdin message is `start` with an absolute `checkpoint_path` or
-`null`. A `null` path starts a fresh run. The trainer saves an initial `-1.pt`
-and reports `checkpoint_ready` before requesting shard 0. The TOML specifies
-the model, device, learning rate, and batch sizes. The current worker builds
-the temporary `DummyModel` and Adam optimizer.
+Its first stdin message is `start` with an absolute `checkpoint_path`. On a
+fresh run, the server provides `-1.pt`, which contains the initial weights.
+The trainer loads those weights, starts its Adam optimizer at the learning
+rate from TOML, and requests shard 0. A checkpoint after training also restores
+the optimizer state. The TOML specifies the model, device, learning rate, and
+batch sizes. The temporary model is `DummyModel`.
 
 Rust client supervision is planned. The client will recover pending
 checkpoints, obtain the resume path from the server, and wait for checkpoint
 acceptance and any due ONNX export before delivering the next shard.
 
-`server.export` converts a checkpoint using the same temporary `DummyModel`
+The server runs `server.initialize` when its checkpoint and model directories
+are empty. It durably publishes `-1.pt` using the same checkpoint writer as
+the trainer. `server.export` converts a checkpoint using the same temporary `DummyModel`
 architecture into a float32 ONNX model with dynamic batch and board dimensions
 and the engine's `rgo.io_version = "0"` metadata:
 

@@ -1,8 +1,9 @@
-"""Save and restore training state at a completed shard boundary."""
+"""Save and restore initial weights and trained checkpoints."""
 
 import os
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 import torch
 from torch import nn
@@ -17,13 +18,13 @@ def checkpoint_path(directory: Path, last_shard_index: int) -> Path:
 def save_checkpoint(
     directory: Path,
     model: nn.Module,
-    optimizer: torch.optim.Optimizer,
+    optimizer: Optional[torch.optim.Optimizer],
     last_shard_index: int,
 ) -> Path:
     path = checkpoint_path(directory, last_shard_index)
     state = {
         "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
+        "optimizer": optimizer.state_dict() if optimizer is not None else None,
         "last_shard_index": last_shard_index,
     }
     temporary = None
@@ -53,5 +54,8 @@ def load_checkpoint(
 ) -> int:
     state = torch.load(path, map_location=next(model.parameters()).device, weights_only=True)
     model.load_state_dict(state["model"])
-    optimizer.load_state_dict(state["optimizer"])
-    return state["last_shard_index"]
+    index = state["last_shard_index"]
+    # The server initializes weights. The trainer config supplies its optimizer.
+    if index != -1:
+        optimizer.load_state_dict(state["optimizer"])
+    return index

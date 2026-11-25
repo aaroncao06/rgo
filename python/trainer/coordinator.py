@@ -16,7 +16,7 @@ class TrainingCoordinator:
         model: nn.Module,
         optimizer: torch.optim.Optimizer,
         checkpoint_dir: Path,
-        resume_path: Optional[Path],
+        resume_path: Path,
         base_batch_size: int,
         effective_batch_size: int,
         checkpoint_rows: int,
@@ -29,32 +29,21 @@ class TrainingCoordinator:
         self.base_batch_size = base_batch_size
         self.effective_batch_size = effective_batch_size
         self.checkpoint_rows = checkpoint_rows
-        self.created_initial_checkpoint = resume_path is None
-        self.last_checkpointed_index = (
-            load_checkpoint(resume_path, model, optimizer)
-            if resume_path is not None
-            else -1
-        )
-        if resume_path is not None and resume_path.name != checkpoint_path(
+        self.last_checkpointed_index = load_checkpoint(resume_path, model, optimizer)
+        if resume_path.name != checkpoint_path(
             checkpoint_dir, self.last_checkpointed_index
         ).name:
             raise ValueError("resume checkpoint filename does not match shard index")
         self.last_consumed_index = self.last_checkpointed_index
         self.rows_since_checkpoint = 0
         self._failed = False
-        if self.created_initial_checkpoint:
-            save_checkpoint(checkpoint_dir, model, optimizer, -1)
 
     @property
     def next_index(self) -> int:
         return self.last_consumed_index + 1
 
-    @property
-    def checkpoint_path(self) -> Path:
-        return checkpoint_path(self.checkpoint_dir, self.last_checkpointed_index)
-
-    def train_next(self, path: Path) -> None:
-        """Train the next shard and checkpoint at the row threshold."""
+    def train_next(self, path: Path) -> Optional[Path]:
+        """Train the next shard and return any checkpoint written at the row threshold."""
         if self._failed:
             raise RuntimeError("reload the coordinator from its checkpoint after failure")
         index = self.next_index
@@ -71,20 +60,21 @@ class TrainingCoordinator:
             self.last_consumed_index = index
             self.rows_since_checkpoint += rows
             if self.rows_since_checkpoint >= self.checkpoint_rows:
-                self.checkpoint()
+                return self.checkpoint()
         except BaseException:
             # Optimizer state may have changed even if the shard did not finish.
             self._failed = True
             raise
+        return None
 
-    def checkpoint(self) -> None:
-        """Persist completed work before a planned stop or trainer handoff."""
+    def checkpoint(self) -> Optional[Path]:
+        """Persist completed work and return the new path when progress has advanced."""
         if self._failed:
             raise RuntimeError("reload the coordinator from its checkpoint after failure")
         if self.last_consumed_index == self.last_checkpointed_index:
-            return
+            return None
         try:
-            save_checkpoint(
+            path = save_checkpoint(
                 self.checkpoint_dir,
                 self.model,
                 self.optimizer,
@@ -96,3 +86,4 @@ class TrainingCoordinator:
             raise
         self.last_checkpointed_index = self.last_consumed_index
         self.rows_since_checkpoint = 0
+        return path

@@ -36,7 +36,6 @@ class TrainerRunnerTest(unittest.TestCase):
                 messages(output),
                 [
                     {"type": "ready", "protocol_version": 1},
-                    {"type": "checkpoint_ready", "path": str(checkpoint_path(Path(directory), -1)), "last_shard_index": -1},
                     {"type": "shard_request", "index": 0},
                     {"type": "shard_request", "index": 1},
                     {"type": "checkpoint_ready", "path": str(checkpoint), "last_shard_index": 0},
@@ -59,7 +58,7 @@ class TrainerRunnerTest(unittest.TestCase):
 
             self.assertEqual(
                 [message["type"] for message in messages(output)],
-                ["ready", "checkpoint_ready", "shard_request", "checkpoint_ready", "shard_request", "stopped"],
+                ["ready", "shard_request", "checkpoint_ready", "shard_request", "stopped"],
             )
             self.assertEqual(new_coordinator(Path(directory), 2, checkpoint).next_index, 1)
 
@@ -85,22 +84,6 @@ class TrainerRunnerTest(unittest.TestCase):
             self.assertEqual(messages(restarted_output)[1], {"type": "shard_request", "index": 1})
             self.assertEqual(new_coordinator(Path(directory), 4, checkpoint_path(Path(directory), 1)).next_index, 2)
 
-    def test_resuming_initial_checkpoint_does_not_reannounce_it(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory)
-            new_coordinator(path, 2)
-            output = io.StringIO()
-            run(
-                new_coordinator(path, 2, checkpoint_path(path, -1)),
-                io.StringIO('{"type":"finish"}\n'),
-                output,
-            )
-            self.assertEqual(
-                [message["type"] for message in messages(output)],
-                ["ready", "shard_request", "stopped"],
-            )
-            self.assertEqual(messages(output)[1]["index"], 0)
-
     def test_bad_shard_response_reports_error_without_checkpoint(self):
         with tempfile.TemporaryDirectory() as directory:
             checkpoint = checkpoint_path(Path(directory), 0)
@@ -118,10 +101,10 @@ class TrainerRunnerTest(unittest.TestCase):
             run(new_coordinator(Path(directory), 2), io.StringIO('{"type":"finish"}\n'), output)
             self.assertEqual(
                 [message["type"] for message in messages(output)],
-                ["ready", "checkpoint_ready", "shard_request", "stopped"],
+                ["ready", "shard_request", "stopped"],
             )
             self.assertFalse(checkpoint.exists())
-            self.assertTrue(checkpoint_path(Path(directory), -1).is_file())
+            self.assertFalse(checkpoint_path(Path(directory), -1).exists())
 
 if __name__ == "__main__":
     unittest.main()

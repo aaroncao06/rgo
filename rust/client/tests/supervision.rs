@@ -50,7 +50,7 @@ impl Server {
         let address = listener.local_addr().unwrap();
         let root = fs::canonicalize(root).unwrap();
         fs::create_dir_all(root.join("test-run/selfplay")).unwrap();
-        let has_models = root.join("models").is_dir();
+        publish_model_fixtures(&root);
         let accepted = Arc::new(Mutex::new(Vec::new()));
         let log = accepted.clone();
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -78,7 +78,6 @@ impl Server {
                             protocol_version: PROTOCOL_VERSION,
                             run_name: "test-run".into(),
                         },
-                        Request::GetLatestModel {} if !has_models => Response::Model { path: None },
                         Request::GetLatestModel {} => {
                             model_polls += 1;
                             if !model_delay.is_zero() {
@@ -98,7 +97,7 @@ impl Server {
                                 "models"
                             };
                             Response::Model {
-                                path: Some(root.join(directory).join(format!("{version}.onnx"))),
+                                path: root.join(directory).join(format!("{version}.onnx")),
                             }
                         }
                         Request::SubmitChunk { path } => {
@@ -305,7 +304,6 @@ async fn status(client: &mut Child, root: &Path) -> std::process::ExitStatus {
 async fn recovers_pending_chunks_forwards_models_and_accepts_final_chunks_before_exit() {
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
-    publish_model_fixtures(&root);
     let server = Server::start(&root).await;
     let pending = chunk_path(&root.join("test-run/selfplay"), 1);
     fs::write(&pending, b"pending").unwrap();
@@ -399,7 +397,6 @@ exit 2
 async fn model_links_survive_pruning_and_are_reused_on_restart() {
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
-    publish_model_fixtures(&root);
     let server = Server::start(&root).await;
     // The first poll advertises a version already pruned from server storage.
     fs::remove_file(root.join("models/42.onnx")).unwrap();
@@ -470,11 +467,11 @@ exit 2
 async fn shutdown_interrupts_model_acquisition_and_submits_final_chunk() {
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
-    // Advertise a model path whose server-side link has already been removed.
-    fs::create_dir(root.join("models")).unwrap();
     // Separate the acquisition deadline from the retry sleep's deadline.
     let server =
         Server::start_with_options(&root, Duration::ZERO, Duration::from_millis(150), false).await;
+    // Advertise a model path whose server-side link has already been removed.
+    fs::remove_file(root.join("models/42.onnx")).unwrap();
     let chunk = chunk_path(&root.join("test-run/selfplay"), 1);
     let event = serde_json::to_string(&rgo_protocol::selfplay::Event::ChunkReady {
         path: chunk.clone(),
@@ -517,7 +514,11 @@ exit 2
 async fn retry_budget_expiry_reaps_the_worker() {
     let temp = tempfile::tempdir().unwrap();
     let server = Server::start(temp.path()).await;
-    let script = "out=\"$output_dir\"\necho $$ > \"$out/pid\"\necho '{\"type\":\"ready\",\"protocol_version\":1}'\nwhile :; do :; done";
+    let script = r#"
+echo $$ > "$output_dir/pid"
+echo '{"type":"ready","protocol_version":1}'
+while IFS= read -r command; do model_loaded "$command"; done
+"#;
     let mut client = start_client(temp.path(), server.address, script);
     let pid_file = temp.path().join("test-run/selfplay/pid");
     wait_for(&mut client, || pid_file.exists()).await;
@@ -638,7 +639,6 @@ async fn refuses_recovery_while_previous_worker_owns_output() {
 async fn lost_chunk_receipt_reconnects_without_restarting_the_worker() {
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
-    publish_model_fixtures(&root);
     let server = Server::start_with_options(&root, Duration::ZERO, Duration::ZERO, true).await;
     let chunk = chunk_path(&root.join("test-run/selfplay"), 1);
     let event = serde_json::to_string(&rgo_protocol::selfplay::Event::ChunkReady {
@@ -710,9 +710,18 @@ exit 2
 async fn worker_failure_interrupts_connection_retries() {
     let temp = tempfile::tempdir().unwrap();
     let server = Server::start(temp.path()).await;
-    let script = "out=\"$output_dir\"\necho started > \"$out/started\"\necho '{\"type\":\"ready\",\"protocol_version\":1}'\nwhile [ ! -e \"$out/fail\" ]; do :; done\nexit 9";
+    let script = r#"
+echo '{"type":"ready","protocol_version":1}'
+while IFS= read -r command; do
+  model_loaded "$command"
+  case "$command" in *43.onnx*) break;; esac
+done
+touch "$output_dir/started"
+while [ ! -e "$output_dir/fail" ]; do :; done
+exit 9
+"#;
     let mut client = start_client_with_budget(temp.path(), server.address, script, 10);
-    // First establish the session and launch the child before losing the server.
+    // Acknowledge both fixture models so the next poll can detect the disconnect.
     wait_for(&mut client, || {
         temp.path().join("test-run/selfplay/started").exists()
     })
@@ -741,7 +750,16 @@ async fn worker_failure_interrupts_connection_retries() {
 async fn second_shutdown_signal_interrupts_connection_retries_and_reaps_worker() {
     let temp = tempfile::tempdir().unwrap();
     let server = Server::start(temp.path()).await;
-    let script = "out=\"$output_dir\"\necho $$ > \"$out/pid\"\necho '{\"type\":\"ready\",\"protocol_version\":1}'\nwhile IFS= read -r command; do case \"$command\" in *finish*) echo finished > \"$out/finished\"; while :; do :; done;; esac; done";
+    let script = r#"
+echo $$ > "$output_dir/pid"
+echo '{"type":"ready","protocol_version":1}'
+while IFS= read -r command; do
+  case "$command" in
+    *model_ready*) model_loaded "$command";;
+    *finish*) touch "$output_dir/finished"; while :; do :; done;;
+  esac
+done
+"#;
     let mut client = start_client_with_budget(temp.path(), server.address, script, 10);
     wait_for(&mut client, || {
         temp.path().join("test-run/selfplay/pid").exists()

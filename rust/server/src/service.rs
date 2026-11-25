@@ -83,8 +83,17 @@ impl StorageState {
         &self.models
     }
 
+    /// Make a model available before accepting any client connections.
+    pub fn prepare_models_at_startup(&mut self) -> Result<(), Error> {
+        if self.latest_model_version.borrow().is_none() {
+            self.checkpoints
+                .initialize_if_empty(model_export::initialize_checkpoint)?;
+        }
+        self.export_model_if_due()
+    }
+
     /// Finish due model publication at startup or after checkpoint acceptance.
-    pub fn export_model_if_due(&mut self) -> Result<(), Error> {
+    fn export_model_if_due(&mut self) -> Result<(), Error> {
         let Some(index) = self.checkpoints.latest_index()? else {
             return Ok(());
         };
@@ -309,6 +318,8 @@ mod tests {
             // An existing model keeps these cleanup tests below the export cadence.
             fs::create_dir_all(root.join("models")).unwrap();
             fs::write(root.join("models/0.onnx"), b"model").unwrap();
+            fs::create_dir(root.join("checkpoints")).unwrap();
+            fs::write(root.join("checkpoints/-1.pt"), b"initial checkpoint").unwrap();
             let mut state = open_storage(
                 &root,
                 replay_config(),
@@ -330,7 +341,7 @@ mod tests {
             ] {
                 fs::write(state.shards.join(name), b"keep").unwrap();
             }
-            for index in [-1, 0, 1] {
+            for index in [0, 1] {
                 let source = temp.path().join(format!("{index}.pt"));
                 fs::write(&source, b"").unwrap();
                 assert!(

@@ -58,12 +58,6 @@ async fn acquire_latest_model(
             Response::Error { message } => return Err(io::Error::other(message)),
             _ => return Err(io::Error::other("invalid model response")),
         };
-        let Some(source) = source else {
-            return match denied_link {
-                Some((_, error)) => Err(error),
-                None => Ok(None),
-            };
-        };
         let version = source
             .file_name()
             .filter(|_| source.is_absolute())
@@ -353,10 +347,10 @@ mod tests {
 
     #[tokio::test]
     async fn denied_model_link_is_retried_only_if_the_version_advanced() {
-        for replacement in [Some(43), Some(42), Some(41), None] {
+        for replacement in [43, 42, 41] {
             let directory = tempfile::tempdir().unwrap();
             let source = model_path(directory.path(), 42);
-            let newer_source = replacement.map(|version| model_path(directory.path(), version));
+            let replacement_path = model_path(directory.path(), replacement);
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let config = Config {
                 server: listener.local_addr().unwrap(),
@@ -382,7 +376,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                for path in [Some(source), newer_source] {
+                for path in [source, replacement_path] {
                     let request = rgo_protocol::read::<Request>(&mut stream).await.unwrap();
                     assert!(matches!(request, Some(Request::GetLatestModel {})));
                     rgo_protocol::write(stream.get_mut(), &Response::Model { path })
@@ -405,7 +399,7 @@ mod tests {
                 }
             })
             .await;
-            if replacement == Some(43) {
+            if replacement == 43 {
                 assert_eq!(attempts, [42, 43]);
                 assert_eq!(
                     result.unwrap(),

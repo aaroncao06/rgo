@@ -94,7 +94,12 @@ async fn connection(
                 message: "hello may only be sent once".into(),
             },
             Request::GetLatestModel {} => Response::Model {
-                path: (*models.borrow()).map(|version| model_path(&model_dir, version)),
+                path: model_path(
+                    &model_dir,
+                    models
+                        .borrow()
+                        .expect("model is prepared before serving clients"),
+                ),
             },
             message => forward_to_storage(&jobs, message).await?,
         };
@@ -103,7 +108,7 @@ async fn connection(
     Ok(())
 }
 
-/// Open storage, expose its model snapshot, finish any recovery export, then
+/// Open storage, prepare its first model or finish a recovery export, then
 /// serve queued requests on this thread.
 fn storage_worker(
     config: Config,
@@ -117,13 +122,12 @@ fn storage_worker(
         config.prune_old_shards,
         config.model_export,
     )?;
-    ready
-        .send((
-            state.subscribe_latest_model_version(),
-            state.model_directory().to_path_buf(),
-        ))
-        .map_err(|_| "server stopped during startup")?;
-    state.export_model_if_due()?;
+    state.prepare_models_at_startup()?;
+    // A shutdown during startup can cancel the readiness receiver and close the queue.
+    let _ = ready.send((
+        state.subscribe_latest_model_version(),
+        state.model_directory().to_path_buf(),
+    ));
     serve_storage_requests(&mut state, incoming)
 }
 
@@ -166,7 +170,17 @@ pub async fn run(config: Config) -> Result<(), Error> {
         .spawn(move || {
             let _ = finished.send(storage_worker(config, incoming, ready));
         })?;
-    let (models, model_dir) = match startup.await {
+    let startup = tokio::select! {
+        biased;
+        signal = signals.recv() => {
+            drop(listener);
+            drop(jobs);
+            let storage = done.await?;
+            return signal.map_err(Into::into).and(storage);
+        }
+        startup = startup => startup,
+    };
+    let (models, model_dir) = match startup {
         Ok(connection_state) => connection_state,
         Err(_) => return done.await?,
     };
@@ -274,7 +288,7 @@ mod tests {
             .unwrap();
         let (server, _) = listener.accept().await.unwrap();
         let (jobs, mut incoming) = mpsc::channel::<StorageJob>(1);
-        let (published, models) = watch::channel(None);
+        let (published, models) = watch::channel(Some(0));
         // A greeting and subsequent model polls must not need queue capacity.
         let (reply, _response) = oneshot::channel();
         jobs.send(StorageJob {
@@ -289,7 +303,7 @@ mod tests {
             "test-run".into(),
             jobs.clone(),
             models,
-            model_dir,
+            model_dir.clone(),
         ));
         let mut client = BufReader::new(client);
         rgo_protocol::write(
@@ -312,8 +326,8 @@ mod tests {
             Some(Response::Welcome { run_name, .. }) if run_name == "test-run"
         ));
 
-        for version in [None, Some(42)] {
-            published.send_replace(version);
+        for version in [0, 42] {
+            published.send_replace(Some(version));
             rgo_protocol::write(client.get_mut(), &Request::GetLatestModel {})
                 .await
                 .unwrap();
@@ -326,7 +340,7 @@ mod tests {
             .unwrap();
             assert!(matches!(
                 response,
-                Some(Response::Model { path }) if path == version.map(|version| PathBuf::from(format!("/models/{version}.onnx")))
+                Some(Response::Model { path }) if path == model_path(&model_dir, version)
             ));
         }
         assert_eq!(incoming.len(), 1);

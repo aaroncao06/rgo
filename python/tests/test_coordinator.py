@@ -20,21 +20,28 @@ def train_two_rows(model, optimizer, path, _base_batch_size, _effective_batch_si
 
 def new_coordinator(directory, checkpoint_rows, resume_path=None):
     model = DummyModel()
+    if resume_path is None:
+        server = directory / "server"
+        server.mkdir()
+        resume_path = save_checkpoint(server, model, None, -1)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     return TrainingCoordinator(model, optimizer, directory, resume_path, 1, 8, checkpoint_rows)
 
 
 class TrainingCoordinatorTest(unittest.TestCase):
-    def test_fresh_trainer_saves_resumable_initial_checkpoint(self):
+    def test_initial_checkpoint_uses_server_weights_and_trainer_optimizer_settings(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
-            fresh = new_coordinator(path, checkpoint_rows=4)
-            initial = checkpoint_path(path, -1)
-            self.assertTrue(initial.is_file())
-
+            server_model = DummyModel()
+            server = path / "server"
+            server.mkdir()
+            initial = save_checkpoint(server, server_model, None, -1)
             resumed = new_coordinator(path, checkpoint_rows=4, resume_path=initial)
             self.assertEqual(resumed.next_index, 0)
-            for expected, actual in zip(fresh.model.parameters(), resumed.model.parameters()):
+            self.assertEqual(resumed.optimizer.param_groups[0]["lr"], 0.001)
+            self.assertFalse(resumed.optimizer.state)
+            self.assertFalse(checkpoint_path(path, -1).exists())
+            for expected, actual in zip(server_model.parameters(), resumed.model.parameters()):
                 torch.testing.assert_close(expected, actual)
 
     def test_restart_replays_only_work_after_last_checkpoint(self):

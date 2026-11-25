@@ -317,7 +317,7 @@ mod tests {
                     rgo_protocol::write(
                         stream.get_mut(),
                         &Response::Model {
-                            path: Some(root.join(directory).join("42.onnx")),
+                            path: root.join(directory).join("42.onnx"),
                         },
                     )
                     .await
@@ -327,7 +327,7 @@ mod tests {
         });
         let mut connection = Connection::open(&config).await.unwrap();
         let response = connection.request(&Request::GetLatestModel {}).await;
-        let Response::Model { path: Some(path) } = response.unwrap() else {
+        let Response::Model { path } = response.unwrap() else {
             panic!("missing model path")
         };
         assert_eq!(path.file_name().unwrap(), "42.onnx");
@@ -555,7 +555,7 @@ mod tests {
             rgo_protocol::write(
                 stream.get_mut(),
                 &Response::Model {
-                    path: Some(std::env::temp_dir().join("42.onnx")),
+                    path: std::env::temp_dir().join("42.onnx"),
                 },
             )
             .await
@@ -572,7 +572,7 @@ mod tests {
         );
         assert!(matches!(
             connection.request(&Request::GetLatestModel {}).await.unwrap(),
-            Response::Model { path: Some(path) } if path.file_name().unwrap() == "42.onnx"
+            Response::Model { path } if path.file_name().unwrap() == "42.onnx"
         ));
         server.await.unwrap();
     }
